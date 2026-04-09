@@ -588,6 +588,23 @@ HTML_TEMPLATE = """
     <script>
         let currentFileId = null;
 
+        async function readResponseBody(response) {
+            const contentType = response.headers.get('content-type') || '';
+
+            if (contentType.includes('application/json')) {
+                try {
+                    return await response.json();
+                } catch (error) {
+                    return { error: 'The server returned invalid JSON.' };
+                }
+            }
+
+            const text = await response.text();
+            return {
+                error: text.trim() || `Request failed with status ${response.status}.`
+            };
+        }
+
         document.getElementById('uploadForm').addEventListener('submit', async (event) => {
             event.preventDefault();
 
@@ -610,7 +627,7 @@ HTML_TEMPLATE = """
                     body: formData
                 });
 
-                const data = await response.json();
+                const data = await readResponseBody(response);
 
                 if (!response.ok) {
                     throw new Error(data.error || 'Upload failed');
@@ -652,7 +669,7 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ file_id: currentFileId, query })
                 });
 
-                const data = await response.json();
+                const data = await readResponseBody(response);
 
                 if (!response.ok) {
                     throw new Error(data.error || 'Search failed');
@@ -696,7 +713,7 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ file_id: currentFileId })
                 });
 
-                const data = await response.json();
+                const data = await readResponseBody(response);
 
                 if (!response.ok) {
                     throw new Error(data.error || 'Summary failed');
