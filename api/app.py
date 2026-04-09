@@ -784,6 +784,7 @@ HTML_TEMPLATE = """
                         <button type="submit" class="btn" id="uploadSubmitButton" style="margin-top: 12px;">Fetch & Extract</button>
                     </form>
                     <div class="muted" id="uploadHint" style="margin-top: 8px;">Upload the PDF to cloud storage first, then paste its public URL here.</div>
+                    <div id="cloudinaryStatusBadge" class="muted" style="margin-top: 8px;"></div>
                     <div id="uploadStatus" class="muted" style="margin-top: 10px;"></div>
                     <div id="requestDebugPanel" class="result" style="margin-top: 12px; max-height: 220px;"></div>
                 </div>
@@ -829,6 +830,7 @@ HTML_TEMPLATE = """
     <script>
         let currentFileId = null;
         let uploadMode = 'url';
+        let cloudinaryMissingAlertShown = false;
         const UPLOAD_HEADERS = { 'Content-Type': 'application/json' };
         const MAX_DEVICE_UPLOAD_BYTES = 50 * 1024 * 1024;
         const CLOUDINARY_CLOUD_NAME = "{{ cloudinary_cloud_name }}";
@@ -837,11 +839,30 @@ HTML_TEMPLATE = """
         const REQUEST_TIMEOUT_MS = 40000;
 
         function logCloudinaryConfig(context) {
+            console.log('CLOUDINARY_CLOUD_NAME', CLOUDINARY_CLOUD_NAME);
+            console.log('CLOUDINARY_UPLOAD_PRESET', CLOUDINARY_UPLOAD_PRESET);
             console.log(`Cloudinary config (${context}):`, {
                 cloudName: CLOUDINARY_CLOUD_NAME || null,
                 uploadPreset: CLOUDINARY_UPLOAD_PRESET || null,
                 ready: CLOUDINARY_READY,
             });
+        }
+
+        function renderCloudinaryBadge() {
+            const badge = document.getElementById('cloudinaryStatusBadge');
+            if (!badge) {
+                return;
+            }
+
+            if (CLOUDINARY_READY) {
+                badge.textContent = `Cloudinary ready: ${CLOUDINARY_CLOUD_NAME}`;
+                badge.style.color = '#065f46';
+                badge.style.fontWeight = '600';
+            } else {
+                badge.textContent = 'Cloudinary missing: set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET for device uploads.';
+                badge.style.color = '#b45309';
+                badge.style.fontWeight = '600';
+            }
         }
 
         function normalizeUserError(message) {
@@ -851,7 +872,10 @@ HTML_TEMPLATE = """
                 return 'File exceeds processing limit (50MB).';
             }
             if (lower.includes('cloudinary config')) {
-                return 'Cloudinary is not configured for device uploads on this deployment.';
+                return 'Device upload disabled: Cloudinary not configured.';
+            }
+            if (lower.includes('device upload disabled')) {
+                return 'Device upload disabled: Cloudinary not configured.';
             }
             if (lower.includes('invalid json')) {
                 return 'The server returned an invalid response.';
@@ -882,12 +906,8 @@ HTML_TEMPLATE = """
                 button.disabled = isBusy;
             }
             const urlButton = document.getElementById('modeUrlButton');
-            const deviceButton = document.getElementById('modeDeviceButton');
             if (urlButton) {
                 urlButton.disabled = isBusy;
-            }
-            if (deviceButton) {
-                deviceButton.disabled = isBusy || !CLOUDINARY_READY;
             }
         }
 
@@ -895,10 +915,29 @@ HTML_TEMPLATE = """
             const status = document.getElementById('uploadStatus');
             const debug = document.getElementById('requestDebugPanel');
             if (!CLOUDINARY_READY && status) {
-                status.textContent = 'Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET to use device uploads.';
+                status.textContent = 'Device upload disabled: Cloudinary not configured.';
                 if (debug) {
-                    debug.textContent = 'Cloudinary config missing. Device uploads are disabled until CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET are set.';
+                    debug.textContent = 'Cloudinary config missing. Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET before using device uploads.';
                 }
+            }
+        }
+
+        function notifyCloudinaryMissing() {
+            const message = 'Device upload disabled: Cloudinary not configured.';
+            const status = document.getElementById('uploadStatus');
+            const debug = document.getElementById('requestDebugPanel');
+            if (status) {
+                status.textContent = message;
+            }
+            if (debug) {
+                debug.textContent = [
+                    message,
+                    'Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET to enable device uploads.',
+                ].join('\n');
+            }
+            if (!cloudinaryMissingAlertShown) {
+                cloudinaryMissingAlertShown = true;
+                window.setTimeout(() => window.alert(message), 0);
             }
         }
 
@@ -914,12 +953,6 @@ HTML_TEMPLATE = """
         }
 
         function setUploadMode(mode) {
-            if (mode === 'device' && !CLOUDINARY_READY) {
-                showConfigError();
-                uploadMode = 'device';
-                return;
-            }
-
             uploadMode = mode;
 
             const urlButton = document.getElementById('modeUrlButton');
@@ -936,7 +969,6 @@ HTML_TEMPLATE = """
 
             urlButton.classList.toggle('mode-active', isUrlMode);
             deviceButton.classList.toggle('mode-active', !isUrlMode);
-            deviceButton.disabled = !CLOUDINARY_READY;
 
             urlSection.classList.toggle('hidden', !isUrlMode);
             deviceSection.classList.toggle('hidden', isUrlMode);
@@ -958,7 +990,10 @@ HTML_TEMPLATE = """
             setUploadProgress(0, isUrlMode ? 'URL mode ready.' : 'Waiting for file selection.');
 
             if (!isUrlMode) {
-                window.setTimeout(() => fileInput.click(), 0);
+                if (!CLOUDINARY_READY) {
+                    notifyCloudinaryMissing();
+                }
+                fileInput.click();
             }
         }
 
@@ -1025,8 +1060,8 @@ HTML_TEMPLATE = """
                         data?.error?.message ||
                         data?.message ||
                         (xhr.status >= 200 && xhr.status < 300
-                            ? 'Cloudinary upload did not return a secure URL.'
-                            : `Cloudinary upload failed with status ${xhr.status}.`);
+                            ? 'Invalid Cloudinary response.'
+                            : 'Upload failed. Check Cloudinary config.');
                     console.error('Cloudinary upload failed:', {
                         endpoint,
                         status: xhr.status,
@@ -1038,7 +1073,7 @@ HTML_TEMPLATE = """
 
                 xhr.onerror = () => {
                     console.error('Cloudinary upload network error:', { endpoint, fileName: file.name });
-                    reject(new Error('Cloudinary upload failed.'));
+                    reject(new Error('Network error during upload.'));
                 };
                 xhr.onabort = () => {
                     console.warn('Cloudinary upload cancelled:', { endpoint, fileName: file.name });
@@ -1046,7 +1081,7 @@ HTML_TEMPLATE = """
                 };
                 xhr.ontimeout = () => {
                     console.warn('Cloudinary upload timed out:', { endpoint, fileName: file.name });
-                    reject(new Error('Cloudinary upload timed out.'));
+                    reject(new Error('Network error during upload.'));
                 };
                 xhr.send(formData);
             });
@@ -1134,6 +1169,10 @@ HTML_TEMPLATE = """
 
             try {
                 if (uploadMode === 'device') {
+                    if (!CLOUDINARY_READY) {
+                        throw new Error('Device upload disabled: Cloudinary not configured.');
+                    }
+
                     const fileInput = document.getElementById('pdfFile');
                     const file = fileInput.files[0];
 
@@ -1201,6 +1240,7 @@ HTML_TEMPLATE = """
 
         setUploadMode('url');
         logCloudinaryConfig('init');
+        renderCloudinaryBadge();
         showConfigError();
 
         document.getElementById('pdfFile').addEventListener('change', (event) => {
