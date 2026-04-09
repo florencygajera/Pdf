@@ -1,11 +1,17 @@
 """Flask API for PDF Content Extraction and Search."""
 
+import gzip
 import json
+import ipaddress
 import re
 import tempfile
 import uuid
+import socket
 import sys
 from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urlparse, unquote
+from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, render_template_string, request
 from werkzeug.utils import secure_filename
@@ -18,7 +24,9 @@ from pdf import IndianLanguagePDFExtractor
 
 
 app = Flask(__name__)
-MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_REMOTE_PDF_BYTES = 25 * 1024 * 1024  # 25 MB download cap for Vercel-safe processing
+DOWNLOAD_TIMEOUT_SECONDS = 20
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 app.config["JSON_SORT_KEYS"] = False
 
@@ -129,6 +137,154 @@ def all_records():
     return records
 
 
+def compact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
+
+
+def build_preview(text: str, limit: int = 1500) -> str:
+    return compact_text(text)[:limit]
+
+
+def slice_content(text: str, offset: int = 0, limit: int = 1500) -> dict:
+    normalized = compact_text(text)
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(int(limit or 1500), 2000))
+    end = min(len(normalized), offset + limit)
+    return {
+        "content": normalized[offset:end],
+        "offset": offset,
+        "limit": limit,
+        "total_length": len(normalized),
+        "has_more": end < len(normalized),
+    }
+
+
+@app.after_request
+def compress_json_response(response):
+    if response.direct_passthrough:
+        return response
+
+    if response.mimetype == "application/json" and "content-encoding" not in response.headers:
+        accept_encoding = request.headers.get("Accept-Encoding", "")
+        payload = response.get_data()
+        if "gzip" in accept_encoding and len(payload) > 1024:
+            response.set_data(gzip.compress(payload))
+            response.headers["Content-Encoding"] = "gzip"
+            response.headers["Content-Length"] = str(len(response.get_data()))
+            response.headers.add("Vary", "Accept-Encoding")
+
+    return response
+
+
+def _is_public_host(hostname: str) -> bool:
+    if not hostname:
+        return False
+
+    lowered = hostname.lower()
+    if lowered in {"localhost", "127.0.0.1", "::1"} or lowered.endswith(".local"):
+        return False
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_global
+    except ValueError:
+        pass
+
+    try:
+        addresses = {
+            info[4][0]
+            for info in socket.getaddrinfo(hostname, None)
+            if info and info[4]
+        }
+    except socket.gaierror:
+        return False
+
+    if not addresses:
+        return False
+
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+
+    return True
+
+
+def _filename_from_url_or_headers(file_url: str, headers) -> str:
+    content_disposition = headers.get("Content-Disposition", "") if headers else ""
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', content_disposition, re.IGNORECASE)
+    if match:
+        return secure_filename(unquote(match.group(1))) or "upload.pdf"
+
+    parsed = urlparse(file_url)
+    inferred = secure_filename(Path(parsed.path).name)
+    return inferred or "upload.pdf"
+
+
+def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
+    parsed = urlparse(file_url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("file_url must use http or https.")
+    if not parsed.netloc:
+        raise ValueError("file_url is invalid.")
+    if parsed.username or parsed.password:
+        raise ValueError("file_url must not include credentials.")
+    if not _is_public_host(parsed.hostname or ""):
+        raise ValueError("file_url must point to a public host.")
+
+    request_headers = {
+        "User-Agent": "PDF-Content-Extractor/1.0",
+        "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
+    }
+    req = Request(file_url, headers=request_headers)
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_path = Path(temp_file.name)
+    total_bytes = 0
+    filename = "upload.pdf"
+
+    try:
+        with urlopen(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+            filename = _filename_from_url_or_headers(file_url, response.headers)
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    content_length_value = int(content_length)
+                except (TypeError, ValueError):
+                    raise ValueError("Remote file size is invalid.") from None
+                if content_length_value > MAX_REMOTE_PDF_BYTES:
+                    raise ValueError("Remote file is too large.")
+
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+
+                total_bytes += len(chunk)
+                if total_bytes > MAX_REMOTE_PDF_BYTES:
+                    raise ValueError("Remote file is too large.")
+
+                temp_file.write(chunk)
+
+        temp_file.flush()
+        temp_file.close()
+
+        with temp_path.open("rb") as file_handle:
+            header = file_handle.read(8)
+            if not header.startswith(b"%PDF-"):
+                raise ValueError("Downloaded file is not a valid PDF.")
+
+        return temp_path, filename
+    except Exception:
+        temp_file.close()
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
 def normalize_whitespace(text: str) -> str:
     return re.sub(r"[ \t]+", " ", (text or "").replace("\xa0", " ")).strip()
 
@@ -227,7 +383,6 @@ def extract_pdf_data(saved_path: Path) -> dict:
 
     page_texts = []
     raw_page_texts = []
-    content_parts = []
     tables = []
     structured_sections = []
     document_title = normalize_whitespace(extracted.get("metadata", {}).get("title", ""))
@@ -238,7 +393,6 @@ def extract_pdf_data(saved_path: Path) -> dict:
         raw_text = normalize_whitespace(page.get("raw_text", "") or page.get("direct_text", ""))
         page_texts.append(cleaned_text or raw_text)
         raw_page_texts.append(raw_text or cleaned_text)
-        content_parts.append(f"--- Page {page_number} ---\n{cleaned_text or raw_text}")
 
         page_heading = normalize_whitespace(page.get("page_heading", ""))
         if not document_title and page_heading:
@@ -284,7 +438,6 @@ def extract_pdf_data(saved_path: Path) -> dict:
         "cleaned_content": cleaned_content,
         "page_texts": page_texts,
         "language_profile": language_profile,
-        "content_parts": content_parts,
         "structured_document": structured_document,
         "tables": tables,
         "metadata": metadata,
@@ -294,7 +447,7 @@ def extract_pdf_data(saved_path: Path) -> dict:
 
 @app.errorhandler(413)
 def request_too_large(_error):
-    return jsonify({"error": "File too large. Maximum size is 500 MB for this deployment."}), 413
+    return jsonify({"error": "File too large. Maximum size is 5 MB for this deployment."}), 413
 
 
 @app.errorhandler(404)
@@ -539,13 +692,13 @@ HTML_TEMPLATE = """
             <div class="stack">
                 <div class="panel">
                     <h3>Upload PDF</h3>
-                    <form id="uploadForm" enctype="multipart/form-data">
+                    <form id="uploadForm">
                         <div class="row">
-                            <input type="file" id="pdfFile" name="file" accept=".pdf" required>
-                            <button type="submit" class="btn">Upload & Extract</button>
+                            <input type="text" id="fileUrl" name="file_url" placeholder="Paste Cloudinary, S3, or Firebase PDF URL" required>
+                            <button type="submit" class="btn">Fetch & Extract</button>
                         </div>
                     </form>
-                    <div class="muted" style="margin-top: 8px;">Max upload size: 500 MB.</div>
+                    <div class="muted" style="margin-top: 8px;">Upload the PDF to cloud storage first, then paste its public URL here.</div>
                     <div id="uploadStatus" class="muted" style="margin-top: 10px;"></div>
                 </div>
 
@@ -589,7 +742,6 @@ HTML_TEMPLATE = """
 
     <script>
         let currentFileId = null;
-        const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 
         async function readResponseBody(response) {
             const contentType = response.headers.get('content-type') || '';
@@ -611,29 +763,21 @@ HTML_TEMPLATE = """
         document.getElementById('uploadForm').addEventListener('submit', async (event) => {
             event.preventDefault();
 
-            const fileInput = document.getElementById('pdfFile');
-            const file = fileInput.files[0];
+            const fileUrlInput = document.getElementById('fileUrl');
+            const fileUrl = fileUrlInput.value.trim();
 
-            if (!file) {
-                alert('Please select a PDF file');
+            if (!fileUrl) {
+                alert('Please provide a cloud PDF URL');
                 return;
             }
-
-            if (file.size > MAX_UPLOAD_BYTES) {
-                document.getElementById('uploadStatus').textContent =
-                    'Error: File is too large. Please upload a PDF smaller than 500 MB.';
-                return;
-            }
-
-            const formData = new FormData();
-            formData.append('file', file);
 
             document.getElementById('uploadStatus').textContent = 'Processing...';
 
             try {
                 const response = await fetch('/api/upload', {
                     method: 'POST',
-                    body: formData
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ file_url: fileUrl })
                 });
 
                 const data = await readResponseBody(response);
@@ -643,14 +787,14 @@ HTML_TEMPLATE = """
                 }
 
                 currentFileId = data.file_id;
-                document.getElementById('uploadStatus').textContent = 'Upload successful';
+                document.getElementById('uploadStatus').textContent = 'Document loaded successfully';
                 document.getElementById('fileInfo').textContent = `File: ${data.filename} (${data.page_count} pages)`;
-                document.getElementById('languageContent').textContent = JSON.stringify(data.language_profile, null, 2);
+                document.getElementById('languageContent').textContent = JSON.stringify(data.language_profile || {}, null, 2);
                 document.getElementById('languagePanel').classList.remove('hidden');
                 document.getElementById('summaryActions').classList.remove('hidden');
                 document.getElementById('summaryStatus').textContent = 'Click "Summarise Whole PDF" to generate a summary from the full extracted text.';
                 document.getElementById('summaryContent').textContent = '';
-                document.getElementById('extractedContent').textContent = data.content;
+                document.getElementById('extractedContent').textContent = data.preview || data.content || '';
                 document.getElementById('resultPanel').classList.remove('hidden');
                 document.getElementById('searchPanel').classList.remove('hidden');
             } catch (error) {
@@ -760,27 +904,29 @@ def favicon():
 @app.route("/api/upload", methods=["POST"])
 def upload_pdf():
     try:
-        if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
-
-        file = request.files["file"]
-        if file.filename == "":
-            return jsonify({"error": "No file selected"}), 400
-
-        if not file.filename.lower().endswith(".pdf"):
-            return jsonify({"error": "Only PDF files are allowed"}), 400
+        data = request.get_json(silent=True) or {}
+        file_url = (data.get("file_url") or "").strip()
+        if not file_url:
+            return jsonify({"error": "Missing file_url"}), 400
 
         file_id = uuid.uuid4().hex
-        saved_path = upload_path(file_id, file.filename)
-        file.save(saved_path)
+        downloaded_path = None
+        try:
+            downloaded_path, filename = download_pdf_from_url(file_url)
+            extracted = extract_pdf_data(downloaded_path)
+        finally:
+            if downloaded_path and downloaded_path.exists():
+                downloaded_path.unlink(missing_ok=True)
 
-        extracted = extract_pdf_data(saved_path)
+        full_content = extracted["cleaned_content"]
+        preview = build_preview(full_content, limit=1500)
         record = {
-            "filename": file.filename,
-            "filepath": str(saved_path),
-            "content": extracted["content"],
-            "cleaned_content": extracted["cleaned_content"],
-            "pages": extracted["content_parts"],
+            "filename": filename,
+            "source_url": file_url,
+            "content": full_content,
+            "cleaned_content": full_content,
+            "preview": preview,
+            "pages": extracted["page_texts"],
             "page_texts": extracted["page_texts"],
             "language_profile": extracted["language_profile"],
             "page_count": extracted["page_count"],
@@ -793,15 +939,15 @@ def upload_pdf():
         return jsonify(
             {
                 "file_id": file_id,
-                "filename": file.filename,
+                "filename": filename,
                 "page_count": extracted["page_count"],
-                "content": extracted["cleaned_content"],
+                "preview": preview,
+                "content": preview,
                 "language_profile": extracted["language_profile"],
-                "structured_document": extracted["structured_document"],
-                "tables": extracted["tables"],
-                "metadata": extracted["metadata"],
             }
         )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -891,7 +1037,46 @@ def get_content(file_id):
     if pdf_data is None:
         return jsonify({"error": "File not found"}), 404
 
-    return jsonify(pdf_data)
+    offset = request.args.get("offset", default=0, type=int)
+    limit = request.args.get("limit", default=1500, type=int)
+    content = pdf_data.get("cleaned_content") or pdf_data.get("content") or ""
+    sliced = slice_content(content, offset=offset, limit=limit)
+
+    return jsonify(
+        {
+            "file_id": file_id,
+            "filename": pdf_data["filename"],
+            "page_count": pdf_data["page_count"],
+            "preview": build_preview(content, limit=1500),
+            **sliced,
+        }
+    )
+
+
+@app.route("/api/page/<file_id>/<int:page_number>", methods=["GET"])
+def get_page_content(file_id, page_number):
+    pdf_data = load_record(file_id)
+    if pdf_data is None:
+        return jsonify({"error": "File not found"}), 404
+
+    page_texts = pdf_data.get("page_texts") or []
+    if page_number < 1 or page_number > len(page_texts):
+        return jsonify({"error": "Page not found"}), 404
+
+    content = page_texts[page_number - 1] or ""
+    limit = request.args.get("limit", default=1500, type=int)
+    sliced = slice_content(content, offset=0, limit=limit)
+
+    return jsonify(
+        {
+            "file_id": file_id,
+            "filename": pdf_data["filename"],
+            "page_number": page_number,
+            "page_count": pdf_data["page_count"],
+            "preview": build_preview(content, limit=1500),
+            **sliced,
+        }
+    )
 
 
 @app.route("/api/structured/<file_id>", methods=["GET"])
