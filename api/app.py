@@ -18,7 +18,8 @@ from pdf import IndianLanguagePDFExtractor
 
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 app.config["JSON_SORT_KEYS"] = False
 
 STORAGE_DIR = Path(tempfile.gettempdir()) / "pdf_content_extractor"
@@ -293,7 +294,7 @@ def extract_pdf_data(saved_path: Path) -> dict:
 
 @app.errorhandler(413)
 def request_too_large(_error):
-    return jsonify({"error": "File too large. Maximum size is 16 MB."}), 413
+    return jsonify({"error": "File too large. Maximum size is 500 MB for this deployment."}), 413
 
 
 @app.errorhandler(404)
@@ -544,6 +545,7 @@ HTML_TEMPLATE = """
                             <button type="submit" class="btn">Upload & Extract</button>
                         </div>
                     </form>
+                    <div class="muted" style="margin-top: 8px;">Max upload size: 500 MB.</div>
                     <div id="uploadStatus" class="muted" style="margin-top: 10px;"></div>
                 </div>
 
@@ -587,6 +589,7 @@ HTML_TEMPLATE = """
 
     <script>
         let currentFileId = null;
+        const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 
         async function readResponseBody(response) {
             const contentType = response.headers.get('content-type') || '';
@@ -613,6 +616,12 @@ HTML_TEMPLATE = """
 
             if (!file) {
                 alert('Please select a PDF file');
+                return;
+            }
+
+            if (file.size > MAX_UPLOAD_BYTES) {
+                document.getElementById('uploadStatus').textContent =
+                    'Error: File is too large. Please upload a PDF smaller than 500 MB.';
                 return;
             }
 
@@ -741,6 +750,11 @@ def index():
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"status": "ok"})
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 
 @app.route("/api/upload", methods=["POST"])

@@ -2,6 +2,8 @@
 
 Production-ready Flask app for uploading PDFs, extracting text, and searching within the extracted content.
 
+Current upload limit: 500 MB in the Flask app. If you deploy on a serverless host, the platform may still enforce its own request-body limit, so very large PDFs may require a self-hosted server or external storage.
+
 ## Local run
 
 ```powershell
