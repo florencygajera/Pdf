@@ -29,12 +29,15 @@ Open `http://127.0.0.1:5000`.
 - Set these environment variables for device uploads:
   - `CLOUDINARY_CLOUD_NAME`
   - `CLOUDINARY_UPLOAD_PRESET`
+  - Use an unsigned preset that allows `raw` uploads for PDF files
+- If you split the frontend and API onto different origins later, set `CORS_ALLOWED_ORIGINS` to a comma-separated list of allowed origins.
 
 ## Upload limits
 
 - Device uploads are limited to 50 MB on the client side before Cloudinary upload starts.
 - Flask never receives the raw device file.
 - URL uploads stay JSON-only and never send multipart form data to the backend.
+- On Vercel, search and summary requests may land on a different serverless instance than the upload request. If that happens, re-upload the PDF before searching or summarizing.
 
 ## Optional OCR extras
 

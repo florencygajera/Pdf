@@ -87,7 +87,9 @@ class ExtractionWarning:
     message: str
 
 
-@lru_cache(maxsize=64)
+# Module-global cache shared across extractor instances. The bound keeps
+# language-string reuse fast without letting long-lived workers grow it forever.
+@lru_cache(maxsize=128)
 def _build_tesseract_lang(
     language_tuple: tuple[str, ...],
     lang_map: tuple[tuple[str, str], ...],
@@ -162,7 +164,7 @@ class IndianLanguagePDFExtractor:
     ) -> dict[str, Any]:
         """Thread-safe: page cache is a LOCAL variable, not self-state."""
         if languages is None:
-            languages = ["hin", "eng"]
+            languages = ["eng", "hin", "guj"]
 
         result: dict[str, Any] = {
             "filename": os.path.basename(pdf_path),
@@ -693,9 +695,12 @@ class IndianLanguagePDFExtractor:
         alnum = sum(c.isalnum() for c in cleaned_direct)
         if alnum >= 80:
             return False
-        if page.get_images(full=True):
-            return True
-        return alnum < 10
+        raw_blocks = page.get_text("blocks")
+        has_text_blocks = any(len(block) >= 5 and (block[4] or "").strip() for block in raw_blocks)
+        if has_text_blocks and alnum >= 30:
+            return False
+        has_images = bool(page.get_images(full=True))
+        return has_images or alnum < 10
 
     # ------------------------------------------------------------------
     # Save output  (FIX: Path.open() instead of string concat)

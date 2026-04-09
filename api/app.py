@@ -69,11 +69,12 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict, deque
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-from flask import Flask, jsonify, render_template_string, request, redirect
+from flask import Flask, jsonify, render_template_string, request, redirect, g, has_request_context
 from werkzeug.utils import secure_filename
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,21 @@ logging.config.dictConfig(
 )
 log = logging.getLogger(__name__)
 
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = getattr(g, "request_id", "-") if has_request_context() else "-"
+        return True
+
+
+_REQUEST_FORMATTER = logging.Formatter(
+    "%(asctime)s %(levelname)-8s %(name)s [rid=%(request_id)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(_REQUEST_FORMATTER)
+    _handler.addFilter(_RequestIdFilter())
+
 # ---------------------------------------------------------------------------
 # Local import
 # ---------------------------------------------------------------------------
@@ -115,9 +131,17 @@ from pdf import IndianLanguagePDFExtractor  # noqa: E402
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+# JSON bodies stay tiny because device uploads go through Cloudinary first;
+# this higher cap simply guards against oversized raw POST abuse.
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_REMOTE_PDF_BYTES = 50 * 1024 * 1024
-DOWNLOAD_TIMEOUT_SECONDS = 20
+DOWNLOAD_TIMEOUT_SECONDS = 60
+IS_VERCEL_RUNTIME = bool(os.getenv("VERCEL") or os.getenv("VERCEL_URL"))
+CORS_ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+}
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 app.config["JSON_SORT_KEYS"] = False
@@ -130,9 +154,17 @@ CACHE_DIR = STORAGE_DIR / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _storage_lock: threading.RLock = threading.RLock()
-pdf_storage: dict[str, dict] = {}
+pdf_storage: OrderedDict[str, dict] = OrderedDict()
 
 PDF_EXTRACTOR = IndianLanguagePDFExtractor()
+OCR_RUNTIME_ENABLED = PDF_EXTRACTOR.ocr_enabled and not IS_VERCEL_RUNTIME
+PDF_EXTRACTOR.ocr_enabled = OCR_RUNTIME_ENABLED
+
+_storage_limit = 100
+_rate_limit_window_seconds = 60
+_rate_limit_max_requests = 20
+_rate_limit_lock = threading.RLock()
+_rate_limit_buckets: OrderedDict[str, deque[float]] = OrderedDict()
 
 # ---------------------------------------------------------------------------
 # Language data
@@ -196,9 +228,49 @@ def _record_path(file_id: str) -> Path:
     return CACHE_DIR / f"{file_id}.json"
 
 
+def _prune_storage_locked() -> None:
+    while len(pdf_storage) > _storage_limit:
+        pdf_storage.popitem(last=False)
+
+
+def _client_ip() -> str:
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return forwarded or request.remote_addr or "unknown"
+
+
+def _rate_limit_ok(client_ip: str) -> bool:
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _rate_limit_buckets.get(client_ip)
+        if bucket is None:
+            bucket = deque()
+            _rate_limit_buckets[client_ip] = bucket
+        while bucket and now - bucket[0] > _rate_limit_window_seconds:
+            bucket.popleft()
+        if len(bucket) >= _rate_limit_max_requests:
+            return False
+        bucket.append(now)
+        _rate_limit_buckets.move_to_end(client_ip)
+        while len(_rate_limit_buckets) > 1000:
+            _rate_limit_buckets.popitem(last=False)
+        return True
+
+
+def _is_cloudinary_host(hostname: str) -> bool:
+    host = (hostname or "").lower()
+    return host == "res.cloudinary.com" or host == "api.cloudinary.com" or host.endswith(".cloudinary.com")
+
+
+def _is_cloudinary_url(file_url: str) -> bool:
+    parsed = urlparse(file_url or "")
+    return parsed.scheme in {"http", "https"} and _is_cloudinary_host(parsed.hostname or "")
+
+
 def save_record(file_id: str, record: dict) -> None:
     with _storage_lock:
         pdf_storage[file_id] = record
+        pdf_storage.move_to_end(file_id)
+        _prune_storage_locked()
     try:
         _record_path(file_id).write_text(
             json.dumps(record, ensure_ascii=False), encoding="utf-8"
@@ -210,6 +282,8 @@ def save_record(file_id: str, record: dict) -> None:
 def load_record(file_id: str) -> dict | None:
     with _storage_lock:
         cached = pdf_storage.get(file_id)
+        if cached is not None:
+            pdf_storage.move_to_end(file_id)
     if cached is not None:
         return cached
 
@@ -224,6 +298,8 @@ def load_record(file_id: str) -> dict | None:
 
     with _storage_lock:
         pdf_storage[file_id] = data
+        pdf_storage.move_to_end(file_id)
+        _prune_storage_locked()
     return data
 
 
@@ -240,6 +316,8 @@ def all_records() -> dict[str, dict]:
             records[file_id] = record
             with _storage_lock:
                 pdf_storage.setdefault(file_id, record)
+                pdf_storage.move_to_end(file_id)
+                _prune_storage_locked()
         except (json.JSONDecodeError, OSError):
             continue
 
@@ -280,7 +358,7 @@ def slice_content(text: str, offset: int = 0, limit: int = 1500) -> dict:
 
 @app.after_request
 def compress_json_response(response):
-    if response.direct_passthrough:
+    if response.direct_passthrough or response.is_streamed:
         return response
     if (
         response.mimetype == "application/json"
@@ -297,9 +375,82 @@ def compress_json_response(response):
     return response
 
 
+@app.before_request
+def trace_request():
+    g.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    g.request_started_at = time.monotonic()
+
+    if request.method == "OPTIONS":
+        return None
+
+    if not _rate_limit_ok(_client_ip()):
+        log.warning(
+            "RATE LIMIT exceeded ip=%s path=%s method=%s",
+            _client_ip(),
+            request.path,
+            request.method,
+        )
+        return jsonify({"error": "Too many requests. Please try again in a minute."}), 429
+
+    log.info(
+        "REQUEST START method=%s path=%s content_length=%s content_type=%r",
+        request.method,
+        request.path,
+        request.content_length,
+        request.headers.get("Content-Type", ""),
+    )
+    return None
+
+
+@app.after_request
+def attach_request_id_and_log(response):
+    request_id = getattr(g, "request_id", None)
+    if request_id:
+        response.headers["X-Request-ID"] = request_id
+
+    started = getattr(g, "request_started_at", None)
+    elapsed_ms = round((time.monotonic() - started) * 1000, 1) if started else -1
+    log.info(
+        "REQUEST END method=%s path=%s status=%s elapsed_ms=%s",
+        request.method,
+        request.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
+
+
 # ---------------------------------------------------------------------------
 # FIX #27/28: Cache-control headers for HTML routes
 # ---------------------------------------------------------------------------
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin")
+    if not origin or origin not in CORS_ALLOWED_ORIGINS:
+        return response
+
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        request.headers.get("Access-Control-Request-Headers")
+        or "Content-Type, Authorization"
+    )
+    response.headers["Access-Control-Max-Age"] = "600"
+    response.headers.add("Vary", "Origin")
+    return response
+
+
+@app.before_request
+def handle_cors_preflight():
+    if request.method != "OPTIONS":
+        return None
+
+    origin = request.headers.get("Origin")
+    if origin and origin in CORS_ALLOWED_ORIGINS:
+        return ("", 204)
+    return ("", 204)
 
 
 @app.after_request
@@ -407,41 +558,45 @@ def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
     req = Request(file_url, headers=req_headers)
     opener = build_opener(_LimitedRedirectHandler())
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    tmp_path = Path(tmp.name)
     total_bytes = 0
     filename = "upload.pdf"
 
     try:
-        with opener.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as resp:
-            final_host = urlparse(resp.geturl()).hostname or ""
-            if not _is_public_host(final_host):
-                raise ValueError("file_url must point to a public host.")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_path = Path(tmp.name)
+            with opener.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as resp:
+                final_host = urlparse(resp.geturl()).hostname or ""
+                if not _is_public_host(final_host):
+                    raise ValueError("file_url must point to a public host.")
 
-            filename = _filename_from_url_or_headers(file_url, resp.headers)
+                content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if content_type != "application/pdf":
+                    raise ValueError("Remote URL did not return application/pdf content.")
 
-            cl = resp.headers.get("Content-Length")
-            if cl:
-                try:
-                    if int(cl) > MAX_REMOTE_PDF_BYTES:
+                filename = _filename_from_url_or_headers(file_url, resp.headers)
+
+                cl = resp.headers.get("Content-Length")
+                if cl:
+                    try:
+                        if int(cl) > MAX_REMOTE_PDF_BYTES:
+                            raise ValueError("File exceeds processing limit (50 MB).")
+                    except (TypeError, ValueError) as exc:
+                        if "50 MB" in str(exc):
+                            raise
+                        raise ValueError(
+                            "Remote Content-Length header is invalid."
+                        ) from exc
+
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_REMOTE_PDF_BYTES:
                         raise ValueError("File exceeds processing limit (50 MB).")
-                except (TypeError, ValueError) as exc:
-                    if "50 MB" in str(exc):
-                        raise
-                    raise ValueError(
-                        "Remote Content-Length header is invalid."
-                    ) from exc
+                    tmp.write(chunk)
 
-            while True:
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                total_bytes += len(chunk)
-                if total_bytes > MAX_REMOTE_PDF_BYTES:
-                    raise ValueError("File exceeds processing limit (50 MB).")
-                tmp.write(chunk)
-
-        tmp.flush()
+            tmp.flush()
 
         with tmp_path.open("rb") as fh:
             if not fh.read(8).startswith(b"%PDF-"):
@@ -454,11 +609,6 @@ def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
             "Download timed out. The file may be too large or the server too slow. "
             "Try uploading to Cloudinary first, then paste the resulting URL."
         ) from exc
-    finally:
-        try:
-            tmp.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +786,7 @@ def extract_pdf_data(saved_path: Path) -> dict:
 def _friendly_upload_error(message: str):
     msg = message or "Upload failed."
     lower = msg.lower()
-    if "processing limit" in lower:
+    if "processing limit" in lower or "too large" in lower or "request body too large" in lower:
         msg = "File exceeds processing limit (50 MB)."
     elif "timeout" in lower:
         msg = (
@@ -654,6 +804,8 @@ def _friendly_upload_error(message: str):
         )
     elif "not a valid pdf" in lower:
         msg = "The URL did not return a valid PDF file. Ensure the link points directly to a .pdf document."
+    elif "application/pdf content" in lower:
+        msg = "The URL did not return application/pdf content."
     elif "content-length header is invalid" in lower:
         msg = (
             "The server returned an invalid Content-Length header. Try a different URL."
@@ -668,7 +820,7 @@ def _friendly_upload_error(message: str):
 
 @app.errorhandler(413)
 def request_too_large(_e):
-    return jsonify({"error": "Request body too large. Maximum size is 5 MB."}), 413
+    return jsonify({"error": "Request body too large. Maximum size is 50 MB."}), 413
 
 
 @app.errorhandler(404)
@@ -702,6 +854,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   window.CLOUDINARY_CLOUD_NAME   = {{ cloudinary_cloud_name|tojson }};
   window.CLOUDINARY_UPLOAD_PRESET = {{ cloudinary_upload_preset|tojson }};
   window.OCR_ENABLED             = {{ ocr_enabled|tojson }};
+  window.OCR_DISABLED_REASON     = {{ ocr_disabled_reason|tojson }};
+  window.IS_VERCEL               = {{ is_vercel_runtime|tojson }};
   window.BUILD_ID                = {{ build_id|tojson }};
 </script>
 <style>
@@ -958,6 +1112,15 @@ input[type="file"]{display:none}
     <!-- Content panel (hidden until upload) -->
     <div id="contentArea" class="hidden" style="display:flex;flex-direction:column;gap:16px">
 
+      <div class="card" style="border-left:4px solid #f59e0b;background:#fffbeb;color:#92400e">
+        <div class="card-title" style="margin-bottom:8px">Vercel storage note</div>
+        <div style="font-size:13px;line-height:1.7">
+          Search and summary requests may land on a different serverless instance than the upload request.
+          If that happens, re-upload the PDF before using Search or Summary. For durable cross-request storage,
+          we would need an external store such as Redis or object storage.
+        </div>
+      </div>
+
       <!-- Summary -->
       <div class="card">
         <div class="section-header">
@@ -1016,6 +1179,8 @@ const LOG = {
 const CLOUDINARY_CLOUD_NAME    = window.CLOUDINARY_CLOUD_NAME   || '';
 const CLOUDINARY_UPLOAD_PRESET = window.CLOUDINARY_UPLOAD_PRESET || '';
 const OCR_ENABLED              = window.OCR_ENABLED;
+const OCR_DISABLED_REASON      = window.OCR_DISABLED_REASON || '';
+const IS_VERCEL                = Boolean(window.IS_VERCEL);
 const BUILD_ID                 = window.BUILD_ID || '';
 
 /* FIX #6: validate cloud name format before treating as ready */
@@ -1023,7 +1188,7 @@ const CLOUD_NAME_VALID = /^[a-z0-9_-]{3,60}$/i.test(CLOUDINARY_CLOUD_NAME);
 const PRESET_VALID     = /^[a-z0-9_-]{3,60}$/i.test(CLOUDINARY_UPLOAD_PRESET);
 const CLOUDINARY_READY = CLOUD_NAME_VALID && PRESET_VALID;
 
-const TIMEOUT_MS       = 45_000;
+const TIMEOUT_MS       = 60_000;
 const MAX_DEVICE_BYTES = 50 * 1024 * 1024;
 
 let currentFileId  = null;
@@ -1036,7 +1201,11 @@ let debugLog       = [];
 function init() {
   LOG.group('PDF Extractor — init');
   LOG.info('Build:', BUILD_ID);
+  LOG.info('Vercel runtime:', IS_VERCEL);
   LOG.info('OCR enabled:', OCR_ENABLED);
+  if (!OCR_ENABLED && OCR_DISABLED_REASON) {
+    appendDebug('WARN: ' + OCR_DISABLED_REASON);
+  }
   LOG.info('Cloudinary cloud name valid:', CLOUD_NAME_VALID, '→', CLOUDINARY_CLOUD_NAME);
   LOG.info('Cloudinary preset valid:', PRESET_VALID, '→', CLOUDINARY_UPLOAD_PRESET);
   LOG.info('Cloudinary ready:', CLOUDINARY_READY);
@@ -1065,11 +1234,12 @@ function init() {
 function friendlyError(raw) {
   const msg = (raw || 'Something went wrong.').trim();
   const t   = msg.toLowerCase();
-  if (t.includes('processing limit'))        return 'File exceeds processing limit (50 MB).';
+  if (t.includes('processing limit') || t.includes('too large') || t.includes('request body too large')) return 'File exceeds processing limit (50 MB).';
   if (t.includes('cloudinary'))              return 'Device upload not configured — Cloudinary env vars missing or invalid.';
   if (t.includes('timeout'))                 return 'Request timed out. For large files, upload to Cloudinary first then paste the URL.';
   if (t.includes('invalid json') || t.includes('unexpected token')) return 'Server returned an invalid response. Check the server logs.';
   if (t.includes('public host') || t.includes('ssrf') || t.includes('blocked')) return 'URL is not publicly accessible. Upload to Cloudinary, S3, or Firebase and use that URL instead.';
+  if (t.includes('not found in this vercel instance') || t.includes('re-upload the pdf')) return 'This Vercel instance no longer has the uploaded PDF. Please re-upload and try again.';
   if (t.includes('valid pdf'))               return 'The URL did not return a valid PDF file.';
   if (t.includes('must use http'))           return 'URL must start with https://.';
   if (t.includes('file_url is invalid') || t.includes('invalid url')) return 'Please provide a valid https:// URL.';
@@ -1135,6 +1305,7 @@ function setMode(mode) {
       appendDebug('WARN: Cloudinary not ready — CLOUD_NAME_VALID=' + CLOUD_NAME_VALID + ' PRESET_VALID=' + PRESET_VALID);
     }
   }
+  document.getElementById('submitBtn').disabled = (mode === 'device' && !CLOUDINARY_READY);
 }
 
 /* === FIX #11: robust file validation (MIME + extension fallback) === */
@@ -1161,13 +1332,13 @@ function validateForm() {
     let parsed;
     try { parsed = new URL(raw); } catch { throw new Error('Invalid URL format. Must start with https://'); }
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('URL must use https://');
-    return { type: 'url', value: raw };
+    return { type: 'url', value: raw, source: 'url' };
   } else {
     if (!CLOUDINARY_READY) throw new Error('Device upload unavailable — Cloudinary not configured. Use URL mode instead.');
     const file = document.getElementById('pdfFile').files[0];
     if (!file) throw new Error('Please select a PDF file first.');
     validatePdfFile(file);
-    return { type: 'device', file };
+    return { type: 'device', file, source: 'device' };
   }
 }
 
@@ -1212,7 +1383,8 @@ function uploadToCloudinary(file) {
     const fd = new FormData();
     fd.append('file', file);
     fd.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-    const url = 'https://api.cloudinary.com/v1_1/' + CLOUDINARY_CLOUD_NAME + '/auto/upload';
+    const url = 'https://api.cloudinary.com/v1_1/' + CLOUDINARY_CLOUD_NAME + '/raw/upload';
+    LOG.info('endpoint:', url);
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url, true);
@@ -1238,12 +1410,12 @@ function uploadToCloudinary(file) {
       } else {
         const errMsg = (d && d.error && d.error.message)
           ? d.error.message
-          : 'Cloudinary upload failed (status ' + xhr.status + '). Check preset name and that it is set to "Unsigned".';
+          : 'Cloudinary upload failed (status ' + xhr.status + '). Check that the preset is unsigned and allows raw uploads for PDFs.';
         reject(new Error(errMsg));
       }
     };
     /* FIX #14: all XHR failure events handled */
-    xhr.onerror   = () => { LOG.end(); reject(new Error('Network error during Cloudinary upload. Check your connection.')); };
+    xhr.onerror   = () => { LOG.end(); reject(new Error('Network error during upload.')); };
     xhr.onabort   = () => { LOG.end(); reject(new Error('Upload was cancelled.')); };
     xhr.ontimeout = () => { LOG.end(); reject(new Error('Cloudinary upload timed out. File may be too large.')); };
 
@@ -1252,8 +1424,8 @@ function uploadToCloudinary(file) {
 }
 
 /* === Send URL to backend === */
-async function sendUrl(fileUrl) {
-  appendDebug('POST /api/upload url=' + fileUrl.slice(0, 80) + '…');
+async function sendUrl(fileUrl, source) {
+  appendDebug('POST /api/upload source=' + source + ' url=' + fileUrl.slice(0, 80) + '…');
   setPhase('extract');
 
   const ctrl = new AbortController();
@@ -1264,7 +1436,7 @@ async function sendUrl(fileUrl) {
     resp = await fetch('/api/upload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },  /* FIX #9 */
-      body: JSON.stringify({ file_url: fileUrl }),
+      body: JSON.stringify({ file_url: fileUrl, source: source }),
       signal: ctrl.signal,
     });
   } catch (err) {
@@ -1304,10 +1476,10 @@ async function handleSubmit() {
       const cloudUrl = await uploadToCloudinary(form.file);
       appendDebug('Cloudinary URL: ' + cloudUrl);
       setPhase('fetch');
-      data = await sendUrl(cloudUrl);
+      data = await sendUrl(cloudUrl, form.source);
     } else {
       setPhase('fetch');
-      data = await sendUrl(form.value);
+      data = await sendUrl(form.value, form.source);
     }
 
     setPhase('done');
@@ -1353,7 +1525,21 @@ function resetState() {
   document.getElementById('progressLabel').textContent = '';
   setPhase('idle');
   setBusy(false);
+  currentPage = 1;
+  totalPages = 1;
   currentFileId = null;
+  document.getElementById('extractedContent').textContent = 'Upload a PDF to see its content.';
+  document.getElementById('extractedContent').classList.add('result-empty');
+  document.getElementById('summaryBox').textContent = 'Click "Generate Summary" to summarise the full document.';
+  document.getElementById('langCard').classList.add('hidden');
+  document.getElementById('warnCard').classList.add('hidden');
+  document.getElementById('contentArea').classList.add('hidden');
+  document.getElementById('emptyState').classList.remove('hidden');
+  document.getElementById('fileInfo').innerHTML = '<p style="color:var(--muted);font-size:13px">No file loaded.</p>';
+  document.getElementById('searchResults').innerHTML = '<span class="result-empty">Results will appear here.</span>';
+  document.getElementById('pageNav').textContent = '';
+  document.getElementById('prevBtn').disabled = true;
+  document.getElementById('nextBtn').disabled = true;
   appendDebug('State reset by user.');
 }
 
@@ -1523,7 +1709,9 @@ def index():
         HTML_TEMPLATE,
         cloudinary_cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", ""),
         cloudinary_upload_preset=os.getenv("CLOUDINARY_UPLOAD_PRESET", ""),
-        ocr_enabled=PDF_EXTRACTOR.ocr_enabled,
+        ocr_enabled=OCR_RUNTIME_ENABLED,
+        ocr_disabled_reason="OCR is disabled on Vercel runtime." if IS_VERCEL_RUNTIME else "",
+        is_vercel_runtime=IS_VERCEL_RUNTIME,
         build_id=build_id,  # FIX #29: fingerprint for deployment verification
     )
 
@@ -1538,7 +1726,9 @@ def healthz():
         {
             "status": "ok",
             "build_id": build_id,
-            "ocr_enabled": PDF_EXTRACTOR.ocr_enabled,
+            "ocr_enabled": OCR_RUNTIME_ENABLED,
+            "ocr_disabled_reason": "OCR is disabled on Vercel runtime." if IS_VERCEL_RUNTIME else "",
+            "is_vercel_runtime": IS_VERCEL_RUNTIME,
             "cloudinary_configured": bool(cloud_name and preset),
             "cloudinary_cloud_name": cloud_name[:4] + "…" if cloud_name else "",
             "cached_files": len(list(CACHE_DIR.glob("*.json"))),
@@ -1590,12 +1780,29 @@ def upload_pdf():
         log.debug("Upload payload: %d bytes", len(raw))
 
         data = request.get_json(silent=True) or {}
-        if set(data.keys()) - {"file_url"}:
+        if set(data.keys()) - {"file_url", "source", "upload_source"}:
             return _reject_file_upload()
 
         file_url = (data.get("file_url") or "").strip()
         if not file_url:
             return jsonify({"error": "Missing file_url"}), 400
+
+        upload_source = (data.get("source") or data.get("upload_source") or "url").strip().lower()
+        if upload_source == "device" and not _is_cloudinary_url(file_url):
+            return jsonify(
+                {
+                    "error": (
+                        "Device upload must use a Cloudinary URL. Please upload from your device again."
+                    )
+                }
+            ), 400
+
+        log.info(
+            "UPLOAD REQUEST source=%s url_host=%r url_prefix=%r",
+            upload_source,
+            urlparse(file_url).hostname or "",
+            file_url[:80],
+        )
 
         file_id = uuid.uuid4().hex
         tmp_path: Path | None = None
@@ -1633,8 +1840,9 @@ def upload_pdf():
             extracted.get("metadata", {}).get("statistics", {}).get("ocr_pages", 0)
         )
         log.info(
-            "UPLOAD COMPLETE file_id=%s filename=%r pages=%d ocr_pages=%d chars=%d tokens=%d ms=%s",
+            "UPLOAD COMPLETE file_id=%s source=%s filename=%r pages=%d ocr_pages=%d chars=%d tokens=%d ms=%s",
             file_id,
+            upload_source,
             filename,
             extracted["page_count"],
             ocr_pages,
@@ -1677,11 +1885,22 @@ def search_in_pdf():
 
         pdf_data = load_record(file_id)
         if pdf_data is None:
-            return jsonify({"error": "File not found. Please upload again."}), 404
+            return jsonify(
+                {
+                    "error": (
+                        "File not found in this Vercel instance. Please re-upload the PDF and try again."
+                    )
+                }
+            ), 404
 
-        escaped = re.escape(_RE_WHITESPACE.sub(" ", query))
-        escaped = re.sub(r"\\\s+", r"\\s+", escaped)
-        pattern = re.compile(escaped, re.IGNORECASE)
+        query = query[:500].strip()
+        if not query:
+            return jsonify({"error": "Query too short"}), 400
+
+        normalized_query = _RE_WHITESPACE.sub(" ", query).strip()
+        if not normalized_query:
+            return jsonify({"error": "Query too short"}), 400
+        pattern = re.compile(re.escape(normalized_query), re.IGNORECASE)
 
         results = []
         pages = pdf_data.get("page_texts") or pdf_data.get("pages", [])
@@ -1713,7 +1932,13 @@ def summarize_pdf():
 
         pdf_data = load_record(file_id)
         if pdf_data is None:
-            return jsonify({"error": "File not found. Please upload again."}), 404
+            return jsonify(
+                {
+                    "error": (
+                        "File not found in this Vercel instance. Please re-upload the PDF and try again."
+                    )
+                }
+            ), 404
 
         summary = summarize_text(
             pdf_data.get("cleaned_content") or pdf_data["content"],
