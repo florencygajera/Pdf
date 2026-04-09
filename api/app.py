@@ -701,6 +701,7 @@ HTML_TEMPLATE = """
                     </form>
                     <div class="muted" style="margin-top: 8px;">Upload the PDF to cloud storage first, then paste its public URL here.</div>
                     <div id="uploadStatus" class="muted" style="margin-top: 10px;"></div>
+                    <div id="requestDebugPanel" class="result" style="margin-top: 12px; max-height: 220px;"></div>
                 </div>
 
                 <div class="panel">
@@ -745,6 +746,17 @@ HTML_TEMPLATE = """
         let currentFileId = null;
         const UPLOAD_HEADERS = { 'Content-Type': 'application/json' };
 
+        function updateRequestDebug(payload, headers, payloadBytes) {
+            const debugPanel = document.getElementById('requestDebugPanel');
+            debugPanel.textContent = [
+                'Request Debug',
+                `Payload: ${JSON.stringify(payload, null, 2)}`,
+                `Headers: ${JSON.stringify(headers, null, 2)}`,
+                `Payload Bytes: ${payloadBytes}`,
+                'Expected request body: JSON only, no file, no FormData, no multipart/form-data'
+            ].join('\n\n');
+        }
+
         async function readResponseBody(response) {
             const contentType = response.headers.get('content-type') || '';
 
@@ -787,6 +799,7 @@ HTML_TEMPLATE = """
             console.log('Upload request payload:', payload);
             console.log('Upload request headers:', UPLOAD_HEADERS);
             console.log('Upload request size (bytes):', payloadBytes);
+            updateRequestDebug(payload, UPLOAD_HEADERS, payloadBytes);
 
             if (payloadBytes > 1024) {
                 document.getElementById('uploadStatus').textContent =
