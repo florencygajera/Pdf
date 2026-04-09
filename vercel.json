@@ -1,9 +1,7 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "flask",
   "functions": {
-    "app.py": {
-      "maxDuration": 30
+    "api/app.py": {
+      "runtime": "python3.9"
     }
   }
 }

@@ -608,5 +608,3 @@ def get_content(file_id):
     return jsonify(pdf_data)
 
 
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
