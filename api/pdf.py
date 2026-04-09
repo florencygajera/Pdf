@@ -78,6 +78,7 @@ class IndianLanguagePDFExtractor:
             "mya": {"name": "Burmese", "script": "Myanmar", "tesseract_code": "mya"},
             "eng": {"name": "English", "script": "Latin", "tesseract_code": "eng"},
         }
+        self._page_text_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
 
     def extract_from_pdf(
         self,
@@ -108,6 +109,9 @@ class IndianLanguagePDFExtractor:
             },
             "warnings": [],
         }
+
+        page_cache: Dict[int, Dict[str, Any]] = {}
+        self._page_text_cache[pdf_path] = page_cache
 
         if languages is None:
             languages = ["hin", "eng"]
@@ -140,6 +144,7 @@ class IndianLanguagePDFExtractor:
                         pdf_path=pdf_path,
                     )
                     result["pages"].append(page_data)
+                    page_cache[page_num] = page_data
                     if page_data["cleaned_text"].strip():
                         result["statistics"]["pages_with_text"] += 1
                     if page_data["extraction_method"] == "ocr":
@@ -159,6 +164,7 @@ class IndianLanguagePDFExtractor:
         result["text"] = self._compile_text(result, field_name="raw_text")
         result["cleaned_text"] = self._compile_text(result, field_name="cleaned_text")
         result["statistics"]["languages_detected"] = self._collect_languages(result["pages"])
+        self._page_text_cache.pop(pdf_path, None)
         return result
 
     def _extract_page(
@@ -182,7 +188,7 @@ class IndianLanguagePDFExtractor:
         extraction_method = "digital"
         warning = ""
 
-        if scanned_detected and extract_images:
+        if scanned_detected and extract_images and len(cleaned_direct_text) < 120:
             if self.ocr_enabled:
                 try:
                     ocr_result = self._extract_page_with_ocr(
@@ -256,13 +262,27 @@ class IndianLanguagePDFExtractor:
     def _split_table_cells(self, text: str) -> List[str]:
         import re
 
-        candidates = [cell.strip() for cell in re.split(r"\s{2,}", text) if cell.strip()]
+        normalized = text.replace("\t", "  ").replace("\xa0", " ")
+        candidates = [cell.strip() for cell in re.split(r"\s{2,}", normalized) if cell.strip()]
         if len(candidates) > 1:
             return candidates
-        pipe_candidates = [cell.strip() for cell in text.split("|") if cell.strip()]
+        pipe_candidates = [cell.strip() for cell in normalized.split("|") if cell.strip()]
         if len(pipe_candidates) > 1:
             return pipe_candidates
         return []
+
+    def _normalize_table_cell(self, cell: str) -> str:
+        cell = (cell or "").replace("\xa0", " ").strip()
+        cell = " ".join(cell.split())
+        if self._looks_numeric_cell(cell):
+            cell = cell.replace(" ", "")
+        return cell
+
+    def _looks_numeric_cell(self, cell: str) -> bool:
+        import re
+
+        candidate = cell.replace(",", "").replace(".", "").replace("-", "").replace("(", "").replace(")", "")
+        return bool(candidate) and candidate.isdigit() and bool(re.search(r"\d", cell))
 
     def _looks_like_table_row(self, text: str) -> bool:
         import re
@@ -320,13 +340,17 @@ class IndianLanguagePDFExtractor:
         )
 
         if header_score >= max(1, width // 2):
-            columns = first_row
+            columns = [self._normalize_table_cell(cell) for cell in first_row]
             rows = parsed_rows[1:]
         else:
             columns = [f"column_{index + 1}" for index in range(width)]
             rows = parsed_rows
 
-        rows = [row for row in rows if any(cell for cell in row)]
+        rows = [
+            [self._normalize_table_cell(cell) for cell in row]
+            for row in rows
+            if any(cell for cell in row)
+        ]
         if not rows:
             return None
 
@@ -431,7 +455,10 @@ class IndianLanguagePDFExtractor:
         return {"text": text, "blocks": blocks}
 
     def _render_page_to_image(self, page):
-        matrix = fitz.Matrix(2, 2)
+        page_rect = page.rect
+        page_area = float(page_rect.width * page_rect.height)
+        scale = 1.5 if page_area > 800_000 else 2.0
+        matrix = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=matrix, alpha=False)
         if np is None:
             raise RuntimeError("numpy is required for OCR image conversion")

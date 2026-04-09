@@ -10,9 +10,9 @@ import uuid
 import socket
 import sys
 from pathlib import Path
-from urllib.error import URLError
 from urllib.parse import urlparse, unquote
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, HTTPRedirectHandler
+import time
 
 from flask import Flask, jsonify, render_template_string, request
 from werkzeug.utils import secure_filename
@@ -26,7 +26,7 @@ from pdf import IndianLanguagePDFExtractor
 
 app = Flask(__name__)
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
-MAX_REMOTE_PDF_BYTES = 25 * 1024 * 1024  # 25 MB download cap for Vercel-safe processing
+MAX_REMOTE_PDF_BYTES = 50 * 1024 * 1024  # 50 MB processing limit
 DOWNLOAD_TIMEOUT_SECONDS = 20
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 app.config["JSON_SORT_KEYS"] = False
@@ -165,7 +165,10 @@ def compress_json_response(response):
     if response.direct_passthrough:
         return response
 
-    if response.mimetype == "application/json" and "content-encoding" not in response.headers:
+    if (
+        response.mimetype == "application/json"
+        and "content-encoding" not in response.headers
+    ):
         accept_encoding = request.headers.get("Accept-Encoding", "")
         payload = response.get_data()
         if "gzip" in accept_encoding and len(payload) > 1024:
@@ -214,9 +217,25 @@ def _is_public_host(hostname: str) -> bool:
     return True
 
 
+class LimitedRedirectHandler(HTTPRedirectHandler):
+    max_redirects = 3
+
+    def __init__(self):
+        super().__init__()
+        self._redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self._redirect_count += 1
+        if self._redirect_count > self.max_redirects:
+            raise ValueError("Too many redirects while downloading the PDF.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _filename_from_url_or_headers(file_url: str, headers) -> str:
     content_disposition = headers.get("Content-Disposition", "") if headers else ""
-    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', content_disposition, re.IGNORECASE)
+    match = re.search(
+        r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', content_disposition, re.IGNORECASE
+    )
     if match:
         return secure_filename(unquote(match.group(1))) or "upload.pdf"
 
@@ -241,6 +260,7 @@ def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
         "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
     }
     req = Request(file_url, headers=request_headers)
+    opener = build_opener(LimitedRedirectHandler())
 
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     temp_path = Path(temp_file.name)
@@ -248,7 +268,12 @@ def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
     filename = "upload.pdf"
 
     try:
-        with urlopen(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with opener.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+            final_url = response.geturl()
+            final_host = urlparse(final_url).hostname or ""
+            if not _is_public_host(final_host):
+                raise ValueError("file_url must point to a public host.")
+
             filename = _filename_from_url_or_headers(file_url, response.headers)
             content_length = response.headers.get("Content-Length")
             if content_length:
@@ -257,7 +282,7 @@ def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
                 except (TypeError, ValueError):
                     raise ValueError("Remote file size is invalid.") from None
                 if content_length_value > MAX_REMOTE_PDF_BYTES:
-                    raise ValueError("Remote file is too large.")
+                    raise ValueError("File exceeds processing limit (50MB).")
 
             while True:
                 chunk = response.read(64 * 1024)
@@ -266,7 +291,7 @@ def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
 
                 total_bytes += len(chunk)
                 if total_bytes > MAX_REMOTE_PDF_BYTES:
-                    raise ValueError("Remote file is too large.")
+                    raise ValueError("File exceeds processing limit (50MB).")
 
                 temp_file.write(chunk)
 
@@ -279,6 +304,11 @@ def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
                 raise ValueError("Downloaded file is not a valid PDF.")
 
         return temp_path, filename
+    except (TimeoutError, socket.timeout):
+        temp_file.close()
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise ValueError("Download timed out. Please try a smaller or faster URL.") from None
     except Exception:
         temp_file.close()
         if temp_path.exists():
@@ -386,12 +416,16 @@ def extract_pdf_data(saved_path: Path) -> dict:
     raw_page_texts = []
     tables = []
     structured_sections = []
-    document_title = normalize_whitespace(extracted.get("metadata", {}).get("title", ""))
+    document_title = normalize_whitespace(
+        extracted.get("metadata", {}).get("title", "")
+    )
 
     for page in extracted.get("pages", []):
         page_number = page.get("page_number", len(page_texts) + 1)
         cleaned_text = normalize_whitespace(page.get("cleaned_text", ""))
-        raw_text = normalize_whitespace(page.get("raw_text", "") or page.get("direct_text", ""))
+        raw_text = normalize_whitespace(
+            page.get("raw_text", "") or page.get("direct_text", "")
+        )
         page_texts.append(cleaned_text or raw_text)
         raw_page_texts.append(raw_text or cleaned_text)
 
@@ -426,14 +460,19 @@ def extract_pdf_data(saved_path: Path) -> dict:
     }
 
     cleaned_content = "\n\n".join(part for part in page_texts if part.strip()).strip()
-    raw_content = "\n\n".join(part for part in raw_page_texts if part.strip()).strip() or cleaned_content
+    raw_content = (
+        "\n\n".join(part for part in raw_page_texts if part.strip()).strip()
+        or cleaned_content
+    )
     language_profile = detect_languages(cleaned_content or raw_content)
     metadata = extracted.get("metadata", {})
     metadata["statistics"] = extracted.get("statistics", {})
     metadata["warnings"] = extracted.get("warnings", [])
 
     return {
-        "page_count": extracted.get("metadata", {}).get("page_count", len(extracted.get("pages", []))),
+        "page_count": extracted.get("metadata", {}).get(
+            "page_count", len(extracted.get("pages", []))
+        ),
         "full_content": cleaned_content,
         "content": raw_content,
         "cleaned_content": cleaned_content,
@@ -448,7 +487,9 @@ def extract_pdf_data(saved_path: Path) -> dict:
 
 @app.errorhandler(413)
 def request_too_large(_error):
-    return jsonify({"error": "File too large. Maximum size is 5 MB for this deployment."}), 413
+    return jsonify(
+        {"error": "File too large. Maximum size is 5 MB for this deployment."}
+    ), 413
 
 
 @app.errorhandler(404)
@@ -792,6 +833,29 @@ HTML_TEMPLATE = """
         const MAX_DEVICE_UPLOAD_BYTES = 50 * 1024 * 1024;
         const CLOUDINARY_CLOUD_NAME = "{{ cloudinary_cloud_name }}";
         const CLOUDINARY_UPLOAD_PRESET = "{{ cloudinary_upload_preset }}";
+        const CLOUDINARY_READY = Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_UPLOAD_PRESET);
+        const REQUEST_TIMEOUT_MS = 40000;
+
+        function normalizeUserError(message) {
+            const text = (message || 'Something went wrong.').toString();
+            const lower = text.toLowerCase();
+            if (lower.includes('processing limit')) {
+                return 'File exceeds processing limit (50MB).';
+            }
+            if (lower.includes('cloudinary config')) {
+                return 'Cloudinary is not configured for device uploads on this deployment.';
+            }
+            if (lower.includes('invalid json')) {
+                return 'The server returned an invalid response.';
+            }
+            if (lower.includes('timeout')) {
+                return 'The request timed out while processing the PDF.';
+            }
+            if (lower.includes('url') && (lower.includes('invalid') || lower.includes('public host'))) {
+                return 'Please provide a valid cloud PDF URL.';
+            }
+            return text;
+        }
 
         function setUploadProgress(percent, message) {
             const fill = document.getElementById('uploadProgressFill');
@@ -801,6 +865,28 @@ HTML_TEMPLATE = """
             }
             if (text && message) {
                 text.textContent = message;
+            }
+        }
+
+        function setUploadBusy(isBusy) {
+            const button = document.getElementById('uploadSubmitButton');
+            if (button) {
+                button.disabled = isBusy;
+            }
+            const urlButton = document.getElementById('modeUrlButton');
+            const deviceButton = document.getElementById('modeDeviceButton');
+            if (urlButton) {
+                urlButton.disabled = isBusy;
+            }
+            if (deviceButton) {
+                deviceButton.disabled = isBusy || !CLOUDINARY_READY;
+            }
+        }
+
+        function showConfigError() {
+            const status = document.getElementById('uploadStatus');
+            if (!CLOUDINARY_READY && status) {
+                status.textContent = 'Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET to use device uploads.';
             }
         }
 
@@ -816,6 +902,12 @@ HTML_TEMPLATE = """
         }
 
         function setUploadMode(mode) {
+            if (mode === 'device' && !CLOUDINARY_READY) {
+                uploadMode = 'url';
+                showConfigError();
+                return;
+            }
+
             uploadMode = mode;
 
             const urlButton = document.getElementById('modeUrlButton');
@@ -832,6 +924,7 @@ HTML_TEMPLATE = """
 
             urlButton.classList.toggle('mode-active', isUrlMode);
             deviceButton.classList.toggle('mode-active', !isUrlMode);
+            deviceButton.disabled = !CLOUDINARY_READY;
 
             urlSection.classList.toggle('hidden', !isUrlMode);
             deviceSection.classList.toggle('hidden', isUrlMode);
@@ -884,6 +977,7 @@ HTML_TEMPLATE = """
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', endpoint, true);
                 xhr.responseType = 'json';
+                xhr.timeout = REQUEST_TIMEOUT_MS;
 
                 xhr.upload.onprogress = (event) => {
                     if (!event.lengthComputable) {
@@ -912,6 +1006,7 @@ HTML_TEMPLATE = """
 
                 xhr.onerror = () => reject(new Error('Cloudinary upload failed.'));
                 xhr.onabort = () => reject(new Error('Cloudinary upload was cancelled.'));
+                xhr.ontimeout = () => reject(new Error('Cloudinary upload timed out.'));
                 xhr.send(formData);
             });
         }
@@ -958,16 +1053,25 @@ HTML_TEMPLATE = """
 
             document.getElementById('uploadStatus').textContent = 'Fetching and extracting...';
 
-            const response = await fetch('/api/upload', {
-                method: 'POST',
-                headers: UPLOAD_HEADERS,
-                body: payloadJson
-            });
+            const controller = new AbortController();
+            const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+            let response;
+            try {
+                response = await fetch('/api/upload', {
+                    method: 'POST',
+                    headers: UPLOAD_HEADERS,
+                    body: payloadJson,
+                    signal: controller.signal
+                });
+            } finally {
+                window.clearTimeout(timeoutId);
+            }
 
             const data = await readResponseBody(response);
 
             if (!response.ok) {
-                throw new Error(data.error || 'Upload failed');
+                throw new Error(normalizeUserError(data.error || 'Upload failed'));
             }
 
             currentFileId = data.file_id;
@@ -985,6 +1089,7 @@ HTML_TEMPLATE = """
 
         document.getElementById('uploadForm').addEventListener('submit', async (event) => {
             event.preventDefault();
+            setUploadBusy(true);
 
             try {
                 if (uploadMode === 'device') {
@@ -1002,7 +1107,7 @@ HTML_TEMPLATE = """
                     }
 
                     if (file.size > MAX_DEVICE_UPLOAD_BYTES) {
-                        throw new Error('PDF must be 50 MB or smaller.');
+                        throw new Error('File exceeds processing limit (50MB).');
                     }
 
                     console.log('Device upload file:', {
@@ -1032,15 +1137,29 @@ HTML_TEMPLATE = """
                     throw new Error('Please provide a cloud PDF URL.');
                 }
 
+                try {
+                    const parsed = new URL(fileUrl);
+                    if (!['http:', 'https:'].includes(parsed.protocol)) {
+                        throw new Error('Please provide a valid cloud PDF URL.');
+                    }
+                } catch (_error) {
+                    throw new Error('Please provide a valid cloud PDF URL.');
+                }
+
                 document.getElementById('uploadStatus').textContent = 'Processing...';
                 await sendUrlToBackend(fileUrl, 'url');
             } catch (error) {
-                document.getElementById('uploadStatus').textContent = `Error: ${error.message}`;
-                document.getElementById('uploadProgressText').textContent = error.message;
+                const friendlyError = normalizeUserError(error.message);
+                document.getElementById('uploadStatus').textContent = `Error: ${friendlyError}`;
+                document.getElementById('uploadProgressText').textContent = friendlyError;
+                setUploadProgress(0, friendlyError);
+            } finally {
+                setUploadBusy(false);
             }
         });
 
         setUploadMode('url');
+        showConfigError();
 
         document.getElementById('pdfFile').addEventListener('change', (event) => {
             const file = event.target.files && event.target.files[0];
@@ -1172,18 +1291,35 @@ def _log_upload_request() -> None:
 def _reject_file_upload() -> tuple:
     return (
         jsonify(
-            {
-                "error": "File upload is not allowed. Please provide a cloud file URL."
-            }
+            {"error": "File upload is not allowed. Please provide a cloud file URL."}
         ),
         400,
     )
+
+
+def _friendly_upload_error(message: str):
+    normalized = message or "Upload failed."
+    lower = normalized.lower()
+    if "processing limit" in lower:
+        normalized = "File exceeds processing limit (50MB)."
+    elif "timeout" in lower:
+        normalized = "The request timed out while processing the PDF."
+    elif "cloudinary config" in lower:
+        normalized = "Cloudinary upload is not configured on this deployment."
+    elif "must use http or https" in lower or "file_url is invalid" in lower:
+        normalized = "Please provide a valid cloud PDF URL."
+    elif "public host" in lower:
+        normalized = "That URL is not allowed. Please use a public cloud file URL."
+    elif "download" in lower and "unable" in lower:
+        normalized = "Unable to download the PDF from the provided URL."
+    return jsonify({"error": normalized}), 400
 
 
 @app.route("/api/upload", methods=["POST"])
 def upload_pdf():
     try:
         _log_upload_request()
+        started_at = time.time()
 
         content_type = (request.headers.get("Content-Type") or "").lower()
         if content_type.startswith("multipart/form-data"):
@@ -1223,6 +1359,8 @@ def upload_pdf():
             "content": full_content,
             "cleaned_content": full_content,
             "preview": preview,
+            "content_length": extracted.get("content_length", len(full_content)),
+            "estimated_tokens": extracted.get("estimated_tokens", 0),
             "pages": extracted["page_texts"],
             "page_texts": extracted["page_texts"],
             "language_profile": extracted["language_profile"],
@@ -1232,6 +1370,19 @@ def upload_pdf():
             "metadata": extracted["metadata"],
         }
         save_record(file_id, record)
+        elapsed_ms = round((time.time() - started_at) * 1000, 1)
+        ocr_pages = extracted.get("metadata", {}).get("statistics", {}).get("ocr_pages", 0)
+        print(
+            "UPLOAD COMPLETE",
+            {
+                "file_id": file_id,
+                "filename": filename,
+                "file_size_bytes": extracted.get("content_length", len(full_content)),
+                "processing_time_ms": elapsed_ms,
+                "ocr_pages": ocr_pages,
+            },
+            flush=True,
+        )
 
         return jsonify(
             {
@@ -1241,10 +1392,12 @@ def upload_pdf():
                 "preview": preview,
                 "content": preview,
                 "language_profile": extracted["language_profile"],
+                "content_length": extracted.get("content_length", len(full_content)),
+                "estimated_tokens": extracted.get("estimated_tokens", 0),
             }
         )
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _friendly_upload_error(str(exc))
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -1274,7 +1427,9 @@ def search_in_pdf():
                     {
                         "page": page_num,
                         "position": match.start(),
-                        "context": extract_search_context(page_content, match.start(), match.end()),
+                        "context": extract_search_context(
+                            page_content, match.start(), match.end()
+                        ),
                     }
                 )
 
