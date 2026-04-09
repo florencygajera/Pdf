@@ -2,7 +2,11 @@
 
 Production-ready Flask app for uploading PDFs, extracting text, and searching within the extracted content.
 
-Upload flow: the Flask app now accepts a cloud PDF URL at `/api/upload`, streams the file temporarily for extraction, and returns only a small preview. The remote download is capped for Vercel-safe processing.
+Upload flow:
+- Paste a cloud PDF URL directly into the app, or
+- Choose `Upload from Device` to send the file directly to Cloudinary from the browser, then pass the resulting `secure_url` to Flask.
+
+The Flask app accepts only `{"file_url":"https://..."}` at `/api/upload`, streams the file temporarily for extraction, and returns only a small preview. The remote download is capped for Vercel-safe processing.
 
 ## Local run
 
@@ -22,6 +26,15 @@ Open `http://127.0.0.1:5000`.
 - Keep the project root at `e:\pdf`
 - Make sure `requirements.txt` is at the root
 - Redeploy after pushing the latest commit
+- Set these environment variables for device uploads:
+  - `CLOUDINARY_CLOUD_NAME`
+  - `CLOUDINARY_UPLOAD_PRESET`
+
+## Upload limits
+
+- Device uploads are limited to 50 MB on the client side before Cloudinary upload starts.
+- Flask never receives the raw device file.
+- URL uploads stay JSON-only and never send multipart form data to the backend.
 
 ## Optional OCR extras
 
