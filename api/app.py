@@ -309,100 +309,279 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PDF Content Extractor & Search</title>
     <style>
+        :root {
+            color-scheme: light;
+            --bg: #f3f4f6;
+            --surface: rgba(255, 255, 255, 0.88);
+            --surface-strong: #ffffff;
+            --text: #111827;
+            --muted: #6b7280;
+            --line: #e5e7eb;
+            --accent: #111827;
+            --accent-soft: #374151;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            height: 100%;
+        }
+
         body {
-            font-family: Arial, sans-serif;
-            max-width: 900px;
-            margin: 40px auto;
-            padding: 20px;
-            background: #f5f5f5;
+            margin: 0;
+            min-height: 100vh;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(17, 24, 39, 0.08), transparent 32%),
+                linear-gradient(180deg, #fafafa 0%, var(--bg) 100%);
         }
+
         .container {
-            background: white;
+            min-height: 100vh;
+            width: 100%;
             padding: 28px;
-            border-radius: 12px;
-            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
         }
-        h1 { margin-top: 0; }
+
+        .hero {
+            background: var(--surface);
+            backdrop-filter: blur(18px);
+            border: 1px solid rgba(229, 231, 235, 0.9);
+            border-radius: 24px;
+            padding: 28px;
+            box-shadow: 0 18px 50px rgba(17, 24, 39, 0.06);
+        }
+
+        .hero-top {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: clamp(2rem, 3vw, 3.2rem);
+            letter-spacing: -0.04em;
+            line-height: 1.02;
+        }
+
+        .subtitle {
+            margin: 10px 0 0;
+            max-width: 62ch;
+            color: var(--muted);
+            font-size: 1rem;
+            line-height: 1.6;
+        }
+
+        .hero-badge {
+            align-self: flex-start;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 8px 12px;
+            color: var(--accent);
+            font-size: 0.9rem;
+            background: rgba(255, 255, 255, 0.72);
+        }
+
+        .layout {
+            width: 100%;
+            display: grid;
+            grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
+            gap: 20px;
+            flex: 1;
+        }
+
+        .stack {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
         .panel {
-            border: 1px solid #ddd;
+            background: var(--surface-strong);
+            border: 1px solid var(--line);
             padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
+            border-radius: 20px;
+            box-shadow: 0 12px 32px rgba(17, 24, 39, 0.04);
         }
+
+        .panel h3 {
+            margin: 0 0 14px;
+            font-size: 1rem;
+            letter-spacing: 0.01em;
+        }
+
         .btn {
-            background: #2563eb;
+            background: var(--accent);
             color: white;
-            padding: 10px 16px;
+            padding: 12px 16px;
             border: 0;
-            border-radius: 8px;
+            border-radius: 12px;
             cursor: pointer;
+            font: inherit;
+            transition: transform 0.15s ease, background 0.15s ease, opacity 0.15s ease;
         }
-        .btn:hover { background: #1d4ed8; }
-        .btn:disabled { background: #9ca3af; cursor: not-allowed; }
-        .row { display: flex; gap: 10px; flex-wrap: wrap; }
+        .btn:hover { background: #1f2937; transform: translateY(-1px); }
+        .btn:disabled { background: #9ca3af; cursor: not-allowed; transform: none; }
+
+        .btn-secondary {
+            background: #e5e7eb;
+            color: #111827;
+        }
+        .btn-secondary:hover { background: #d1d5db; }
+
+        .row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
         input[type="file"], input[type="text"] {
-            padding: 10px;
+            padding: 12px 14px;
             font-size: 15px;
+            border-radius: 12px;
+            border: 1px solid var(--line);
+            background: white;
+            width: 100%;
+            font: inherit;
+            color: var(--text);
         }
+
         input[type="text"] { flex: 1; min-width: 220px; }
+
         .result {
             white-space: pre-wrap;
             background: #fafafa;
-            border: 1px solid #e5e7eb;
-            padding: 14px;
-            border-radius: 8px;
+            border: 1px solid var(--line);
+            padding: 16px;
+            border-radius: 14px;
             margin-top: 14px;
-            max-height: 420px;
+            min-height: 160px;
+            max-height: 62vh;
             overflow: auto;
+            line-height: 1.6;
         }
+
         .hidden { display: none; }
-        .muted { color: #6b7280; }
+        .muted { color: var(--muted); }
+
+        .full-height {
+            min-height: 100%;
+        }
+
+        .content-panel {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .content-panel .result {
+            flex: 1;
+        }
+
+        .file-info {
+            font-size: 0.95rem;
+        }
+
+        @media (max-width: 980px) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+
+            .hero {
+                padding: 22px;
+            }
+        }
+
+        @media (max-width: 640px) {
+            .container {
+                padding: 14px;
+            }
+
+            .hero, .panel {
+                border-radius: 18px;
+                padding: 18px;
+            }
+
+            .row {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .btn {
+                width: 100%;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>PDF Content Extractor & Search</h1>
-        <p class="muted">Upload a PDF, extract text, and search within the uploaded document.</p>
-
-        <div class="panel">
-            <h3>Upload PDF</h3>
-            <form id="uploadForm" enctype="multipart/form-data">
-                <div class="row">
-                    <input type="file" id="pdfFile" name="file" accept=".pdf" required>
-                    <button type="submit" class="btn">Upload & Extract</button>
+        <section class="hero">
+            <div class="hero-top">
+                <div>
+                    <h1>PDF Content Extractor</h1>
+                    <p class="subtitle">Upload a PDF, extract readable text, inspect the detected language, summarize the document, and search inside it from one clean full-page workspace.</p>
                 </div>
-            </form>
-            <div id="uploadStatus" class="muted" style="margin-top: 10px;"></div>
-        </div>
-
-        <div id="fileInfo" class="muted"></div>
-
-        <div id="languagePanel" class="panel hidden">
-            <h3>Detected Language</h3>
-            <div id="languageContent" class="result"></div>
-        </div>
-
-        <div id="summaryActions" class="panel hidden">
-            <h3>Summary</h3>
-            <div class="row">
-                <button class="btn" id="summarizeButton" onclick="summarizePDF()">Summarise Whole PDF</button>
+                <div class="hero-badge">Minimal full-page view</div>
             </div>
-            <div id="summaryStatus" class="muted" style="margin-top: 10px;"></div>
-            <div id="summaryContent" class="result"></div>
-        </div>
+        </section>
 
-        <div id="resultPanel" class="panel hidden">
-            <h3>Extracted Content</h3>
-            <div id="extractedContent" class="result"></div>
-        </div>
+        <div class="layout">
+            <div class="stack">
+                <div class="panel">
+                    <h3>Upload PDF</h3>
+                    <form id="uploadForm" enctype="multipart/form-data">
+                        <div class="row">
+                            <input type="file" id="pdfFile" name="file" accept=".pdf" required>
+                            <button type="submit" class="btn">Upload & Extract</button>
+                        </div>
+                    </form>
+                    <div id="uploadStatus" class="muted" style="margin-top: 10px;"></div>
+                </div>
 
-        <div id="searchPanel" class="panel hidden">
-            <h3>Search in PDF</h3>
-            <div class="row">
-                <input type="text" id="searchQuery" placeholder="Enter text to search...">
-                <button class="btn" onclick="searchInPDF()">Search</button>
+                <div class="panel">
+                    <h3>File Info</h3>
+                    <div id="fileInfo" class="muted file-info">No file uploaded yet.</div>
+                </div>
+
+                <div id="languagePanel" class="panel hidden">
+                    <h3>Detected Language</h3>
+                    <div id="languageContent" class="result"></div>
+                </div>
+
+                <div id="summaryActions" class="panel hidden">
+                    <h3>Summary</h3>
+                    <div class="row">
+                        <button class="btn" id="summarizeButton" onclick="summarizePDF()">Summarise Whole PDF</button>
+                    </div>
+                    <div id="summaryStatus" class="muted" style="margin-top: 10px;"></div>
+                    <div id="summaryContent" class="result"></div>
+                </div>
             </div>
-            <div id="searchResults" class="result"></div>
+
+            <div class="stack full-height">
+                <div id="resultPanel" class="panel hidden content-panel">
+                    <h3>Extracted Content</h3>
+                    <div id="extractedContent" class="result"></div>
+                </div>
+
+                <div id="searchPanel" class="panel hidden content-panel">
+                    <h3>Search in PDF</h3>
+                    <div class="row">
+                        <input type="text" id="searchQuery" placeholder="Enter text to search...">
+                        <button class="btn btn-secondary" onclick="searchInPDF()">Search</button>
+                    </div>
+                    <div id="searchResults" class="result"></div>
+                </div>
+            </div>
         </div>
     </div>
 
