@@ -733,6 +733,7 @@ HTML_TEMPLATE = """
                             <div class="row">
                                 <input type="file" id="pdfFile" accept="application/pdf,.pdf">
                             </div>
+                            <div id="selectedFileName" class="muted" style="margin-top: 8px;">No file selected.</div>
                             <div class="muted" style="margin-top: 8px;">PDF only. Client-side limit: 50 MB. File uploads go directly to Cloudinary, not Flask.</div>
                             <div class="progress-wrap">
                                 <div class="progress-bar"><div id="uploadProgressFill"></div></div>
@@ -823,6 +824,7 @@ HTML_TEMPLATE = """
             const deviceSection = document.getElementById('deviceUploadSection');
             const fileUrlInput = document.getElementById('fileUrl');
             const fileInput = document.getElementById('pdfFile');
+            const selectedFileName = document.getElementById('selectedFileName');
             const submitButton = document.getElementById('uploadSubmitButton');
             const hint = document.getElementById('uploadHint');
 
@@ -842,9 +844,17 @@ HTML_TEMPLATE = """
                 ? 'Upload the PDF to cloud storage first, then paste its public URL here.'
                 : 'Select a PDF and upload it directly to Cloudinary. Flask never receives the raw file.';
 
+            if (selectedFileName) {
+                selectedFileName.textContent = isUrlMode ? 'No file selected.' : 'Choose a PDF to upload to Cloudinary.';
+            }
+
             document.getElementById('uploadStatus').textContent = '';
             document.getElementById('requestDebugPanel').textContent = '';
             setUploadProgress(0, isUrlMode ? 'URL mode ready.' : 'Waiting for file selection.');
+
+            if (!isUrlMode) {
+                window.setTimeout(() => fileInput.click(), 0);
+            }
         }
 
         function getCloudinaryUploadEndpoint() {
@@ -1001,6 +1011,11 @@ HTML_TEMPLATE = """
                         size: file.size
                     });
 
+                    const selectedFileName = document.getElementById('selectedFileName');
+                    if (selectedFileName) {
+                        selectedFileName.textContent = `Selected file: ${file.name}`;
+                    }
+
                     document.getElementById('uploadStatus').textContent = 'Uploading to Cloudinary...';
                     setUploadProgress(0, 'Uploading to Cloudinary...');
 
@@ -1026,6 +1041,17 @@ HTML_TEMPLATE = """
         });
 
         setUploadMode('url');
+
+        document.getElementById('pdfFile').addEventListener('change', (event) => {
+            const file = event.target.files && event.target.files[0];
+            const selectedFileName = document.getElementById('selectedFileName');
+            if (selectedFileName) {
+                selectedFileName.textContent = file ? `Selected file: ${file.name}` : 'No file selected.';
+            }
+            if (file) {
+                setUploadProgress(0, `Ready to upload: ${file.name}`);
+            }
+        });
 
         async function searchInPDF() {
             const query = document.getElementById('searchQuery').value.trim();
