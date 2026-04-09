@@ -621,6 +621,10 @@ HTML_TEMPLATE = r"""
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
     <title>PDF Content Extractor &amp; Search</title>
+    <script>
+        window.CLOUDINARY_CLOUD_NAME = {{ cloudinary_cloud_name|tojson }};
+        window.CLOUDINARY_UPLOAD_PRESET = {{ cloudinary_upload_preset|tojson }};
+    </script>
     <style>
         :root {
             color-scheme: light;
@@ -760,11 +764,14 @@ HTML_TEMPLATE = r"""
 
 <script>
 // FIX: use |tojson so Jinja2 properly escapes values for JS — no raw string injection
-const CLOUDINARY_CLOUD_NAME   = {{ cloudinary_cloud_name|tojson }};
-const CLOUDINARY_UPLOAD_PRESET= {{ cloudinary_upload_preset|tojson }};
+const CLOUDINARY_CLOUD_NAME   = window.CLOUDINARY_CLOUD_NAME || "";
+const CLOUDINARY_UPLOAD_PRESET= window.CLOUDINARY_UPLOAD_PRESET || "";
 const CLOUDINARY_READY        = Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_UPLOAD_PRESET);
 const MAX_DEVICE_BYTES        = 50 * 1024 * 1024;
 const TIMEOUT_MS              = 40_000;
+
+console.log("Cloud Name:", CLOUDINARY_CLOUD_NAME);
+console.log("Preset:", CLOUDINARY_UPLOAD_PRESET);
 
 let currentFileId  = null;
 let uploadMode     = 'url';
