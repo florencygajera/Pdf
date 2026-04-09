@@ -227,6 +227,8 @@ class IndianLanguagePDFExtractor:
             "scanned_detected": scanned_detected,
             "extraction_method": extraction_method,
             "blocks": final_blocks,
+            "tables": self._extract_tables_from_blocks(final_blocks),
+            "page_heading": self._extract_page_heading(final_blocks),
             "warning": warning,
         }
 
@@ -250,6 +252,97 @@ class IndianLanguagePDFExtractor:
             )
         blocks.sort(key=lambda item: (round(item["y0"], 1), item["x0"]))
         return blocks
+
+    def _split_table_cells(self, text: str) -> List[str]:
+        import re
+
+        candidates = [cell.strip() for cell in re.split(r"\s{2,}", text) if cell.strip()]
+        if len(candidates) > 1:
+            return candidates
+        pipe_candidates = [cell.strip() for cell in text.split("|") if cell.strip()]
+        if len(pipe_candidates) > 1:
+            return pipe_candidates
+        return []
+
+    def _looks_like_table_row(self, text: str) -> bool:
+        import re
+
+        cells = self._split_table_cells(text)
+        if len(cells) >= 3:
+            return True
+        tokens = text.lower().split()
+        numeric_tokens = sum(bool(re.fullmatch(r"[\d,()./-]+", token)) for token in tokens)
+        return numeric_tokens >= 2 and len(tokens) >= 4
+
+    def _extract_tables_from_blocks(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        tables: List[Dict[str, Any]] = []
+        buffer: List[str] = []
+
+        def flush_buffer() -> None:
+            nonlocal buffer
+            table = self._finalize_table(buffer)
+            if table is not None:
+                tables.append(table)
+            buffer = []
+
+        for block in blocks:
+            text = block.get("text", "").strip()
+            if not text:
+                continue
+            if self._looks_like_table_row(text):
+                buffer.append(text)
+            else:
+                if buffer:
+                    flush_buffer()
+
+        if buffer:
+            flush_buffer()
+
+        return tables
+
+    def _finalize_table(self, raw_rows: List[str]) -> Optional[Dict[str, Any]]:
+        parsed_rows = [self._split_table_cells(row) for row in raw_rows]
+        parsed_rows = [row for row in parsed_rows if len(row) >= 2]
+        if len(parsed_rows) < 2:
+            return None
+
+        width = max(len(row) for row in parsed_rows)
+        if width < 2:
+            return None
+
+        parsed_rows = [row + [""] * (width - len(row)) for row in parsed_rows]
+        first_row = parsed_rows[0]
+        header_score = sum(
+            1
+            for cell in first_row
+            if cell.lower().strip(":") in {"amount", "balance", "bill", "date", "description", "gross", "item", "net", "qty", "quantity", "rate", "total", "unit", "value"}
+            or not cell.replace(",", "").replace(".", "").isdigit()
+        )
+
+        if header_score >= max(1, width // 2):
+            columns = first_row
+            rows = parsed_rows[1:]
+        else:
+            columns = [f"column_{index + 1}" for index in range(width)]
+            rows = parsed_rows
+
+        rows = [row for row in rows if any(cell for cell in row)]
+        if not rows:
+            return None
+
+        return {"columns": columns, "rows": rows}
+
+    def _extract_page_heading(self, blocks: List[Dict[str, Any]]) -> str:
+        if not blocks:
+            return ""
+        first_line = (blocks[0].get("text") or "").strip()
+        if not first_line:
+            return ""
+        if len(first_line) <= 120 and (
+            first_line.isupper() or first_line.endswith(":") or len(first_line.split()) <= 8
+        ):
+            return first_line.rstrip(":")
+        return ""
 
     def _extract_page_with_ocr(
         self,

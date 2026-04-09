@@ -4,11 +4,17 @@ import json
 import re
 import tempfile
 import uuid
+import sys
 from pathlib import Path
 
-import fitz  # PyMuPDF
 from flask import Flask, jsonify, render_template_string, request
 from werkzeug.utils import secure_filename
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+from pdf import IndianLanguagePDFExtractor
 
 
 app = Flask(__name__)
@@ -23,6 +29,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory cache for warm invocations.
 pdf_storage = {}
+PDF_EXTRACTOR = IndianLanguagePDFExtractor()
 
 SCRIPT_RANGES = {
     "hindi": [(0x0900, 0x097F)],
@@ -121,6 +128,27 @@ def all_records():
     return records
 
 
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", (text or "").replace("\xa0", " ")).strip()
+
+
+def clean_text(text: str) -> str:
+    return PDF_EXTRACTOR.clean_text(text or "")
+
+
+def build_search_pattern(query: str):
+    escaped = re.escape(normalize_whitespace(query))
+    escaped = re.sub(r"\\\s+", r"\\s+", escaped)
+    return re.compile(escaped, flags=re.IGNORECASE)
+
+
+def extract_search_context(text: str, start: int, end: int, window: int = 80) -> str:
+    context_start = max(0, start - window)
+    context_end = min(len(text), end + window)
+    context = normalize_whitespace(text[context_start:context_end])
+    return f"...{context}..."
+
+
 def detect_languages(text: str) -> dict:
     counts = {"english": 0, "hindi": 0, "gujarati": 0}
     for char in text:
@@ -194,25 +222,72 @@ def summarize_text(
 
 
 def extract_pdf_data(saved_path: Path) -> dict:
-    content_parts = []
-    page_texts = []
-    with fitz.open(str(saved_path)) as doc:
-        page_count = len(doc)
-        for page_num in range(page_count):
-            page = doc[page_num]
-            text = page.get_text("text")
-            page_texts.append(text)
-            content_parts.append(f"--- Page {page_num + 1} ---\n{text}")
+    extracted = PDF_EXTRACTOR.extract_from_pdf(str(saved_path), extract_images=True)
 
-    full_content = "\n\n".join(content_parts)
-    language_profile = detect_languages(full_content)
+    page_texts = []
+    raw_page_texts = []
+    content_parts = []
+    tables = []
+    structured_sections = []
+    document_title = normalize_whitespace(extracted.get("metadata", {}).get("title", ""))
+
+    for page in extracted.get("pages", []):
+        page_number = page.get("page_number", len(page_texts) + 1)
+        cleaned_text = normalize_whitespace(page.get("cleaned_text", ""))
+        raw_text = normalize_whitespace(page.get("raw_text", "") or page.get("direct_text", ""))
+        page_texts.append(cleaned_text or raw_text)
+        raw_page_texts.append(raw_text or cleaned_text)
+        content_parts.append(f"--- Page {page_number} ---\n{cleaned_text or raw_text}")
+
+        page_heading = normalize_whitespace(page.get("page_heading", ""))
+        if not document_title and page_heading:
+            document_title = page_heading
+
+        section_heading = page_heading or f"Page {page_number}"
+        page_tables = page.get("tables", []) or []
+        section_content = cleaned_text or raw_text
+        structured_sections.append(
+            {
+                "heading": section_heading,
+                "content": section_content,
+                "tables": page_tables,
+            }
+        )
+
+        for table in page_tables:
+            tables.append(
+                {
+                    "page": page_number,
+                    "heading": section_heading,
+                    "columns": table.get("columns", []),
+                    "rows": table.get("rows", []),
+                }
+            )
+
+    structured_document = {
+        "document_title": document_title or extracted["filename"],
+        "sections": structured_sections,
+    }
+
+    cleaned_content = "\n\n".join(part for part in page_texts if part.strip()).strip()
+    raw_content = "\n\n".join(part for part in raw_page_texts if part.strip()).strip() or cleaned_content
+    language_profile = detect_languages(cleaned_content or raw_content)
+    metadata = extracted.get("metadata", {})
+    metadata["statistics"] = extracted.get("statistics", {})
+    metadata["warnings"] = extracted.get("warnings", [])
 
     return {
-        "page_count": page_count,
-        "full_content": full_content,
+        "page_count": extracted.get("metadata", {}).get("page_count", len(extracted.get("pages", []))),
+        "full_content": cleaned_content,
+        "content": raw_content,
+        "cleaned_content": cleaned_content,
         "page_texts": page_texts,
         "language_profile": language_profile,
         "content_parts": content_parts,
+        "structured_document": structured_document,
+        "tables": tables,
+        "metadata": metadata,
+        "pages_data": extracted.get("pages", []),
     }
 
 
@@ -493,11 +568,15 @@ def upload_pdf():
         record = {
             "filename": file.filename,
             "filepath": str(saved_path),
-            "content": extracted["full_content"],
+            "content": extracted["content"],
+            "cleaned_content": extracted["cleaned_content"],
             "pages": extracted["content_parts"],
             "page_texts": extracted["page_texts"],
             "language_profile": extracted["language_profile"],
             "page_count": extracted["page_count"],
+            "structured_document": extracted["structured_document"],
+            "tables": extracted["tables"],
+            "metadata": extracted["metadata"],
         }
         save_record(file_id, record)
 
@@ -506,8 +585,11 @@ def upload_pdf():
                 "file_id": file_id,
                 "filename": file.filename,
                 "page_count": extracted["page_count"],
-                "content": extracted["full_content"],
+                "content": extracted["cleaned_content"],
                 "language_profile": extracted["language_profile"],
+                "structured_document": extracted["structured_document"],
+                "tables": extracted["tables"],
+                "metadata": extracted["metadata"],
             }
         )
     except Exception as exc:
@@ -528,28 +610,20 @@ def search_in_pdf():
         if pdf_data is None:
             return jsonify({"error": "File not found. Please upload again."}), 404
 
+        pattern = build_search_pattern(query)
         results = []
-        for page_num, page_content in enumerate(pdf_data["pages"], start=1):
-            lower_content = page_content.lower()
-            lower_query = query.lower()
-            start = 0
-
-            while True:
-                pos = lower_content.find(lower_query, start)
-                if pos == -1:
-                    break
-
-                context_start = max(0, pos - 50)
-                context_end = min(len(page_content), pos + len(query) + 50)
-                context = page_content[context_start:context_end]
+        page_texts = pdf_data.get("page_texts") or pdf_data.get("pages", [])
+        for page_num, page_content in enumerate(page_texts, start=1):
+            if not page_content:
+                continue
+            for match in pattern.finditer(page_content):
                 results.append(
                     {
                         "page": page_num,
-                        "position": pos,
-                        "context": f"...{context}...",
+                        "position": match.start(),
+                        "context": extract_search_context(page_content, match.start(), match.end()),
                     }
                 )
-                start = pos + 1
 
         return jsonify({"query": query, "count": len(results), "results": results})
     except Exception as exc:
@@ -570,7 +644,7 @@ def summarize_pdf():
             return jsonify({"error": "File not found. Please upload again."}), 404
 
         summary = summarize_text(
-            pdf_data["content"],
+            pdf_data.get("cleaned_content") or pdf_data["content"],
             language_profile=pdf_data.get("language_profile"),
         )
         pdf_data["summary"] = summary
@@ -608,3 +682,12 @@ def get_content(file_id):
         return jsonify({"error": "File not found"}), 404
 
     return jsonify(pdf_data)
+
+
+@app.route("/api/structured/<file_id>", methods=["GET"])
+def get_structured_content(file_id):
+    pdf_data = load_record(file_id)
+    if pdf_data is None:
+        return jsonify({"error": "File not found"}), 404
+
+    return jsonify(pdf_data.get("structured_document", {}))
