@@ -836,6 +836,14 @@ HTML_TEMPLATE = """
         const CLOUDINARY_READY = Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_UPLOAD_PRESET);
         const REQUEST_TIMEOUT_MS = 40000;
 
+        function logCloudinaryConfig(context) {
+            console.log(`Cloudinary config (${context}):`, {
+                cloudName: CLOUDINARY_CLOUD_NAME || null,
+                uploadPreset: CLOUDINARY_UPLOAD_PRESET || null,
+                ready: CLOUDINARY_READY,
+            });
+        }
+
         function normalizeUserError(message) {
             const text = (message || 'Something went wrong.').toString();
             const lower = text.toLowerCase();
@@ -885,8 +893,12 @@ HTML_TEMPLATE = """
 
         function showConfigError() {
             const status = document.getElementById('uploadStatus');
+            const debug = document.getElementById('requestDebugPanel');
             if (!CLOUDINARY_READY && status) {
                 status.textContent = 'Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET to use device uploads.';
+                if (debug) {
+                    debug.textContent = 'Cloudinary config missing. Device uploads are disabled until CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET are set.';
+                }
             }
         }
 
@@ -903,8 +915,8 @@ HTML_TEMPLATE = """
 
         function setUploadMode(mode) {
             if (mode === 'device' && !CLOUDINARY_READY) {
-                uploadMode = 'url';
                 showConfigError();
+                uploadMode = 'device';
                 return;
             }
 
@@ -974,6 +986,7 @@ HTML_TEMPLATE = """
                 const formData = new FormData();
                 formData.append('file', file);
                 formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+                logCloudinaryConfig('upload');
                 console.log('Cloudinary upload endpoint:', endpoint);
                 console.log('Cloudinary upload request:', {
                     fileName: file.name,
@@ -1187,6 +1200,7 @@ HTML_TEMPLATE = """
         });
 
         setUploadMode('url');
+        logCloudinaryConfig('init');
         showConfigError();
 
         document.getElementById('pdfFile').addEventListener('change', (event) => {
