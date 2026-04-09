@@ -1,4 +1,4 @@
-"""Flask API for PDF Content Extraction and Search."""
+"""Flask API for PDF content extraction, cleanup, and structured parsing."""
 
 import json
 import re
@@ -69,6 +69,64 @@ STOPWORDS = {
     }
 }
 
+HEADING_KEYWORDS = {
+    "abstract",
+    "annexure",
+    "amount",
+    "bill",
+    "certificate",
+    "deductions",
+    "details",
+    "engineering",
+    "financial",
+    "gross amount",
+    "introduction",
+    "invoice",
+    "net payable",
+    "notes",
+    "particulars",
+    "payment",
+    "railway",
+    "schedule",
+    "section",
+    "statement",
+    "summary",
+    "tax",
+    "total",
+}
+
+TABLE_HEADER_HINTS = {
+    "amount",
+    "balance",
+    "bill",
+    "code",
+    "date",
+    "deduction",
+    "description",
+    "gross",
+    "item",
+    "net",
+    "no",
+    "particular",
+    "payable",
+    "qty",
+    "quantity",
+    "rate",
+    "remarks",
+    "serial",
+    "sr",
+    "total",
+    "unit",
+    "value",
+}
+
+NOISE_PATTERNS = [
+    re.compile(r"^[\W_]{3,}$"),
+    re.compile(r"^(?:[0Oo]{1,2}[\s./\\-]*){4,}$"),
+    re.compile(r"^(?:[/\\|._-]\s*){4,}$"),
+    re.compile(r"^(?:\.\s*){4,}$"),
+]
+
 
 def record_path(file_id: str) -> Path:
     return CACHE_DIR / f"{file_id}.json"
@@ -117,6 +175,235 @@ def all_records():
             continue
 
     return records
+
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", text.replace("\xa0", " ")).strip()
+
+
+def collapse_broken_words(text: str) -> str:
+    text = re.sub(r"(?<=\w)-\s+(?=\w)", "", text)
+    text = re.sub(r"(?<=\d)\s+(?=\d)", "", text)
+    text = re.sub(r"(?<=\b[A-Za-z])\s+(?=[A-Za-z]\b)", "", text)
+    return normalize_whitespace(text)
+
+
+def is_noise_line(text: str) -> bool:
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return True
+    if len(cleaned) == 1 and not cleaned.isalnum():
+        return True
+    if re.search(r"(stamp|signature|seal)", cleaned, flags=re.IGNORECASE) and len(cleaned) < 24:
+        return True
+    if sum(char.isalnum() for char in cleaned) <= 2 and len(cleaned) >= 3:
+        return True
+    if len(re.findall(r"[^A-Za-z0-9\u0900-\u097F\u0A80-\u0AFF\s]", cleaned)) > max(6, len(cleaned) * 0.45):
+        return True
+    return any(pattern.match(cleaned) for pattern in NOISE_PATTERNS)
+
+
+def clean_line(text: str) -> str:
+    cleaned = normalize_whitespace(text)
+    cleaned = re.sub(r"([/\\|._-])\1{2,}", r"\1", cleaned)
+    cleaned = re.sub(r"([A-Za-z])\1{4,}", r"\1", cleaned)
+    cleaned = collapse_broken_words(cleaned)
+    return cleaned
+
+
+def is_heading(text: str) -> bool:
+    cleaned = normalize_whitespace(text).rstrip(":")
+    if not cleaned or len(cleaned) > 120:
+        return False
+    lowered = cleaned.lower()
+    words = lowered.split()
+    if len(words) > 14:
+        return False
+    if lowered in HEADING_KEYWORDS:
+        return True
+    if any(keyword in lowered for keyword in HEADING_KEYWORDS) and len(words) <= 8:
+        return True
+    if cleaned.isupper() and any(char.isalpha() for char in cleaned):
+        return True
+    alpha_words = [word for word in re.findall(r"[A-Za-z]+", cleaned)]
+    if alpha_words and sum(word[:1].isupper() for word in alpha_words) >= max(1, len(alpha_words) - 1):
+        return len(alpha_words) <= 8
+    return cleaned.endswith(":")
+
+
+def split_table_cells(text: str) -> list[str]:
+    candidates = [normalize_whitespace(cell) for cell in re.split(r"\s{2,}", text) if normalize_whitespace(cell)]
+    if len(candidates) > 1:
+        return candidates
+    pipe_candidates = [normalize_whitespace(cell) for cell in text.split("|") if normalize_whitespace(cell)]
+    if len(pipe_candidates) > 1:
+        return pipe_candidates
+    return []
+
+
+def looks_like_table_row(text: str) -> bool:
+    cells = split_table_cells(text)
+    if len(cells) >= 3:
+        return True
+    tokens = text.lower().split()
+    numeric_tokens = sum(bool(re.fullmatch(r"[\d,()./-]+", token)) for token in tokens)
+    has_header_hint = sum(token.strip(":") in TABLE_HEADER_HINTS for token in tokens)
+    return numeric_tokens >= 2 and (len(tokens) >= 4 or has_header_hint >= 1)
+
+
+def pad_rows(rows: list[list[str]], width: int) -> list[list[str]]:
+    return [row + [""] * (width - len(row)) for row in rows]
+
+
+def finalize_table(raw_rows: list[str]) -> dict | None:
+    parsed_rows = [split_table_cells(row) for row in raw_rows]
+    parsed_rows = [row for row in parsed_rows if len(row) >= 2]
+    if len(parsed_rows) < 2:
+        return None
+
+    width = max(len(row) for row in parsed_rows)
+    if width < 2:
+        return None
+
+    parsed_rows = pad_rows(parsed_rows, width)
+    first_row = parsed_rows[0]
+    header_score = sum(
+        cell.lower().strip(":") in TABLE_HEADER_HINTS or not re.fullmatch(r"[\d,()./-]+", cell or "")
+        for cell in first_row
+        if cell
+    )
+
+    if header_score >= max(1, width // 2):
+        columns = first_row
+        data_rows = parsed_rows[1:]
+    else:
+        columns = [f"column_{index + 1}" for index in range(width)]
+        data_rows = parsed_rows
+
+    data_rows = [row for row in data_rows if any(cell for cell in row)]
+    if not data_rows:
+        return None
+
+    return {"columns": columns, "rows": data_rows}
+
+
+def extract_page_lines(page) -> list[dict]:
+    blocks = page.get_text("blocks")
+    lines = []
+    if blocks:
+        for block in blocks:
+            if len(block) < 5:
+                continue
+            x0, y0, x1, y1, text = block[:5]
+            cleaned = clean_line(text)
+            if is_noise_line(cleaned):
+                continue
+            lines.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "text": cleaned})
+    else:
+        for index, raw_line in enumerate(page.get_text("text").splitlines()):
+            cleaned = clean_line(raw_line)
+            if is_noise_line(cleaned):
+                continue
+            lines.append({"x0": 0, "y0": float(index), "x1": 0, "y1": float(index), "text": cleaned})
+
+    lines.sort(key=lambda item: (round(item["y0"], 1), item["x0"]))
+    return lines
+
+
+def lines_to_sections(page_lines: list[dict]) -> list[dict]:
+    sections = []
+    current_section = {"heading": "General", "content_lines": [], "tables": []}
+    table_buffer: list[str] = []
+
+    def flush_table() -> None:
+        nonlocal table_buffer, current_section
+        table = finalize_table(table_buffer)
+        if table is not None:
+            current_section["tables"].append(table)
+        else:
+            current_section["content_lines"].extend(table_buffer)
+        table_buffer = []
+
+    def flush_section() -> None:
+        nonlocal current_section
+        flush_table()
+        content = "\n".join(current_section["content_lines"]).strip()
+        if content or current_section["tables"] or current_section["heading"] != "General":
+            sections.append(
+                {
+                    "heading": current_section["heading"],
+                    "content": content,
+                    "tables": current_section["tables"],
+                }
+            )
+        current_section = {"heading": "General", "content_lines": [], "tables": []}
+
+    for line in page_lines:
+        text = line["text"]
+        if is_heading(text):
+            flush_section()
+            current_section["heading"] = text.rstrip(":")
+            continue
+
+        if looks_like_table_row(text):
+            table_buffer.append(text)
+            continue
+
+        if table_buffer:
+            flush_table()
+
+        current_section["content_lines"].append(text)
+
+    flush_section()
+    return sections
+
+
+def merge_duplicate_sections(sections: list[dict]) -> list[dict]:
+    merged = []
+    index_by_heading = {}
+    for section in sections:
+        heading = section["heading"].strip() or "General"
+        if heading not in index_by_heading:
+            index_by_heading[heading] = len(merged)
+            merged.append(
+                {
+                    "heading": heading,
+                    "content": section["content"].strip(),
+                    "tables": list(section["tables"]),
+                }
+            )
+            continue
+
+        target = merged[index_by_heading[heading]]
+        if section["content"]:
+            if target["content"]:
+                target["content"] = f"{target['content']}\n{section['content']}".strip()
+            else:
+                target["content"] = section["content"].strip()
+        target["tables"].extend(section["tables"])
+    return merged
+
+
+def extract_document_title(doc, page_lines: list[dict]) -> str:
+    metadata_title = normalize_whitespace(doc.metadata.get("title", ""))
+    if metadata_title:
+        return metadata_title
+    top_lines = [line["text"] for line in page_lines[:5] if len(line["text"]) > 3]
+    return top_lines[0] if top_lines else "Untitled Document"
+
+
+def structured_sections_to_text(sections: list[dict]) -> str:
+    parts = []
+    for section in sections:
+        parts.append(section["heading"])
+        if section["content"]:
+            parts.append(section["content"])
+        for table in section["tables"]:
+            header = " | ".join(table["columns"])
+            parts.append(header)
+            for row in table["rows"]:
+                parts.append(" | ".join(row))
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 def detect_languages(text: str) -> dict:
@@ -194,16 +481,28 @@ def summarize_text(
 def extract_pdf_data(saved_path: Path) -> dict:
     content_parts = []
     page_texts = []
+    structured_sections = []
+    document_title = ""
     with fitz.open(str(saved_path)) as doc:
         page_count = len(doc)
         for page_num in range(page_count):
             page = doc[page_num]
-            text = page.get_text("text")
-            page_texts.append(text)
-            content_parts.append(f"--- Page {page_num + 1} ---\n{text}")
+            page_lines = extract_page_lines(page)
+            if page_num == 0:
+                document_title = extract_document_title(doc, page_lines)
+            page_sections = lines_to_sections(page_lines)
+            structured_sections.extend(page_sections)
+            page_text = structured_sections_to_text(page_sections)
+            page_texts.append(page_text)
+            content_parts.append(f"--- Page {page_num + 1} ---\n{page_text}")
 
-    full_content = "\n\n".join(content_parts)
+    structured_sections = merge_duplicate_sections(structured_sections)
+    full_content = "\n\n".join(content_parts).strip()
     language_profile = detect_languages(full_content)
+    structured_document = {
+        "document_title": document_title,
+        "sections": structured_sections,
+    }
 
     return {
         "page_count": page_count,
@@ -211,6 +510,7 @@ def extract_pdf_data(saved_path: Path) -> dict:
         "page_texts": page_texts,
         "language_profile": language_profile,
         "content_parts": content_parts,
+        "structured_document": structured_document,
     }
 
 
@@ -496,6 +796,7 @@ def upload_pdf():
             "page_texts": extracted["page_texts"],
             "language_profile": extracted["language_profile"],
             "page_count": extracted["page_count"],
+            "structured_document": extracted["structured_document"],
         }
         save_record(file_id, record)
 
@@ -506,6 +807,7 @@ def upload_pdf():
                 "page_count": extracted["page_count"],
                 "content": extracted["full_content"],
                 "language_profile": extracted["language_profile"],
+                "structured_document": extracted["structured_document"],
             }
         )
     except Exception as exc:
@@ -607,4 +909,12 @@ def get_content(file_id):
 
     return jsonify(pdf_data)
 
+
+@app.route("/api/structured/<file_id>", methods=["GET"])
+def get_structured_content(file_id):
+    pdf_data = load_record(file_id)
+    if pdf_data is None:
+        return jsonify({"error": "File not found"}), 404
+
+    return jsonify(pdf_data.get("structured_document", {}))
 
