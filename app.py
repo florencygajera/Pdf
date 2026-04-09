@@ -1,6 +1,7 @@
 """Flask API for PDF Content Extraction and Search."""
 
 import json
+import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -22,6 +23,51 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory cache for warm invocations.
 pdf_storage = {}
+
+SCRIPT_RANGES = {
+    "hindi": [(0x0900, 0x097F)],
+    "gujarati": [(0x0A80, 0x0AFF)],
+    "english": [(0x0041, 0x007A)],
+}
+
+STOPWORDS = {
+    "english": {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "he",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "that",
+        "the",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+        "this",
+        "these",
+        "those",
+        "you",
+        "your",
+        "we",
+        "our",
+        "they",
+        "their",
+    }
+}
 
 
 def record_path(file_id: str) -> Path:
@@ -71,6 +117,101 @@ def all_records():
             continue
 
     return records
+
+
+def detect_languages(text: str) -> dict:
+    counts = {"english": 0, "hindi": 0, "gujarati": 0}
+    for char in text:
+        code = ord(char)
+        for language, ranges in SCRIPT_RANGES.items():
+            for start, end in ranges:
+                if start <= code <= end:
+                    counts[language] += 1
+                    break
+
+    detected = [language for language, count in counts.items() if count > 0]
+    primary = max(counts, key=counts.get) if any(counts.values()) else "unknown"
+    if not detected:
+        primary = "unknown"
+
+    if len([language for language, count in counts.items() if count > 0]) > 1:
+        primary = "mixed"
+
+    return {
+        "primary_language": primary,
+        "detected_languages": detected,
+        "script_counts": counts,
+    }
+
+
+def summarize_text(
+    text: str,
+    language_profile: dict | None = None,
+    max_sentences: int = 3,
+    max_chars: int = 700,
+) -> str:
+    cleaned_text = re.sub(r"\s+", " ", text).strip()
+    if not cleaned_text:
+        return "No readable text was extracted from the PDF."
+
+    sentence_candidates = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", cleaned_text)
+        if sentence.strip()
+    ]
+
+    if len(sentence_candidates) <= max_sentences:
+        summary = " ".join(sentence_candidates)
+        return summary[:max_chars].strip()
+
+    primary_language = (language_profile or {}).get("primary_language", "unknown")
+    if primary_language in {"hindi", "gujarati", "mixed", "unknown"}:
+        summary = " ".join(sentence_candidates[:max_sentences])
+        return summary[:max_chars].strip()
+
+    words = re.findall(r"\w+", cleaned_text.lower(), flags=re.UNICODE)
+    english_words = [word for word in words if word not in STOPWORDS["english"]]
+    if not english_words:
+        return " ".join(sentence_candidates[:max_sentences])[:max_chars].strip()
+
+    frequency = {}
+    for word in english_words:
+        frequency[word] = frequency.get(word, 0) + 1
+
+    ranked_sentences = []
+    for index, sentence in enumerate(sentence_candidates):
+        sentence_words = re.findall(r"\w+", sentence.lower(), flags=re.UNICODE)
+        score = sum(frequency.get(word, 0) for word in sentence_words)
+        score += min(len(sentence_words), 40) * 0.1
+        ranked_sentences.append((score, index, sentence))
+
+    ranked_sentences.sort(key=lambda item: (-item[0], item[1]))
+    selected = sorted(ranked_sentences[:max_sentences], key=lambda item: item[1])
+    summary = " ".join(sentence for _, _, sentence in selected)
+    return summary[:max_chars].strip()
+
+
+def extract_pdf_data(saved_path: Path) -> dict:
+    content_parts = []
+    page_texts = []
+    with fitz.open(str(saved_path)) as doc:
+        page_count = len(doc)
+        for page_num in range(page_count):
+            page = doc[page_num]
+            text = page.get_text("text")
+            page_texts.append(text)
+            content_parts.append(f"--- Page {page_num + 1} ---\n{text}")
+
+    full_content = "\n\n".join(content_parts)
+    language_profile = detect_languages(full_content)
+
+    return {
+        "page_count": page_count,
+        "full_content": full_content,
+        "page_texts": page_texts,
+        "language_profile": language_profile,
+        "content_parts": content_parts,
+    }
 
 
 @app.errorhandler(413)
@@ -159,6 +300,20 @@ HTML_TEMPLATE = """
 
         <div id="fileInfo" class="muted"></div>
 
+        <div id="languagePanel" class="panel hidden">
+            <h3>Detected Language</h3>
+            <div id="languageContent" class="result"></div>
+        </div>
+
+        <div id="summaryActions" class="panel hidden">
+            <h3>Summary</h3>
+            <div class="row">
+                <button class="btn" id="summarizeButton" onclick="summarizePDF()">Summarise Whole PDF</button>
+            </div>
+            <div id="summaryStatus" class="muted" style="margin-top: 10px;"></div>
+            <div id="summaryContent" class="result"></div>
+        </div>
+
         <div id="resultPanel" class="panel hidden">
             <h3>Extracted Content</h3>
             <div id="extractedContent" class="result"></div>
@@ -208,6 +363,11 @@ HTML_TEMPLATE = """
                 currentFileId = data.file_id;
                 document.getElementById('uploadStatus').textContent = 'Upload successful';
                 document.getElementById('fileInfo').textContent = `File: ${data.filename} (${data.page_count} pages)`;
+                document.getElementById('languageContent').textContent = JSON.stringify(data.language_profile, null, 2);
+                document.getElementById('languagePanel').classList.remove('hidden');
+                document.getElementById('summaryActions').classList.remove('hidden');
+                document.getElementById('summaryStatus').textContent = 'Click "Summarise Whole PDF" to generate a summary from the full extracted text.';
+                document.getElementById('summaryContent').textContent = '';
                 document.getElementById('extractedContent').textContent = data.content;
                 document.getElementById('resultPanel').classList.remove('hidden');
                 document.getElementById('searchPanel').classList.remove('hidden');
@@ -258,6 +418,42 @@ HTML_TEMPLATE = """
                 document.getElementById('searchResults').textContent = `Error: ${error.message}`;
             }
         }
+
+        async function summarizePDF() {
+            if (!currentFileId) {
+                alert('Please upload a PDF first');
+                return;
+            }
+
+            const button = document.getElementById('summarizeButton');
+            const status = document.getElementById('summaryStatus');
+            const summaryBox = document.getElementById('summaryContent');
+
+            button.disabled = true;
+            status.textContent = 'Summarising full document...';
+            summaryBox.textContent = '';
+
+            try {
+                const response = await fetch('/api/summarize', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ file_id: currentFileId })
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Summary failed');
+                }
+
+                summaryBox.textContent = data.summary || 'No summary available.';
+                status.textContent = 'Summary generated from the full PDF content.';
+            } catch (error) {
+                status.textContent = `Error: ${error.message}`;
+            } finally {
+                button.disabled = false;
+            }
+        }
     </script>
 </body>
 </html>
@@ -291,21 +487,15 @@ def upload_pdf():
         saved_path = upload_path(file_id, file.filename)
         file.save(saved_path)
 
-        content_parts = []
-        with fitz.open(str(saved_path)) as doc:
-            page_count = len(doc)
-            for page_num in range(page_count):
-                page = doc[page_num]
-                text = page.get_text()
-                content_parts.append(f"--- Page {page_num + 1} ---\n{text}")
-
-        full_content = "\n\n".join(content_parts)
+        extracted = extract_pdf_data(saved_path)
         record = {
             "filename": file.filename,
             "filepath": str(saved_path),
-            "content": full_content,
-            "pages": content_parts,
-            "page_count": page_count,
+            "content": extracted["full_content"],
+            "pages": extracted["content_parts"],
+            "page_texts": extracted["page_texts"],
+            "language_profile": extracted["language_profile"],
+            "page_count": extracted["page_count"],
         }
         save_record(file_id, record)
 
@@ -313,8 +503,9 @@ def upload_pdf():
             {
                 "file_id": file_id,
                 "filename": file.filename,
-                "page_count": page_count,
-                "content": full_content,
+                "page_count": extracted["page_count"],
+                "content": extracted["full_content"],
+                "language_profile": extracted["language_profile"],
             }
         )
     except Exception as exc:
@@ -359,6 +550,37 @@ def search_in_pdf():
                 start = pos + 1
 
         return jsonify({"query": query, "count": len(results), "results": results})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/summarize", methods=["POST"])
+def summarize_pdf():
+    try:
+        data = request.get_json(silent=True) or {}
+        file_id = data.get("file_id")
+
+        if not file_id:
+            return jsonify({"error": "Missing file_id"}), 400
+
+        pdf_data = load_record(file_id)
+        if pdf_data is None:
+            return jsonify({"error": "File not found. Please upload again."}), 404
+
+        summary = summarize_text(
+            pdf_data["content"],
+            language_profile=pdf_data.get("language_profile"),
+        )
+        pdf_data["summary"] = summary
+        save_record(file_id, pdf_data)
+
+        return jsonify(
+            {
+                "file_id": file_id,
+                "summary": summary,
+                "language_profile": pdf_data.get("language_profile", {}),
+            }
+        )
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
