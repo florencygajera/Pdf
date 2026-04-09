@@ -461,6 +461,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
     <title>PDF Content Extractor & Search</title>
     <style>
         :root {
@@ -742,6 +743,7 @@ HTML_TEMPLATE = """
 
     <script>
         let currentFileId = null;
+        const UPLOAD_HEADERS = { 'Content-Type': 'application/json' };
 
         async function readResponseBody(response) {
             const contentType = response.headers.get('content-type') || '';
@@ -771,13 +773,34 @@ HTML_TEMPLATE = """
                 return;
             }
 
+            const payload = { file_url: fileUrl };
+            const payloadKeys = Object.keys(payload);
+            const payloadJson = JSON.stringify(payload);
+            const payloadBytes = new Blob([payloadJson]).size;
+
+            if (payloadKeys.length !== 1 || payloadKeys[0] !== 'file_url') {
+                document.getElementById('uploadStatus').textContent =
+                    'Error: Only file_url is allowed in the request payload.';
+                return;
+            }
+
+            console.log('Upload request payload:', payload);
+            console.log('Upload request headers:', UPLOAD_HEADERS);
+            console.log('Upload request size (bytes):', payloadBytes);
+
+            if (payloadBytes > 1024) {
+                document.getElementById('uploadStatus').textContent =
+                    'Error: Upload request is too large. It must stay under 1 KB.';
+                return;
+            }
+
             document.getElementById('uploadStatus').textContent = 'Processing...';
 
             try {
                 const response = await fetch('/api/upload', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ file_url: fileUrl })
+                    headers: UPLOAD_HEADERS,
+                    body: payloadJson
                 });
 
                 const data = await readResponseBody(response);
