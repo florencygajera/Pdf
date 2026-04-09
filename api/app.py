@@ -966,6 +966,7 @@ HTML_TEMPLATE = """
                 try {
                     endpoint = getCloudinaryUploadEndpoint();
                 } catch (error) {
+                    console.error('Cloudinary config error:', error);
                     reject(error);
                     return;
                 }
@@ -973,6 +974,13 @@ HTML_TEMPLATE = """
                 const formData = new FormData();
                 formData.append('file', file);
                 formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+                console.log('Cloudinary upload endpoint:', endpoint);
+                console.log('Cloudinary upload request:', {
+                    fileName: file.name,
+                    fileType: file.type,
+                    fileSize: file.size,
+                    uploadPresetConfigured: Boolean(CLOUDINARY_UPLOAD_PRESET),
+                });
 
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', endpoint, true);
@@ -991,6 +999,9 @@ HTML_TEMPLATE = """
 
                 xhr.onload = () => {
                     const data = xhr.response || {};
+                    console.log('Cloudinary upload response status:', xhr.status);
+                    console.log('Cloudinary upload response body:', data);
+                    console.log('Cloudinary upload response headers:', xhr.getAllResponseHeaders());
                     if (xhr.status >= 200 && xhr.status < 300 && data.secure_url) {
                         setUploadProgress(100, 'Cloudinary upload complete.');
                         resolve(data.secure_url);
@@ -1000,13 +1011,30 @@ HTML_TEMPLATE = """
                     const message =
                         data?.error?.message ||
                         data?.message ||
-                        `Cloudinary upload failed with status ${xhr.status}.`;
+                        (xhr.status >= 200 && xhr.status < 300
+                            ? 'Cloudinary upload did not return a secure URL.'
+                            : `Cloudinary upload failed with status ${xhr.status}.`);
+                    console.error('Cloudinary upload failed:', {
+                        endpoint,
+                        status: xhr.status,
+                        response: data,
+                        headers: xhr.getAllResponseHeaders(),
+                    });
                     reject(new Error(message));
                 };
 
-                xhr.onerror = () => reject(new Error('Cloudinary upload failed.'));
-                xhr.onabort = () => reject(new Error('Cloudinary upload was cancelled.'));
-                xhr.ontimeout = () => reject(new Error('Cloudinary upload timed out.'));
+                xhr.onerror = () => {
+                    console.error('Cloudinary upload network error:', { endpoint, fileName: file.name });
+                    reject(new Error('Cloudinary upload failed.'));
+                };
+                xhr.onabort = () => {
+                    console.warn('Cloudinary upload cancelled:', { endpoint, fileName: file.name });
+                    reject(new Error('Cloudinary upload was cancelled.'));
+                };
+                xhr.ontimeout = () => {
+                    console.warn('Cloudinary upload timed out:', { endpoint, fileName: file.name });
+                    reject(new Error('Cloudinary upload timed out.'));
+                };
                 xhr.send(formData);
             });
         }
