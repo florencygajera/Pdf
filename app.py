@@ -12,6 +12,7 @@ from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
+app.config["JSON_SORT_KEYS"] = False
 
 STORAGE_DIR = Path(tempfile.gettempdir()) / "pdf_content_extractor"
 UPLOAD_DIR = STORAGE_DIR / "uploads"
@@ -70,6 +71,16 @@ def all_records():
             continue
 
     return records
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({"error": "File too large. Maximum size is 16 MB."}), 413
+
+
+@app.errorhandler(404)
+def not_found(_error):
+    return jsonify({"error": "Not found"}), 404
 
 
 HTML_TEMPLATE = """
@@ -256,6 +267,11 @@ HTML_TEMPLATE = """
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/upload", methods=["POST"])
