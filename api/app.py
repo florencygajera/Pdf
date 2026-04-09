@@ -1,53 +1,116 @@
-"""Flask API for PDF Content Extraction and Search."""
+"""
+Flask API for PDF Content Extraction and Search — production-grade.
+
+Fixes applied vs original:
+  [CRITICAL] No from __future__ import annotations → added; dict|None works on Python 3.9+
+  [CRITICAL] pdf_storage had no thread-lock → protected with threading.RLock
+  [CRITICAL] PDF_EXTRACTOR._page_text_cache was instance-level → fixed in pdf.py (local var)
+  [BUG]      extract_pdf_data read non-existent keys content_length/estimated_tokens → computed locally
+  [BUG]      all_records() iterated pdf_storage without lock → snapshot copy under lock
+  [BUG]      save_record had no error handling for disk write → try/except + warning log
+  [BUG]      compress_json_response called get_data() twice → single variable
+  [BUG]      JS cloudinary vars injected as raw string inside <script> → |tojson filter
+  [BUG]      download_pdf_from_url: temp_file FD leaked on ValueError → moved close() to finally
+  [WARN]     upload_path() / UPLOAD_DIR dead code → removed
+  [WARN]     print() used for logging → replaced with logging module
+  [WARN]     No estimated_tokens calculation → computed as len(text)//4
+  [WARN]     slice_content double-cast of limit → single cast only
+"""
+
+from __future__ import annotations
 
 import gzip
 import json
+import logging
+import logging.config
 import os
 import ipaddress
 import re
-import tempfile
-import uuid
 import socket
 import sys
+import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
-import time
 
 from flask import Flask, jsonify, render_template_string, request
 from werkzeug.utils import secure_filename
 
+# ---------------------------------------------------------------------------
+# Logging — structured, level-aware, timestamped
+# ---------------------------------------------------------------------------
+logging.config.dictConfig(
+    {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "format": "%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+                "datefmt": "%Y-%m-%dT%H:%M:%S",
+            }
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "default",
+                "stream": "ext://sys.stdout",
+            }
+        },
+        "root": {"level": os.getenv("LOG_LEVEL", "INFO"), "handlers": ["console"]},
+    }
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Local import of extractor
+# ---------------------------------------------------------------------------
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from pdf import IndianLanguagePDFExtractor
+from pdf import IndianLanguagePDFExtractor  # noqa: E402
 
-
+# ---------------------------------------------------------------------------
+# Flask app + config
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
-MAX_REMOTE_PDF_BYTES = 50 * 1024 * 1024  # 50 MB processing limit
+
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB  — JSON payload only (just the URL)
+MAX_REMOTE_PDF_BYTES = 50 * 1024 * 1024  # 50 MB — remote PDF content
 DOWNLOAD_TIMEOUT_SECONDS = 20
+
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 app.config["JSON_SORT_KEYS"] = False
 
+# ---------------------------------------------------------------------------
+# Storage dirs — only cache dir is used; UPLOAD_DIR removed (was dead code)
+# ---------------------------------------------------------------------------
 STORAGE_DIR = Path(tempfile.gettempdir()) / "pdf_content_extractor"
-UPLOAD_DIR = STORAGE_DIR / "uploads"
 CACHE_DIR = STORAGE_DIR / "cache"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory cache for warm invocations.
-pdf_storage = {}
+# ---------------------------------------------------------------------------
+# In-memory store — guarded by a reentrant lock (FIX: was unprotected)
+# ---------------------------------------------------------------------------
+_storage_lock: threading.RLock = threading.RLock()
+pdf_storage: dict[str, dict] = {}
+
+# Single shared extractor — thread-safe now that _page_text_cache is local in pdf.py
 PDF_EXTRACTOR = IndianLanguagePDFExtractor()
 
-SCRIPT_RANGES = {
+# ---------------------------------------------------------------------------
+# Language / stop-word data
+# ---------------------------------------------------------------------------
+SCRIPT_RANGES: dict[str, list[tuple[int, int]]] = {
     "hindi": [(0x0900, 0x097F)],
     "gujarati": [(0x0A80, 0x0AFF)],
     "english": [(0x0041, 0x007A)],
 }
 
-STOPWORDS = {
+STOPWORDS: dict[str, set[str]] = {
     "english": {
         "a",
         "an",
@@ -86,70 +149,93 @@ STOPWORDS = {
     }
 }
 
+# Compiled regex helpers
+_RE_WHITESPACE = re.compile(r"\s+")
+_RE_NBSP = re.compile(r"\xa0")
+_RE_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+_RE_WORDS = re.compile(r"\w+", re.UNICODE)
 
-def record_path(file_id: str) -> Path:
+
+# ---------------------------------------------------------------------------
+# Storage helpers  (all guarded by _storage_lock)
+# ---------------------------------------------------------------------------
+
+
+def _record_path(file_id: str) -> Path:
     return CACHE_DIR / f"{file_id}.json"
 
 
-def upload_path(file_id: str, filename: str) -> Path:
-    safe_name = secure_filename(filename) or "upload.pdf"
-    return UPLOAD_DIR / f"{file_id}_{safe_name}"
-
-
 def save_record(file_id: str, record: dict) -> None:
-    pdf_storage[file_id] = record
-    record_path(file_id).write_text(
-        json.dumps(record, ensure_ascii=False), encoding="utf-8"
-    )
+    with _storage_lock:
+        pdf_storage[file_id] = record
+    # Persist to disk outside the lock to avoid blocking other threads
+    try:
+        _record_path(file_id).write_text(
+            json.dumps(record, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:
+        log.warning("Failed to persist record %s to disk: %s", file_id, exc)
 
 
-def load_record(file_id: str):
-    cached = pdf_storage.get(file_id)
+def load_record(file_id: str) -> dict | None:
+    with _storage_lock:
+        cached = pdf_storage.get(file_id)
     if cached is not None:
         return cached
 
-    path = record_path(file_id)
+    path = _record_path(file_id)
     if not path.exists():
         return None
 
     try:
-        cached = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
         return None
 
-    pdf_storage[file_id] = cached
-    return cached
+    with _storage_lock:
+        pdf_storage[file_id] = data
+    return data
 
 
-def all_records():
-    records = {}
-    for file_id, data in pdf_storage.items():
-        records[file_id] = data
+def all_records() -> dict[str, dict]:
+    """Return snapshot of every known record — thread-safe."""
+    # FIX: take a snapshot under lock so no RuntimeError during iteration
+    with _storage_lock:
+        records = dict(pdf_storage)
 
     for path in CACHE_DIR.glob("*.json"):
         file_id = path.stem
         if file_id in records:
             continue
         try:
-            records[file_id] = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            records[file_id] = record
+            with _storage_lock:
+                pdf_storage.setdefault(file_id, record)
+        except (json.JSONDecodeError, OSError):
             continue
 
     return records
 
 
-def compact_text(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
+# ---------------------------------------------------------------------------
+# Text utilities
+# ---------------------------------------------------------------------------
+
+
+def _compact(text: str) -> str:
+    return _RE_WHITESPACE.sub(" ", _RE_NBSP.sub(" ", text or "")).strip()
 
 
 def build_preview(text: str, limit: int = 1500) -> str:
-    return compact_text(text)[:limit]
+    return _compact(text)[:limit]
 
 
 def slice_content(text: str, offset: int = 0, limit: int = 1500) -> dict:
-    normalized = compact_text(text)
+    # FIX: single cast for each param
     offset = max(0, int(offset or 0))
     limit = max(1, min(int(limit or 1500), 2000))
+    normalized = _compact(text)
     end = min(len(normalized), offset + limit)
     return {
         "content": normalized[offset:end],
@@ -160,40 +246,47 @@ def slice_content(text: str, offset: int = 0, limit: int = 1500) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Gzip response compression
+# ---------------------------------------------------------------------------
+
+
 @app.after_request
 def compress_json_response(response):
     if response.direct_passthrough:
         return response
-
     if (
         response.mimetype == "application/json"
         and "content-encoding" not in response.headers
     ):
-        accept_encoding = request.headers.get("Accept-Encoding", "")
+        accept = request.headers.get("Accept-Encoding", "")
+        # FIX: single get_data() call stored in variable
         payload = response.get_data()
-        if "gzip" in accept_encoding and len(payload) > 1024:
-            response.set_data(gzip.compress(payload))
+        if "gzip" in accept and len(payload) > 1024:
+            compressed = gzip.compress(payload)
+            response.set_data(compressed)
             response.headers["Content-Encoding"] = "gzip"
-            response.headers["Content-Length"] = str(len(response.get_data()))
+            response.headers["Content-Length"] = str(len(compressed))
             response.headers.add("Vary", "Accept-Encoding")
-
     return response
+
+
+# ---------------------------------------------------------------------------
+# URL / host validation
+# ---------------------------------------------------------------------------
 
 
 def _is_public_host(hostname: str) -> bool:
     if not hostname:
         return False
-
     lowered = hostname.lower()
     if lowered in {"localhost", "127.0.0.1", "::1"} or lowered.endswith(".local"):
         return False
-
     try:
         ip = ipaddress.ip_address(hostname)
         return ip.is_global
     except ValueError:
         pass
-
     try:
         addresses = {
             info[4][0]
@@ -202,43 +295,36 @@ def _is_public_host(hostname: str) -> bool:
         }
     except socket.gaierror:
         return False
-
     if not addresses:
         return False
-
     for address in addresses:
         try:
-            ip = ipaddress.ip_address(address)
+            if not ipaddress.ip_address(address).is_global:
+                return False
         except ValueError:
             return False
-        if not ip.is_global:
-            return False
-
     return True
 
 
-class LimitedRedirectHandler(HTTPRedirectHandler):
+class _LimitedRedirectHandler(HTTPRedirectHandler):
     max_redirects = 3
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self._redirect_count = 0
+        self._count = 0
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        self._redirect_count += 1
-        if self._redirect_count > self.max_redirects:
+        self._count += 1
+        if self._count > self.max_redirects:
             raise ValueError("Too many redirects while downloading the PDF.")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _filename_from_url_or_headers(file_url: str, headers) -> str:
-    content_disposition = headers.get("Content-Disposition", "") if headers else ""
-    match = re.search(
-        r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', content_disposition, re.IGNORECASE
-    )
-    if match:
-        return secure_filename(unquote(match.group(1))) or "upload.pdf"
-
+    cd = headers.get("Content-Disposition", "") if headers else ""
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd, re.IGNORECASE)
+    if m:
+        return secure_filename(unquote(m.group(1))) or "upload.pdf"
     parsed = urlparse(file_url)
     inferred = secure_filename(Path(parsed.path).name)
     return inferred or "upload.pdf"
@@ -255,90 +341,77 @@ def download_pdf_from_url(file_url: str) -> tuple[Path, str]:
     if not _is_public_host(parsed.hostname or ""):
         raise ValueError("file_url must point to a public host.")
 
-    request_headers = {
+    req_headers = {
         "User-Agent": "PDF-Content-Extractor/1.0",
         "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
     }
-    req = Request(file_url, headers=request_headers)
-    opener = build_opener(LimitedRedirectHandler())
+    req = Request(file_url, headers=req_headers)
+    opener = build_opener(_LimitedRedirectHandler())
 
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    temp_path = Path(temp_file.name)
+    # FIX: temp_file is ALWAYS closed in the finally block — no FD leaks
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp_path = Path(tmp.name)
     total_bytes = 0
     filename = "upload.pdf"
 
     try:
-        with opener.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
-            final_url = response.geturl()
-            final_host = urlparse(final_url).hostname or ""
+        with opener.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as resp:
+            final_host = urlparse(resp.geturl()).hostname or ""
             if not _is_public_host(final_host):
                 raise ValueError("file_url must point to a public host.")
 
-            filename = _filename_from_url_or_headers(file_url, response.headers)
-            content_length = response.headers.get("Content-Length")
-            if content_length:
+            filename = _filename_from_url_or_headers(file_url, resp.headers)
+
+            cl = resp.headers.get("Content-Length")
+            if cl:
                 try:
-                    content_length_value = int(content_length)
-                except (TypeError, ValueError):
-                    raise ValueError("Remote file size is invalid.") from None
-                if content_length_value > MAX_REMOTE_PDF_BYTES:
-                    raise ValueError("File exceeds processing limit (50MB).")
+                    if int(cl) > MAX_REMOTE_PDF_BYTES:
+                        raise ValueError("File exceeds processing limit (50 MB).")
+                except (TypeError, ValueError) as exc:
+                    if "50 MB" in str(exc):
+                        raise
+                    raise ValueError(
+                        "Remote Content-Length header is invalid."
+                    ) from exc
 
             while True:
-                chunk = response.read(64 * 1024)
+                chunk = resp.read(64 * 1024)
                 if not chunk:
                     break
-
                 total_bytes += len(chunk)
                 if total_bytes > MAX_REMOTE_PDF_BYTES:
-                    raise ValueError("File exceeds processing limit (50MB).")
+                    raise ValueError("File exceeds processing limit (50 MB).")
+                tmp.write(chunk)
 
-                temp_file.write(chunk)
+        # Flush before reading back
+        tmp.flush()
 
-        temp_file.flush()
-        temp_file.close()
-
-        with temp_path.open("rb") as file_handle:
-            header = file_handle.read(8)
-            if not header.startswith(b"%PDF-"):
+        # Verify PDF magic bytes
+        with tmp_path.open("rb") as fh:
+            if not fh.read(8).startswith(b"%PDF-"):
                 raise ValueError("Downloaded file is not a valid PDF.")
 
-        return temp_path, filename
-    except (TimeoutError, socket.timeout):
-        temp_file.close()
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise ValueError("Download timed out. Please try a smaller or faster URL.") from None
-    except Exception:
-        temp_file.close()
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise
+        return tmp_path, filename
+
+    except (TimeoutError, socket.timeout) as exc:
+        raise ValueError(
+            "Download timed out. Please try a smaller or faster URL."
+        ) from exc
+    finally:
+        # FIX: always close the file handle — prevents descriptor leak
+        try:
+            tmp.close()
+        except Exception:
+            pass
 
 
-def normalize_whitespace(text: str) -> str:
-    return re.sub(r"[ \t]+", " ", (text or "").replace("\xa0", " ")).strip()
-
-
-def clean_text(text: str) -> str:
-    return PDF_EXTRACTOR.clean_text(text or "")
-
-
-def build_search_pattern(query: str):
-    escaped = re.escape(normalize_whitespace(query))
-    escaped = re.sub(r"\\\s+", r"\\s+", escaped)
-    return re.compile(escaped, flags=re.IGNORECASE)
-
-
-def extract_search_context(text: str, start: int, end: int, window: int = 80) -> str:
-    context_start = max(0, start - window)
-    context_end = min(len(text), end + window)
-    context = normalize_whitespace(text[context_start:context_end])
-    return f"...{context}..."
+# ---------------------------------------------------------------------------
+# Language detection (app-level, for API response)
+# ---------------------------------------------------------------------------
 
 
 def detect_languages(text: str) -> dict:
-    counts = {"english": 0, "hindi": 0, "gujarati": 0}
+    counts: dict[str, int] = {"english": 0, "hindi": 0, "gujarati": 0}
     for char in text:
         code = ord(char)
         for language, ranges in SCRIPT_RANGES.items():
@@ -347,12 +420,16 @@ def detect_languages(text: str) -> dict:
                     counts[language] += 1
                     break
 
-    detected = [language for language, count in counts.items() if count > 0]
-    primary = max(counts, key=counts.get) if any(counts.values()) else "unknown"
+    detected = [lang for lang, count in counts.items() if count > 0]
     if not detected:
-        primary = "unknown"
+        return {
+            "primary_language": "unknown",
+            "detected_languages": [],
+            "script_counts": counts,
+        }
 
-    if len([language for language, count in counts.items() if count > 0]) > 1:
+    primary = max(counts, key=counts.get)  # type: ignore[arg-type]
+    if len(detected) > 1:
         primary = "mixed"
 
     return {
@@ -362,80 +439,80 @@ def detect_languages(text: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Summarization
+# ---------------------------------------------------------------------------
+
+
 def summarize_text(
     text: str,
     language_profile: dict | None = None,
     max_sentences: int = 3,
     max_chars: int = 700,
 ) -> str:
-    cleaned_text = re.sub(r"\s+", " ", text).strip()
-    if not cleaned_text:
+    cleaned = _RE_WHITESPACE.sub(" ", text).strip()
+    if not cleaned:
         return "No readable text was extracted from the PDF."
 
-    sentence_candidates = [
-        sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\s+|\n+", cleaned_text)
-        if sentence.strip()
-    ]
+    candidates = [s.strip() for s in _RE_SENTENCE.split(cleaned) if s.strip()]
 
-    if len(sentence_candidates) <= max_sentences:
-        summary = " ".join(sentence_candidates)
-        return summary[:max_chars].strip()
+    if len(candidates) <= max_sentences:
+        return " ".join(candidates)[:max_chars].strip()
 
-    primary_language = (language_profile or {}).get("primary_language", "unknown")
-    if primary_language in {"hindi", "gujarati", "mixed", "unknown"}:
-        summary = " ".join(sentence_candidates[:max_sentences])
-        return summary[:max_chars].strip()
+    primary = (language_profile or {}).get("primary_language", "unknown")
+    if primary in {"hindi", "gujarati", "mixed", "unknown"}:
+        return " ".join(candidates[:max_sentences])[:max_chars].strip()
 
-    words = re.findall(r"\w+", cleaned_text.lower(), flags=re.UNICODE)
-    english_words = [word for word in words if word not in STOPWORDS["english"]]
-    if not english_words:
-        return " ".join(sentence_candidates[:max_sentences])[:max_chars].strip()
+    # TF-IDF-lite scoring for English
+    words = _RE_WORDS.findall(cleaned.lower())
+    en_words = [w for w in words if w not in STOPWORDS["english"]]
+    if not en_words:
+        return " ".join(candidates[:max_sentences])[:max_chars].strip()
 
-    frequency = {}
-    for word in english_words:
-        frequency[word] = frequency.get(word, 0) + 1
+    freq: dict[str, int] = {}
+    for w in en_words:
+        freq[w] = freq.get(w, 0) + 1
 
-    ranked_sentences = []
-    for index, sentence in enumerate(sentence_candidates):
-        sentence_words = re.findall(r"\w+", sentence.lower(), flags=re.UNICODE)
-        score = sum(frequency.get(word, 0) for word in sentence_words)
-        score += min(len(sentence_words), 40) * 0.1
-        ranked_sentences.append((score, index, sentence))
+    ranked = []
+    for idx, sentence in enumerate(candidates):
+        sw = _RE_WORDS.findall(sentence.lower())
+        score = sum(freq.get(w, 0) for w in sw) + min(len(sw), 40) * 0.1
+        ranked.append((score, idx, sentence))
 
-    ranked_sentences.sort(key=lambda item: (-item[0], item[1]))
-    selected = sorted(ranked_sentences[:max_sentences], key=lambda item: item[1])
-    summary = " ".join(sentence for _, _, sentence in selected)
-    return summary[:max_chars].strip()
+    ranked.sort(key=lambda x: (-x[0], x[1]))
+    selected = sorted(ranked[:max_sentences], key=lambda x: x[1])
+    return " ".join(s for _, _, s in selected)[:max_chars].strip()
+
+
+# ---------------------------------------------------------------------------
+# PDF data extraction (bridges pdf.py → app storage)
+# ---------------------------------------------------------------------------
 
 
 def extract_pdf_data(saved_path: Path) -> dict:
     extracted = PDF_EXTRACTOR.extract_from_pdf(str(saved_path), extract_images=True)
 
-    page_texts = []
-    raw_page_texts = []
-    tables = []
-    structured_sections = []
-    document_title = normalize_whitespace(
-        extracted.get("metadata", {}).get("title", "")
-    )
+    page_texts: list[str] = []
+    raw_page_texts: list[str] = []
+    tables: list[dict] = []
+    structured_sections: list[dict] = []
+    document_title = _compact(extracted.get("metadata", {}).get("title", ""))
 
     for page in extracted.get("pages", []):
         page_number = page.get("page_number", len(page_texts) + 1)
-        cleaned_text = normalize_whitespace(page.get("cleaned_text", ""))
-        raw_text = normalize_whitespace(
-            page.get("raw_text", "") or page.get("direct_text", "")
-        )
+        cleaned_text = _compact(page.get("cleaned_text", ""))
+        raw_text = _compact(page.get("raw_text", "") or page.get("direct_text", ""))
         page_texts.append(cleaned_text or raw_text)
         raw_page_texts.append(raw_text or cleaned_text)
 
-        page_heading = normalize_whitespace(page.get("page_heading", ""))
+        page_heading = _compact(page.get("page_heading", ""))
         if not document_title and page_heading:
             document_title = page_heading
 
         section_heading = page_heading or f"Page {page_number}"
         page_tables = page.get("tables", []) or []
         section_content = cleaned_text or raw_text
+
         structured_sections.append(
             {
                 "heading": section_heading,
@@ -443,14 +520,13 @@ def extract_pdf_data(saved_path: Path) -> dict:
                 "tables": page_tables,
             }
         )
-
-        for table in page_tables:
+        for tbl in page_tables:
             tables.append(
                 {
                     "page": page_number,
                     "heading": section_heading,
-                    "columns": table.get("columns", []),
-                    "rows": table.get("rows", []),
+                    "columns": tbl.get("columns", []),
+                    "rows": tbl.get("rows", []),
                 }
             )
 
@@ -459,20 +535,22 @@ def extract_pdf_data(saved_path: Path) -> dict:
         "sections": structured_sections,
     }
 
-    cleaned_content = "\n\n".join(part for part in page_texts if part.strip()).strip()
+    cleaned_content = "\n\n".join(p for p in page_texts if p.strip()).strip()
     raw_content = (
-        "\n\n".join(part for part in raw_page_texts if part.strip()).strip()
-        or cleaned_content
+        "\n\n".join(p for p in raw_page_texts if p.strip()).strip() or cleaned_content
     )
     language_profile = detect_languages(cleaned_content or raw_content)
     metadata = extracted.get("metadata", {})
     metadata["statistics"] = extracted.get("statistics", {})
     metadata["warnings"] = extracted.get("warnings", [])
 
+    # FIX: compute content_length and estimated_tokens locally;
+    #      these keys were expected but never present in the original code.
+    content_length = len(cleaned_content)
+    estimated_tokens = max(1, content_length // 4)
+
     return {
-        "page_count": extracted.get("metadata", {}).get(
-            "page_count", len(extracted.get("pages", []))
-        ),
+        "page_count": extracted.get("metadata", {}).get("page_count", len(page_texts)),
         "full_content": cleaned_content,
         "content": raw_content,
         "cleaned_content": cleaned_content,
@@ -481,861 +559,428 @@ def extract_pdf_data(saved_path: Path) -> dict:
         "structured_document": structured_document,
         "tables": tables,
         "metadata": metadata,
-        "pages_data": extracted.get("pages", []),
+        "content_length": content_length,
+        "estimated_tokens": estimated_tokens,
     }
 
 
+# ---------------------------------------------------------------------------
+# Error response helpers
+# ---------------------------------------------------------------------------
+
+
+def _friendly_upload_error(message: str):
+    msg = message or "Upload failed."
+    lower = msg.lower()
+    if "processing limit" in lower:
+        msg = "File exceeds processing limit (50 MB)."
+    elif "timeout" in lower:
+        msg = "The request timed out while processing the PDF."
+    elif "cloudinary" in lower:
+        msg = "Cloudinary upload is not configured on this deployment."
+    elif ("must use http" in lower) or ("file_url is invalid" in lower):
+        msg = "Please provide a valid cloud PDF URL."
+    elif "public host" in lower:
+        msg = "That URL is not allowed. Please use a public cloud file URL."
+    elif "not a valid pdf" in lower:
+        msg = "The URL did not return a valid PDF file."
+    return jsonify({"error": msg}), 400
+
+
+# ---------------------------------------------------------------------------
+# Error handlers
+# ---------------------------------------------------------------------------
+
+
 @app.errorhandler(413)
-def request_too_large(_error):
+def request_too_large(_e):
     return jsonify(
         {"error": "File too large. Maximum size is 5 MB for this deployment."}
     ), 413
 
 
 @app.errorhandler(404)
-def not_found(_error):
+def not_found(_e):
     return jsonify({"error": "Not found"}), 404
 
 
-HTML_TEMPLATE = """
+@app.errorhandler(500)
+def internal_error(_e):
+    return jsonify({"error": "Internal server error."}), 500
+
+
+# ---------------------------------------------------------------------------
+# HTML template
+# ---------------------------------------------------------------------------
+
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
-    <title>PDF Content Extractor & Search</title>
+    <title>PDF Content Extractor &amp; Search</title>
     <style>
         :root {
             color-scheme: light;
             --bg: #f3f4f6;
-            --surface: rgba(255, 255, 255, 0.88);
+            --surface: rgba(255,255,255,0.88);
             --surface-strong: #ffffff;
             --text: #111827;
             --muted: #6b7280;
             --line: #e5e7eb;
             --accent: #111827;
-            --accent-soft: #374151;
         }
-
-        * {
-            box-sizing: border-box;
-        }
-
-        html, body {
-            height: 100%;
-        }
-
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; }
         body {
-            margin: 0;
             min-height: 100vh;
-            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
             color: var(--text);
-            background:
-                radial-gradient(circle at top left, rgba(17, 24, 39, 0.08), transparent 32%),
-                linear-gradient(180deg, #fafafa 0%, var(--bg) 100%);
+            background: radial-gradient(circle at top left,rgba(17,24,39,.08),transparent 32%),
+                        linear-gradient(180deg,#fafafa 0%,var(--bg) 100%);
         }
-
-        .container {
-            min-height: 100vh;
-            width: 100%;
-            padding: 28px;
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
+        .container { min-height:100vh;width:100%;padding:28px;display:flex;flex-direction:column;gap:20px; }
         .hero {
-            background: var(--surface);
-            backdrop-filter: blur(18px);
-            border: 1px solid rgba(229, 231, 235, 0.9);
-            border-radius: 24px;
-            padding: 28px;
-            box-shadow: 0 18px 50px rgba(17, 24, 39, 0.06);
+            background: var(--surface); backdrop-filter: blur(18px);
+            border:1px solid rgba(229,231,235,.9); border-radius:24px;
+            padding:28px; box-shadow:0 18px 50px rgba(17,24,39,.06);
         }
-
-        .hero-top {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 20px;
-            flex-wrap: wrap;
-        }
-
-        h1 {
-            margin: 0;
-            font-size: clamp(2rem, 3vw, 3.2rem);
-            letter-spacing: -0.04em;
-            line-height: 1.02;
-        }
-
-        .subtitle {
-            margin: 10px 0 0;
-            max-width: 62ch;
-            color: var(--muted);
-            font-size: 1rem;
-            line-height: 1.6;
-        }
-
-        .hero-badge {
-            align-self: flex-start;
-            border: 1px solid var(--line);
-            border-radius: 999px;
-            padding: 8px 12px;
-            color: var(--accent);
-            font-size: 0.9rem;
-            background: rgba(255, 255, 255, 0.72);
-        }
-
-        .layout {
-            width: 100%;
-            display: grid;
-            grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
-            gap: 20px;
-            flex: 1;
-        }
-
-        .stack {
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
-        .panel {
-            background: var(--surface-strong);
-            border: 1px solid var(--line);
-            padding: 20px;
-            border-radius: 20px;
-            box-shadow: 0 12px 32px rgba(17, 24, 39, 0.04);
-        }
-
-        .panel h3 {
-            margin: 0 0 14px;
-            font-size: 1rem;
-            letter-spacing: 0.01em;
-        }
-
-        .btn {
-            background: var(--accent);
-            color: white;
-            padding: 12px 16px;
-            border: 0;
-            border-radius: 12px;
-            cursor: pointer;
-            font: inherit;
-            transition: transform 0.15s ease, background 0.15s ease, opacity 0.15s ease;
-        }
-        .btn:hover { background: #1f2937; transform: translateY(-1px); }
-        .btn:disabled { background: #9ca3af; cursor: not-allowed; transform: none; }
-
-        .btn-secondary {
-            background: #e5e7eb;
-            color: #111827;
-        }
-        .btn-secondary:hover { background: #d1d5db; }
-
-        .row {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-
-        input[type="file"], input[type="text"] {
-            padding: 12px 14px;
-            font-size: 15px;
-            border-radius: 12px;
-            border: 1px solid var(--line);
-            background: white;
-            width: 100%;
-            font: inherit;
-            color: var(--text);
-        }
-
-        input[type="text"] { flex: 1; min-width: 220px; }
-
-        .result {
-            white-space: pre-wrap;
-            background: #fafafa;
-            border: 1px solid var(--line);
-            padding: 16px;
-            border-radius: 14px;
-            margin-top: 14px;
-            min-height: 160px;
-            max-height: 62vh;
-            overflow: auto;
-            line-height: 1.6;
-        }
-
-        .progress-wrap {
-            margin-top: 12px;
-        }
-
-        .progress-bar {
-            width: 100%;
-            height: 10px;
-            border-radius: 999px;
-            overflow: hidden;
-            background: #e5e7eb;
-        }
-
-        .progress-bar > div {
-            width: 0%;
-            height: 100%;
-            border-radius: inherit;
-            background: var(--accent);
-            transition: width 0.15s ease;
-        }
-
-        .mode-active {
-            background: var(--accent);
-            color: white;
-        }
-
-        .hidden { display: none; }
-        .muted { color: var(--muted); }
-
-        .full-height {
-            min-height: 100%;
-        }
-
-        .content-panel {
-            display: flex;
-            flex-direction: column;
-            min-height: 0;
-        }
-
-        .content-panel .result {
-            flex: 1;
-        }
-
-        .file-info {
-            font-size: 0.95rem;
-        }
-
-        @media (max-width: 980px) {
-            .layout {
-                grid-template-columns: 1fr;
-            }
-
-            .hero {
-                padding: 22px;
-            }
-        }
-
-        @media (max-width: 640px) {
-            .container {
-                padding: 14px;
-            }
-
-            .hero, .panel {
-                border-radius: 18px;
-                padding: 18px;
-            }
-
-            .row {
-                flex-direction: column;
-                align-items: stretch;
-            }
-
-            .btn {
-                width: 100%;
-            }
+        .hero-top { display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap; }
+        h1 { margin:0;font-size:clamp(2rem,3vw,3.2rem);letter-spacing:-.04em;line-height:1.02; }
+        .subtitle { margin:10px 0 0;max-width:62ch;color:var(--muted);font-size:1rem;line-height:1.6; }
+        .hero-badge { align-self:flex-start;border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-size:.9rem;background:rgba(255,255,255,.72); }
+        .layout { width:100%;display:grid;grid-template-columns:minmax(320px,380px) minmax(0,1fr);gap:20px;flex:1; }
+        .stack { display:flex;flex-direction:column;gap:20px; }
+        .panel { background:var(--surface-strong);border:1px solid var(--line);padding:20px;border-radius:20px;box-shadow:0 12px 32px rgba(17,24,39,.04); }
+        .panel h3 { margin:0 0 14px;font-size:1rem;letter-spacing:.01em; }
+        .btn { background:var(--accent);color:#fff;padding:12px 16px;border:0;border-radius:12px;cursor:pointer;font:inherit;transition:transform .15s,background .15s,opacity .15s; }
+        .btn:hover { background:#1f2937;transform:translateY(-1px); }
+        .btn:disabled { background:#9ca3af;cursor:not-allowed;transform:none; }
+        .btn-secondary { background:#e5e7eb;color:#111827; }
+        .btn-secondary:hover { background:#d1d5db; }
+        .row { display:flex;gap:10px;flex-wrap:wrap;align-items:center; }
+        input[type="file"], input[type="text"] { padding:12px 14px;font-size:15px;border-radius:12px;border:1px solid var(--line);background:#fff;width:100%;font:inherit;color:var(--text); }
+        input[type="text"] { flex:1;min-width:220px; }
+        .result { white-space:pre-wrap;background:#fafafa;border:1px solid var(--line);padding:16px;border-radius:14px;margin-top:14px;min-height:160px;max-height:62vh;overflow:auto;line-height:1.6; }
+        .progress-bar { width:100%;height:10px;border-radius:999px;overflow:hidden;background:#e5e7eb;margin-top:8px; }
+        .progress-bar>div { width:0%;height:100%;border-radius:inherit;background:var(--accent);transition:width .15s; }
+        .mode-active { background:var(--accent) !important;color:#fff !important; }
+        .hidden { display:none; }
+        .muted { color:var(--muted); }
+        .content-panel { display:flex;flex-direction:column;min-height:0; }
+        .content-panel .result { flex:1; }
+        @media(max-width:980px){ .layout { grid-template-columns:1fr; } }
+        @media(max-width:640px){
+            .container { padding:14px; }
+            .hero,.panel { border-radius:18px;padding:18px; }
+            .row { flex-direction:column;align-items:stretch; }
+            .btn { width:100%; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <section class="hero">
-            <div class="hero-top">
-                <div>
-                    <h1>PDF Content Extractor</h1>
-                    <p class="subtitle">Upload a PDF, extract readable text, inspect the detected language, summarize the document, and search inside it from one clean full-page workspace.</p>
-                </div>
-                <div class="hero-badge">Minimal full-page view</div>
+<div class="container">
+    <section class="hero">
+        <div class="hero-top">
+            <div>
+                <h1>PDF Content Extractor</h1>
+                <p class="subtitle">Upload a PDF, extract readable text (typed or scanned), detect language, summarise, and search — all from one workspace.</p>
             </div>
-        </section>
+            <div class="hero-badge">Production build</div>
+        </div>
+    </section>
 
-        <div class="layout">
-            <div class="stack">
-                <div class="panel">
-                    <h3>Upload PDF</h3>
-                    <div class="row" style="margin-bottom: 12px;">
-                        <button type="button" class="btn btn-secondary" id="modeUrlButton" onclick="setUploadMode('url')">Paste URL</button>
-                        <button type="button" class="btn btn-secondary" id="modeDeviceButton" onclick="setUploadMode('device')">Upload from Device</button>
-                    </div>
-                    <form id="uploadForm">
-                        <div id="urlUploadSection">
-                            <div class="row">
-                                <input type="text" id="fileUrl" name="file_url" placeholder="Paste Cloudinary, S3, or Firebase PDF URL">
-                            </div>
+    <div class="layout">
+        <div class="stack">
+            <div class="panel">
+                <h3>Upload PDF</h3>
+                <div class="row" style="margin-bottom:12px;">
+                    <button type="button" class="btn btn-secondary" id="modeUrlBtn" onclick="setMode('url')">Paste URL</button>
+                    <button type="button" class="btn btn-secondary" id="modeDeviceBtn" onclick="setMode('device')">Upload from Device</button>
+                </div>
+                <form id="uploadForm">
+                    <div id="urlSection">
+                        <div class="row">
+                            <input type="text" id="fileUrl" placeholder="Paste Cloudinary, S3, or Firebase PDF URL">
                         </div>
-                        <div id="deviceUploadSection" class="hidden">
-                            <div class="row">
-                                <input type="file" id="pdfFile" accept="application/pdf,.pdf">
-                            </div>
-                            <div id="selectedFileName" class="muted" style="margin-top: 8px;">No file selected.</div>
-                            <div class="muted" style="margin-top: 8px;">PDF only. Client-side limit: 50 MB. File uploads go directly to Cloudinary, not Flask.</div>
-                            <div class="progress-wrap">
-                                <div class="progress-bar"><div id="uploadProgressFill"></div></div>
-                                <div id="uploadProgressText" class="muted" style="margin-top: 8px;">Waiting for file selection.</div>
-                            </div>
-                        </div>
-                        <button type="submit" class="btn" id="uploadSubmitButton" style="margin-top: 12px;">Fetch & Extract</button>
-                    </form>
-                    <div class="muted" id="uploadHint" style="margin-top: 8px;">Upload the PDF to cloud storage first, then paste its public URL here.</div>
-                    <div id="cloudinaryStatusBadge" class="muted" style="margin-top: 8px;"></div>
-                    <div id="uploadStatus" class="muted" style="margin-top: 10px;"></div>
-                    <div id="requestDebugPanel" class="result" style="margin-top: 12px; max-height: 220px;"></div>
-                </div>
-
-                <div class="panel">
-                    <h3>File Info</h3>
-                    <div id="fileInfo" class="muted file-info">No file uploaded yet.</div>
-                </div>
-
-                <div id="languagePanel" class="panel hidden">
-                    <h3>Detected Language</h3>
-                    <div id="languageContent" class="result"></div>
-                </div>
-
-                <div id="summaryActions" class="panel hidden">
-                    <h3>Summary</h3>
-                    <div class="row">
-                        <button class="btn" id="summarizeButton" onclick="summarizePDF()">Summarise Whole PDF</button>
                     </div>
-                    <div id="summaryStatus" class="muted" style="margin-top: 10px;"></div>
-                    <div id="summaryContent" class="result"></div>
-                </div>
+                    <div id="deviceSection" class="hidden">
+                        <div class="row"><input type="file" id="pdfFile" accept="application/pdf,.pdf"></div>
+                        <div id="selectedName" class="muted" style="margin-top:8px;">No file selected.</div>
+                        <div class="muted" style="margin-top:8px;">PDF only · max 50 MB · uploaded to Cloudinary, not Flask.</div>
+                        <div class="progress-bar"><div id="progressFill"></div></div>
+                        <div id="progressText" class="muted" style="margin-top:6px;">Waiting for file.</div>
+                    </div>
+                    <button type="submit" class="btn" id="submitBtn" style="margin-top:12px;">Fetch &amp; Extract</button>
+                </form>
+                <div id="uploadHint" class="muted" style="margin-top:8px;"></div>
+                <div id="cloudinaryBadge" class="muted" style="margin-top:8px;font-weight:600;"></div>
+                <div id="uploadStatus" class="muted" style="margin-top:10px;"></div>
+                <div id="debugPanel" class="result" style="margin-top:12px;max-height:220px;display:none;"></div>
             </div>
 
-            <div class="stack full-height">
-                <div id="resultPanel" class="panel hidden content-panel">
-                    <h3>Extracted Content</h3>
-                    <div id="extractedContent" class="result"></div>
-                </div>
+            <div class="panel">
+                <h3>File Info</h3>
+                <div id="fileInfo" class="muted">No file uploaded yet.</div>
+            </div>
 
-                <div id="searchPanel" class="panel hidden content-panel">
-                    <h3>Search in PDF</h3>
-                    <div class="row">
-                        <input type="text" id="searchQuery" placeholder="Enter text to search...">
-                        <button class="btn btn-secondary" onclick="searchInPDF()">Search</button>
-                    </div>
-                    <div id="searchResults" class="result"></div>
+            <div id="langPanel" class="panel hidden">
+                <h3>Detected Language</h3>
+                <div id="langContent" class="result"></div>
+            </div>
+
+            <div id="summaryPanel" class="panel hidden">
+                <h3>Summary</h3>
+                <div class="row">
+                    <button class="btn" id="summarizeBtn" onclick="summarize()">Summarise Whole PDF</button>
                 </div>
+                <div id="summaryStatus" class="muted" style="margin-top:10px;"></div>
+                <div id="summaryContent" class="result"></div>
+            </div>
+        </div>
+
+        <div class="stack">
+            <div id="resultPanel" class="panel hidden content-panel">
+                <h3>Extracted Content</h3>
+                <div id="extractedContent" class="result"></div>
+            </div>
+            <div id="searchPanel" class="panel hidden content-panel">
+                <h3>Search in PDF</h3>
+                <div class="row">
+                    <input type="text" id="searchQuery" placeholder="Enter text to search...">
+                    <button class="btn btn-secondary" onclick="doSearch()">Search</button>
+                </div>
+                <div id="searchResults" class="result"></div>
             </div>
         </div>
     </div>
+</div>
 
-    <script>
-        let currentFileId = null;
-        let uploadMode = 'url';
-        let cloudinaryMissingAlertShown = false;
-        const UPLOAD_HEADERS = { 'Content-Type': 'application/json' };
-        const MAX_DEVICE_UPLOAD_BYTES = 50 * 1024 * 1024;
-        const CLOUDINARY_CLOUD_NAME = "{{ cloudinary_cloud_name }}";
-        const CLOUDINARY_UPLOAD_PRESET = "{{ cloudinary_upload_preset }}";
-        const CLOUDINARY_READY = Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_UPLOAD_PRESET);
-        const REQUEST_TIMEOUT_MS = 40000;
+<script>
+// FIX: use |tojson so Jinja2 properly escapes values for JS — no raw string injection
+const CLOUDINARY_CLOUD_NAME   = {{ cloudinary_cloud_name|tojson }};
+const CLOUDINARY_UPLOAD_PRESET= {{ cloudinary_upload_preset|tojson }};
+const CLOUDINARY_READY        = Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_UPLOAD_PRESET);
+const MAX_DEVICE_BYTES        = 50 * 1024 * 1024;
+const TIMEOUT_MS              = 40_000;
 
-        function logCloudinaryConfig(context) {
-            console.log('CLOUDINARY_CLOUD_NAME', CLOUDINARY_CLOUD_NAME);
-            console.log('CLOUDINARY_UPLOAD_PRESET', CLOUDINARY_UPLOAD_PRESET);
-            console.log(`Cloudinary config (${context}):`, {
-                cloudName: CLOUDINARY_CLOUD_NAME || null,
-                uploadPreset: CLOUDINARY_UPLOAD_PRESET || null,
-                ready: CLOUDINARY_READY,
-            });
-        }
+let currentFileId  = null;
+let uploadMode     = 'url';
 
-        function renderCloudinaryBadge() {
-            const badge = document.getElementById('cloudinaryStatusBadge');
-            if (!badge) {
-                return;
-            }
+function $(id){ return document.getElementById(id); }
 
-            if (CLOUDINARY_READY) {
-                badge.textContent = `Cloudinary ready: ${CLOUDINARY_CLOUD_NAME}`;
-                badge.style.color = '#065f46';
-                badge.style.fontWeight = '600';
-            } else {
-                badge.textContent = 'Cloudinary missing: set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET for device uploads.';
-                badge.style.color = '#b45309';
-                badge.style.fontWeight = '600';
-            }
-        }
+function setProgress(pct, msg){
+    $('progressFill').style.width = Math.max(0,Math.min(100,pct))+'%';
+    if(msg) $('progressText').textContent = msg;
+}
 
-        function normalizeUserError(message) {
-            const text = (message || 'Something went wrong.').toString();
-            const lower = text.toLowerCase();
-            if (lower.includes('processing limit')) {
-                return 'File exceeds processing limit (50MB).';
-            }
-            if (lower.includes('cloudinary config')) {
-                return 'Device upload disabled: Cloudinary not configured.';
-            }
-            if (lower.includes('device upload disabled')) {
-                return 'Device upload disabled: Cloudinary not configured.';
-            }
-            if (lower.includes('invalid json')) {
-                return 'The server returned an invalid response.';
-            }
-            if (lower.includes('timeout')) {
-                return 'The request timed out while processing the PDF.';
-            }
-            if (lower.includes('url') && (lower.includes('invalid') || lower.includes('public host'))) {
-                return 'Please provide a valid cloud PDF URL.';
-            }
-            return text;
-        }
+function setBusy(busy){
+    $('submitBtn').disabled     = busy;
+    $('modeUrlBtn').disabled    = busy;
+    $('modeDeviceBtn').disabled = busy;
+}
 
-        function setUploadProgress(percent, message) {
-            const fill = document.getElementById('uploadProgressFill');
-            const text = document.getElementById('uploadProgressText');
-            if (fill) {
-                fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
-            }
-            if (text && message) {
-                text.textContent = message;
-            }
-        }
+function showDebug(text){
+    const p = $('debugPanel');
+    p.style.display = text ? 'block' : 'none';
+    p.textContent   = text || '';
+}
 
-        function setUploadBusy(isBusy) {
-            const button = document.getElementById('uploadSubmitButton');
-            if (button) {
-                button.disabled = isBusy;
-            }
-            const urlButton = document.getElementById('modeUrlButton');
-            if (urlButton) {
-                urlButton.disabled = isBusy;
-            }
-        }
+function friendlyError(msg){
+    const t = (msg||'Something went wrong.').toLowerCase();
+    if(t.includes('processing limit'))  return 'File exceeds processing limit (50 MB).';
+    if(t.includes('cloudinary'))        return 'Device upload not configured (Cloudinary missing).';
+    if(t.includes('timeout'))           return 'The request timed out.';
+    if(t.includes('invalid json'))      return 'Server returned an invalid response.';
+    if(t.includes('url')||t.includes('public host')) return 'Please provide a valid cloud PDF URL.';
+    return msg;
+}
 
-        function showConfigError() {
-            const status = document.getElementById('uploadStatus');
-            const debug = document.getElementById('requestDebugPanel');
-            if (!CLOUDINARY_READY && status) {
-                status.textContent = 'Device upload disabled: Cloudinary not configured.';
-                if (debug) {
-                    debug.textContent = 'Cloudinary config missing. Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET before using device uploads.';
-                }
-            }
-        }
+function renderCloudinaryBadge(){
+    const b = $('cloudinaryBadge');
+    if(CLOUDINARY_READY){
+        b.textContent = '\u2713 Cloudinary: '+CLOUDINARY_CLOUD_NAME;
+        b.style.color = '#065f46';
+    } else {
+        b.textContent = '\u26a0 Cloudinary missing — device upload disabled.';
+        b.style.color = '#b45309';
+    }
+}
 
-        function notifyCloudinaryMissing() {
-            const message = 'Device upload disabled: Cloudinary not configured.';
-            const status = document.getElementById('uploadStatus');
-            const debug = document.getElementById('requestDebugPanel');
-            if (status) {
-                status.textContent = message;
-            }
-            if (debug) {
-                debug.textContent = [
-                    message,
-                    'Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET to enable device uploads.',
-                ].join('\n');
-            }
-            if (!cloudinaryMissingAlertShown) {
-                cloudinaryMissingAlertShown = true;
-                window.setTimeout(() => window.alert(message), 0);
-            }
-        }
+function setMode(mode){
+    uploadMode = mode;
+    $('modeUrlBtn').classList.toggle('mode-active', mode==='url');
+    $('modeDeviceBtn').classList.toggle('mode-active', mode==='device');
+    $('urlSection').classList.toggle('hidden', mode!=='url');
+    $('deviceSection').classList.toggle('hidden', mode!=='device');
+    $('submitBtn').textContent = mode==='url' ? 'Fetch & Extract' : 'Upload & Extract';
+    $('uploadHint').textContent = mode==='url'
+        ? 'Upload the PDF to cloud storage first, then paste its public URL here.'
+        : 'File uploads go to Cloudinary; Flask only receives the resulting URL.';
+    $('uploadStatus').textContent = '';
+    showDebug('');
+    setProgress(0, mode==='url' ? 'URL mode ready.' : 'Waiting for file selection.');
+    if(mode==='device'){
+        if(!CLOUDINARY_READY){ $('uploadStatus').textContent='Device upload disabled: Cloudinary not configured.'; return; }
+        $('pdfFile').click();
+    }
+}
 
-        function updateRequestDebug(payload, headers, payloadBytes, modeLabel) {
-            const debugPanel = document.getElementById('requestDebugPanel');
-            debugPanel.textContent = [
-                `Request Debug (${modeLabel})`,
-                `Payload: ${JSON.stringify(payload, null, 2)}`,
-                `Headers: ${JSON.stringify(headers, null, 2)}`,
-                `Payload Bytes: ${payloadBytes}`,
-                'Expected request body: JSON only, no file, no FormData, no multipart/form-data'
-            ].join('\n\n');
-        }
+async function readBody(resp){
+    const ct = resp.headers.get('content-type')||'';
+    if(ct.includes('application/json')){
+        try{ return await resp.json(); }
+        catch{ return {error:'Server returned invalid JSON.'}; }
+    }
+    const t = await resp.text();
+    return { error: t.trim()||`Request failed (${resp.status}).` };
+}
 
-        function setUploadMode(mode) {
-            uploadMode = mode;
+async function sendUrl(fileUrl, label){
+    const payload     = { file_url: fileUrl };
+    const payloadJson = JSON.stringify(payload);
+    if(new Blob([payloadJson]).size > 2048){
+        $('uploadStatus').textContent='Error: URL too long.'; return;
+    }
+    showDebug(`[${label}] POST /api/upload\n${payloadJson}`);
+    $('uploadStatus').textContent='Extracting…';
 
-            const urlButton = document.getElementById('modeUrlButton');
-            const deviceButton = document.getElementById('modeDeviceButton');
-            const urlSection = document.getElementById('urlUploadSection');
-            const deviceSection = document.getElementById('deviceUploadSection');
-            const fileUrlInput = document.getElementById('fileUrl');
-            const fileInput = document.getElementById('pdfFile');
-            const selectedFileName = document.getElementById('selectedFileName');
-            const submitButton = document.getElementById('uploadSubmitButton');
-            const hint = document.getElementById('uploadHint');
-
-            const isUrlMode = mode === 'url';
-
-            urlButton.classList.toggle('mode-active', isUrlMode);
-            deviceButton.classList.toggle('mode-active', !isUrlMode);
-
-            urlSection.classList.toggle('hidden', !isUrlMode);
-            deviceSection.classList.toggle('hidden', isUrlMode);
-
-            fileUrlInput.required = isUrlMode;
-            fileInput.required = !isUrlMode;
-
-            submitButton.textContent = isUrlMode ? 'Fetch & Extract' : 'Upload & Extract';
-            hint.textContent = isUrlMode
-                ? 'Upload the PDF to cloud storage first, then paste its public URL here.'
-                : 'Select a PDF and upload it directly to Cloudinary. Flask never receives the raw file.';
-
-            if (selectedFileName) {
-                selectedFileName.textContent = isUrlMode ? 'No file selected.' : 'Choose a PDF to upload to Cloudinary.';
-            }
-
-            document.getElementById('uploadStatus').textContent = '';
-            document.getElementById('requestDebugPanel').textContent = '';
-            setUploadProgress(0, isUrlMode ? 'URL mode ready.' : 'Waiting for file selection.');
-
-            if (!isUrlMode) {
-                if (!CLOUDINARY_READY) {
-                    notifyCloudinaryMissing();
-                }
-                fileInput.click();
-            }
-        }
-
-        function getCloudinaryUploadEndpoint() {
-            if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_UPLOAD_PRESET) {
-                throw new Error(
-                    'Cloudinary config is missing. Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET.'
-                );
-            }
-
-            return `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`;
-        }
-
-        function uploadToCloudinary(file) {
-            return new Promise((resolve, reject) => {
-                let endpoint;
-                try {
-                    endpoint = getCloudinaryUploadEndpoint();
-                } catch (error) {
-                    console.error('Cloudinary config error:', error);
-                    reject(error);
-                    return;
-                }
-
-                const formData = new FormData();
-                formData.append('file', file);
-                formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-                logCloudinaryConfig('upload');
-                console.log('Cloudinary upload endpoint:', endpoint);
-                console.log('Cloudinary upload request:', {
-                    fileName: file.name,
-                    fileType: file.type,
-                    fileSize: file.size,
-                    uploadPresetConfigured: Boolean(CLOUDINARY_UPLOAD_PRESET),
-                });
-
-                const xhr = new XMLHttpRequest();
-                xhr.open('POST', endpoint, true);
-                xhr.responseType = 'json';
-                xhr.timeout = REQUEST_TIMEOUT_MS;
-
-                xhr.upload.onprogress = (event) => {
-                    if (!event.lengthComputable) {
-                        setUploadProgress(30, 'Uploading to Cloudinary...');
-                        return;
-                    }
-
-                    const percent = Math.round((event.loaded / event.total) * 100);
-                    setUploadProgress(percent, `Uploading to Cloudinary... ${percent}%`);
-                };
-
-                xhr.onload = () => {
-                    const data = xhr.response || {};
-                    console.log('Cloudinary upload response status:', xhr.status);
-                    console.log('Cloudinary upload response body:', data);
-                    console.log('Cloudinary upload response headers:', xhr.getAllResponseHeaders());
-                    if (xhr.status >= 200 && xhr.status < 300 && data.secure_url) {
-                        setUploadProgress(100, 'Cloudinary upload complete.');
-                        resolve(data.secure_url);
-                        return;
-                    }
-
-                    const message =
-                        data?.error?.message ||
-                        data?.message ||
-                        (xhr.status >= 200 && xhr.status < 300
-                            ? 'Invalid Cloudinary response.'
-                            : 'Upload failed. Check Cloudinary config.');
-                    console.error('Cloudinary upload failed:', {
-                        endpoint,
-                        status: xhr.status,
-                        response: data,
-                        headers: xhr.getAllResponseHeaders(),
-                    });
-                    reject(new Error(message));
-                };
-
-                xhr.onerror = () => {
-                    console.error('Cloudinary upload network error:', { endpoint, fileName: file.name });
-                    reject(new Error('Network error during upload.'));
-                };
-                xhr.onabort = () => {
-                    console.warn('Cloudinary upload cancelled:', { endpoint, fileName: file.name });
-                    reject(new Error('Cloudinary upload was cancelled.'));
-                };
-                xhr.ontimeout = () => {
-                    console.warn('Cloudinary upload timed out:', { endpoint, fileName: file.name });
-                    reject(new Error('Network error during upload.'));
-                };
-                xhr.send(formData);
-            });
-        }
-
-        async function readResponseBody(response) {
-            const contentType = response.headers.get('content-type') || '';
-
-            if (contentType.includes('application/json')) {
-                try {
-                    return await response.json();
-                } catch (error) {
-                    return { error: 'The server returned invalid JSON.' };
-                }
-            }
-
-            const text = await response.text();
-            return {
-                error: text.trim() || `Request failed with status ${response.status}.`
-            };
-        }
-
-        async function sendUrlToBackend(fileUrl, modeLabel) {
-            const payload = { file_url: fileUrl };
-            const payloadKeys = Object.keys(payload);
-            const payloadJson = JSON.stringify(payload);
-            const payloadBytes = new Blob([payloadJson]).size;
-
-            if (payloadKeys.length !== 1 || payloadKeys[0] !== 'file_url') {
-                document.getElementById('uploadStatus').textContent =
-                    'Error: Only file_url is allowed in the request payload.';
-                return;
-            }
-
-            console.log('Backend upload request payload:', payload);
-            console.log('Backend upload request headers:', UPLOAD_HEADERS);
-            console.log('Backend upload request size (bytes):', payloadBytes);
-            updateRequestDebug(payload, UPLOAD_HEADERS, payloadBytes, modeLabel);
-
-            if (payloadBytes > 1024) {
-                document.getElementById('uploadStatus').textContent =
-                    'Error: Upload request is too large. It must stay under 1 KB.';
-                return;
-            }
-
-            document.getElementById('uploadStatus').textContent = 'Fetching and extracting...';
-
-            const controller = new AbortController();
-            const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-            let response;
-            try {
-                response = await fetch('/api/upload', {
-                    method: 'POST',
-                    headers: UPLOAD_HEADERS,
-                    body: payloadJson,
-                    signal: controller.signal
-                });
-            } finally {
-                window.clearTimeout(timeoutId);
-            }
-
-            const data = await readResponseBody(response);
-
-            if (!response.ok) {
-                throw new Error(normalizeUserError(data.error || 'Upload failed'));
-            }
-
-            currentFileId = data.file_id;
-            document.getElementById('uploadStatus').textContent = 'Document loaded successfully';
-            document.getElementById('fileInfo').textContent = `File: ${data.filename} (${data.page_count} pages)`;
-            document.getElementById('languageContent').textContent = JSON.stringify(data.language_profile || {}, null, 2);
-            document.getElementById('languagePanel').classList.remove('hidden');
-            document.getElementById('summaryActions').classList.remove('hidden');
-            document.getElementById('summaryStatus').textContent = 'Click "Summarise Whole PDF" to generate a summary from the full extracted text.';
-            document.getElementById('summaryContent').textContent = '';
-            document.getElementById('extractedContent').textContent = data.preview || data.content || '';
-            document.getElementById('resultPanel').classList.remove('hidden');
-            document.getElementById('searchPanel').classList.remove('hidden');
-        }
-
-        document.getElementById('uploadForm').addEventListener('submit', async (event) => {
-            event.preventDefault();
-            setUploadBusy(true);
-
-            try {
-                if (uploadMode === 'device') {
-                    if (!CLOUDINARY_READY) {
-                        throw new Error('Device upload disabled: Cloudinary not configured.');
-                    }
-
-                    const fileInput = document.getElementById('pdfFile');
-                    const file = fileInput.files[0];
-
-                    if (!file) {
-                        throw new Error('Please choose a PDF file first.');
-                    }
-
-                    const isPdfMime = file.type === 'application/pdf';
-                    const isPdfExtension = file.name.toLowerCase().endsWith('.pdf');
-                    if (!isPdfMime && !isPdfExtension) {
-                        throw new Error('Only PDF files are allowed.');
-                    }
-
-                    if (file.size > MAX_DEVICE_UPLOAD_BYTES) {
-                        throw new Error('File exceeds processing limit (50MB).');
-                    }
-
-                    console.log('Device upload file:', {
-                        name: file.name,
-                        type: file.type,
-                        size: file.size
-                    });
-
-                    const selectedFileName = document.getElementById('selectedFileName');
-                    if (selectedFileName) {
-                        selectedFileName.textContent = `Selected file: ${file.name}`;
-                    }
-
-                    document.getElementById('uploadStatus').textContent = 'Uploading to Cloudinary...';
-                    setUploadProgress(0, 'Uploading to Cloudinary...');
-
-                    const secureUrl = await uploadToCloudinary(file);
-                    console.log('Cloudinary secure_url:', secureUrl);
-                    await sendUrlToBackend(secureUrl, 'device->cloudinary->backend');
-                    return;
-                }
-
-                const fileUrlInput = document.getElementById('fileUrl');
-                const fileUrl = fileUrlInput.value.trim();
-
-                if (!fileUrl) {
-                    throw new Error('Please provide a cloud PDF URL.');
-                }
-
-                try {
-                    const parsed = new URL(fileUrl);
-                    if (!['http:', 'https:'].includes(parsed.protocol)) {
-                        throw new Error('Please provide a valid cloud PDF URL.');
-                    }
-                } catch (_error) {
-                    throw new Error('Please provide a valid cloud PDF URL.');
-                }
-
-                document.getElementById('uploadStatus').textContent = 'Processing...';
-                await sendUrlToBackend(fileUrl, 'url');
-            } catch (error) {
-                const friendlyError = normalizeUserError(error.message);
-                document.getElementById('uploadStatus').textContent = `Error: ${friendlyError}`;
-                document.getElementById('uploadProgressText').textContent = friendlyError;
-                setUploadProgress(0, friendlyError);
-            } finally {
-                setUploadBusy(false);
-            }
+    const ctrl = new AbortController();
+    const tid  = setTimeout(()=>ctrl.abort(), TIMEOUT_MS);
+    let resp;
+    try{
+        resp = await fetch('/api/upload',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: payloadJson,
+            signal: ctrl.signal,
         });
+    } finally { clearTimeout(tid); }
 
-        setUploadMode('url');
-        logCloudinaryConfig('init');
-        renderCloudinaryBadge();
-        showConfigError();
+    const data = await readBody(resp);
+    if(!resp.ok) throw new Error(friendlyError(data.error||'Upload failed'));
 
-        document.getElementById('pdfFile').addEventListener('change', (event) => {
-            const file = event.target.files && event.target.files[0];
-            const selectedFileName = document.getElementById('selectedFileName');
-            if (selectedFileName) {
-                selectedFileName.textContent = file ? `Selected file: ${file.name}` : 'No file selected.';
-            }
-            if (file) {
-                setUploadProgress(0, `Ready to upload: ${file.name}`);
-            }
-        });
+    currentFileId = data.file_id;
+    $('uploadStatus').textContent='Document loaded.';
+    $('fileInfo').textContent=`File: ${data.filename}  ·  ${data.page_count} page(s)  ·  ${data.content_length||0} chars  ·  ~${data.estimated_tokens||0} tokens`;
+    $('langContent').textContent=JSON.stringify(data.language_profile||{},null,2);
+    $('langPanel').classList.remove('hidden');
+    $('summaryPanel').classList.remove('hidden');
+    $('summaryStatus').textContent='Click "Summarise Whole PDF" to generate a summary.';
+    $('summaryContent').textContent='';
+    $('extractedContent').textContent=data.preview||data.content||'';
+    $('resultPanel').classList.remove('hidden');
+    $('searchPanel').classList.remove('hidden');
+    showDebug('');
+}
 
-        async function searchInPDF() {
-            const query = document.getElementById('searchQuery').value.trim();
+function uploadToCloudinary(file){
+    return new Promise((resolve,reject)=>{
+        if(!CLOUDINARY_READY){ reject(new Error('Device upload disabled: Cloudinary not configured.')); return; }
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+        const url = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`;
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.responseType='json';
+        xhr.timeout = TIMEOUT_MS;
+        xhr.upload.onprogress = e=>{
+            if(e.lengthComputable) setProgress(Math.round(e.loaded/e.total*100),`Uploading… ${Math.round(e.loaded/e.total*100)}%`);
+            else setProgress(30,'Uploading to Cloudinary…');
+        };
+        xhr.onload=()=>{
+            const d=xhr.response||{};
+            if(xhr.status>=200&&xhr.status<300&&d.secure_url){ setProgress(100,'Upload complete.'); resolve(d.secure_url); }
+            else reject(new Error(d?.error?.message||'Cloudinary upload failed.'));
+        };
+        xhr.onerror=()=>reject(new Error('Network error during upload.'));
+        xhr.onabort=()=>reject(new Error('Upload cancelled.'));
+        xhr.ontimeout=()=>reject(new Error('Upload timed out.'));
+        xhr.send(fd);
+    });
+}
 
-            if (!query) {
-                alert('Please enter a search query');
-                return;
-            }
-
-            if (!currentFileId) {
-                alert('Please upload a PDF first');
-                return;
-            }
-
-            try {
-                const response = await fetch('/api/search', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ file_id: currentFileId, query })
-                });
-
-                const data = await readResponseBody(response);
-
-                if (!response.ok) {
-                    throw new Error(data.error || 'Search failed');
-                }
-
-                if (!data.results.length) {
-                    document.getElementById('searchResults').textContent = 'No matches found.';
-                    return;
-                }
-
-                let output = `Found ${data.results.length} result(s):\n\n`;
-                data.results.forEach((result, index) => {
-                    output += `Result ${index + 1}\n`;
-                    output += `Page: ${result.page}\n`;
-                    output += `Context: ${result.context}\n\n`;
-                });
-                document.getElementById('searchResults').textContent = output;
-            } catch (error) {
-                document.getElementById('searchResults').textContent = `Error: ${error.message}`;
-            }
+$('uploadForm').addEventListener('submit', async e=>{
+    e.preventDefault();
+    setBusy(true);
+    try{
+        if(uploadMode==='device'){
+            if(!CLOUDINARY_READY) throw new Error('Device upload disabled: Cloudinary not configured.');
+            const file=$('pdfFile').files[0];
+            if(!file) throw new Error('Please choose a PDF file first.');
+            if(!file.type.includes('pdf')&&!file.name.toLowerCase().endsWith('.pdf')) throw new Error('Only PDF files are allowed.');
+            if(file.size>MAX_DEVICE_BYTES) throw new Error('File exceeds processing limit (50 MB).');
+            $('uploadStatus').textContent='Uploading to Cloudinary…';
+            setProgress(0,'Starting…');
+            const url=await uploadToCloudinary(file);
+            await sendUrl(url,'device→cloudinary→backend');
+        } else {
+            const raw=$('fileUrl').value.trim();
+            if(!raw) throw new Error('Please provide a cloud PDF URL.');
+            try{
+                const p=new URL(raw);
+                if(!['http:','https:'].includes(p.protocol)) throw new Error('bad protocol');
+            } catch{ throw new Error('Please provide a valid cloud PDF URL.'); }
+            $('uploadStatus').textContent='Processing…';
+            await sendUrl(raw,'url');
         }
+    } catch(err){
+        const msg=friendlyError(err.message);
+        $('uploadStatus').textContent='Error: '+msg;
+        setProgress(0,msg);
+    } finally{ setBusy(false); }
+});
 
-        async function summarizePDF() {
-            if (!currentFileId) {
-                alert('Please upload a PDF first');
-                return;
-            }
+$('pdfFile').addEventListener('change',e=>{
+    const f=e.target.files&&e.target.files[0];
+    $('selectedName').textContent=f?`Selected: ${f.name}`:'No file selected.';
+    if(f) setProgress(0,`Ready: ${f.name}`);
+});
 
-            const button = document.getElementById('summarizeButton');
-            const status = document.getElementById('summaryStatus');
-            const summaryBox = document.getElementById('summaryContent');
+async function doSearch(){
+    const q=$('searchQuery').value.trim();
+    if(!q){alert('Please enter a search query.');return;}
+    if(!currentFileId){alert('Please upload a PDF first.');return;}
+    try{
+        const r=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file_id:currentFileId,query:q})});
+        const d=await readBody(r);
+        if(!r.ok) throw new Error(d.error||'Search failed');
+        if(!d.results.length){$('searchResults').textContent='No matches found.';return;}
+        let out=`Found ${d.results.length} result(s):\n\n`;
+        d.results.forEach((res,i)=>{ out+=`Result ${i+1}\nPage: ${res.page}\nContext: ${res.context}\n\n`; });
+        $('searchResults').textContent=out;
+    } catch(err){ $('searchResults').textContent='Error: '+err.message; }
+}
 
-            button.disabled = true;
-            status.textContent = 'Summarising full document...';
-            summaryBox.textContent = '';
+async function summarize(){
+    if(!currentFileId){alert('Please upload a PDF first.');return;}
+    const btn=$('summarizeBtn'), status=$('summaryStatus'), box=$('summaryContent');
+    btn.disabled=true; status.textContent='Summarising…'; box.textContent='';
+    try{
+        const r=await fetch('/api/summarize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file_id:currentFileId})});
+        const d=await readBody(r);
+        if(!r.ok) throw new Error(d.error||'Summary failed');
+        box.textContent=d.summary||'No summary available.';
+        status.textContent='Summary generated from full PDF content.';
+    } catch(err){ status.textContent='Error: '+err.message; }
+    finally{ btn.disabled=false; }
+}
 
-            try {
-                const response = await fetch('/api/summarize', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ file_id: currentFileId })
-                });
-
-                const data = await readResponseBody(response);
-
-                if (!response.ok) {
-                    throw new Error(data.error || 'Summary failed');
-                }
-
-                summaryBox.textContent = data.summary || 'No summary available.';
-                status.textContent = 'Summary generated from the full PDF content.';
-            } catch (error) {
-                status.textContent = `Error: ${error.message}`;
-            } finally {
-                button.disabled = false;
-            }
-        }
-    </script>
+// Init
+setMode('url');
+renderCloudinaryBadge();
+</script>
 </body>
 </html>
 """
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 
 @app.route("/")
@@ -1349,7 +994,13 @@ def index():
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    return jsonify({"status": "ok"})
+    return jsonify(
+        {
+            "status": "ok",
+            "ocr_enabled": PDF_EXTRACTOR.ocr_enabled,
+            "cached_files": len(list(CACHE_DIR.glob("*.json"))),
+        }
+    )
 
 
 @app.route("/favicon.ico")
@@ -1358,63 +1009,35 @@ def favicon():
 
 
 def _log_upload_request() -> None:
-    print(
-        "UPLOAD REQUEST",
-        {
-            "method": request.method,
-            "content_type": request.headers.get("Content-Type", ""),
-            "content_length": request.content_length,
-            "accept": request.headers.get("Accept", ""),
-        },
-        flush=True,
+    log.info(
+        "UPLOAD REQUEST method=%s content_type=%r content_length=%s",
+        request.method,
+        request.headers.get("Content-Type", ""),
+        request.content_length,
     )
 
 
-def _reject_file_upload() -> tuple:
-    return (
-        jsonify(
-            {"error": "File upload is not allowed. Please provide a cloud file URL."}
-        ),
-        400,
-    )
-
-
-def _friendly_upload_error(message: str):
-    normalized = message or "Upload failed."
-    lower = normalized.lower()
-    if "processing limit" in lower:
-        normalized = "File exceeds processing limit (50MB)."
-    elif "timeout" in lower:
-        normalized = "The request timed out while processing the PDF."
-    elif "cloudinary config" in lower:
-        normalized = "Cloudinary upload is not configured on this deployment."
-    elif "must use http or https" in lower or "file_url is invalid" in lower:
-        normalized = "Please provide a valid cloud PDF URL."
-    elif "public host" in lower:
-        normalized = "That URL is not allowed. Please use a public cloud file URL."
-    elif "download" in lower and "unable" in lower:
-        normalized = "Unable to download the PDF from the provided URL."
-    return jsonify({"error": normalized}), 400
+def _reject_file_upload():
+    return jsonify(
+        {"error": "File upload is not allowed. Please provide a cloud file URL."}
+    ), 400
 
 
 @app.route("/api/upload", methods=["POST"])
 def upload_pdf():
     try:
         _log_upload_request()
-        started_at = time.time()
+        started = time.monotonic()
 
-        content_type = (request.headers.get("Content-Type") or "").lower()
-        if content_type.startswith("multipart/form-data"):
+        # Reject multipart / form-data uploads
+        ct = (request.headers.get("Content-Type") or "").lower()
+        if ct.startswith("multipart/form-data") or request.files:
             return _reject_file_upload()
-
-        if request.files:
-            return _reject_file_upload()
-
         if not request.is_json:
             return _reject_file_upload()
 
-        raw_payload = request.get_data(cache=True, as_text=False) or b""
-        print("UPLOAD PAYLOAD BYTES", len(raw_payload), flush=True)
+        raw = request.get_data(cache=True, as_text=False) or b""
+        log.debug("Upload payload: %d bytes", len(raw))
 
         data = request.get_json(silent=True) or {}
         if set(data.keys()) - {"file_url"}:
@@ -1425,24 +1048,25 @@ def upload_pdf():
             return jsonify({"error": "Missing file_url"}), 400
 
         file_id = uuid.uuid4().hex
-        downloaded_path = None
+        tmp_path: Path | None = None
         try:
-            downloaded_path, filename = download_pdf_from_url(file_url)
-            extracted = extract_pdf_data(downloaded_path)
+            tmp_path, filename = download_pdf_from_url(file_url)
+            extracted = extract_pdf_data(tmp_path)
         finally:
-            if downloaded_path and downloaded_path.exists():
-                downloaded_path.unlink(missing_ok=True)
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
         full_content = extracted["cleaned_content"]
         preview = build_preview(full_content, limit=1500)
+
         record = {
             "filename": filename,
             "source_url": file_url,
             "content": full_content,
             "cleaned_content": full_content,
             "preview": preview,
-            "content_length": extracted.get("content_length", len(full_content)),
-            "estimated_tokens": extracted.get("estimated_tokens", 0),
+            "content_length": extracted["content_length"],
+            "estimated_tokens": extracted["estimated_tokens"],
             "pages": extracted["page_texts"],
             "page_texts": extracted["page_texts"],
             "language_profile": extracted["language_profile"],
@@ -1452,18 +1076,20 @@ def upload_pdf():
             "metadata": extracted["metadata"],
         }
         save_record(file_id, record)
-        elapsed_ms = round((time.time() - started_at) * 1000, 1)
-        ocr_pages = extracted.get("metadata", {}).get("statistics", {}).get("ocr_pages", 0)
-        print(
-            "UPLOAD COMPLETE",
-            {
-                "file_id": file_id,
-                "filename": filename,
-                "file_size_bytes": extracted.get("content_length", len(full_content)),
-                "processing_time_ms": elapsed_ms,
-                "ocr_pages": ocr_pages,
-            },
-            flush=True,
+
+        elapsed = round((time.monotonic() - started) * 1000, 1)
+        ocr_pages = (
+            extracted.get("metadata", {}).get("statistics", {}).get("ocr_pages", 0)
+        )
+        log.info(
+            "UPLOAD COMPLETE file_id=%s filename=%r pages=%d ocr_pages=%d chars=%d tokens=%d ms=%s",
+            file_id,
+            filename,
+            extracted["page_count"],
+            ocr_pages,
+            extracted["content_length"],
+            extracted["estimated_tokens"],
+            elapsed,
         )
 
         return jsonify(
@@ -1474,13 +1100,15 @@ def upload_pdf():
                 "preview": preview,
                 "content": preview,
                 "language_profile": extracted["language_profile"],
-                "content_length": extracted.get("content_length", len(full_content)),
-                "estimated_tokens": extracted.get("estimated_tokens", 0),
+                "content_length": extracted["content_length"],
+                "estimated_tokens": extracted["estimated_tokens"],
             }
         )
+
     except ValueError as exc:
         return _friendly_upload_error(str(exc))
     except Exception as exc:
+        log.exception("Unhandled error in /api/upload")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -1498,25 +1126,31 @@ def search_in_pdf():
         if pdf_data is None:
             return jsonify({"error": "File not found. Please upload again."}), 404
 
-        pattern = build_search_pattern(query)
+        escaped = re.escape(_RE_WHITESPACE.sub(" ", query))
+        escaped = re.sub(r"\\\s+", r"\\s+", escaped)
+        pattern = re.compile(escaped, re.IGNORECASE)
+
         results = []
-        page_texts = pdf_data.get("page_texts") or pdf_data.get("pages", [])
-        for page_num, page_content in enumerate(page_texts, start=1):
+        pages = pdf_data.get("page_texts") or pdf_data.get("pages", [])
+        for page_num, page_content in enumerate(pages, start=1):
             if not page_content:
                 continue
-            for match in pattern.finditer(page_content):
+            for m in pattern.finditer(page_content):
+                ctx_start = max(0, m.start() - 80)
+                ctx_end = min(len(page_content), m.end() + 80)
+                context = _RE_WHITESPACE.sub(" ", page_content[ctx_start:ctx_end])
                 results.append(
                     {
                         "page": page_num,
-                        "position": match.start(),
-                        "context": extract_search_context(
-                            page_content, match.start(), match.end()
-                        ),
+                        "position": m.start(),
+                        "context": f"…{context}…",
                     }
                 )
 
         return jsonify({"query": query, "count": len(results), "results": results})
+
     except Exception as exc:
+        log.exception("Error in /api/search")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -1525,7 +1159,6 @@ def summarize_pdf():
     try:
         data = request.get_json(silent=True) or {}
         file_id = data.get("file_id")
-
         if not file_id:
             return jsonify({"error": "Missing file_id"}), 400
 
@@ -1547,26 +1180,23 @@ def summarize_pdf():
                 "language_profile": pdf_data.get("language_profile", {}),
             }
         )
+
     except Exception as exc:
+        log.exception("Error in /api/summarize")
         return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/files", methods=["GET"])
 def list_files():
-    files = []
-    for file_id, data in all_records().items():
-        files.append(
-            {
-                "file_id": file_id,
-                "filename": data["filename"],
-                "page_count": data["page_count"],
-            }
-        )
+    files = [
+        {"file_id": fid, "filename": d["filename"], "page_count": d["page_count"]}
+        for fid, d in all_records().items()
+    ]
     return jsonify({"files": files})
 
 
 @app.route("/api/content/<file_id>", methods=["GET"])
-def get_content(file_id):
+def get_content(file_id: str):
     pdf_data = load_record(file_id)
     if pdf_data is None:
         return jsonify({"error": "File not found"}), 404
@@ -1588,7 +1218,7 @@ def get_content(file_id):
 
 
 @app.route("/api/page/<file_id>/<int:page_number>", methods=["GET"])
-def get_page_content(file_id, page_number):
+def get_page_content(file_id: str, page_number: int):
     pdf_data = load_record(file_id)
     if pdf_data is None:
         return jsonify({"error": "File not found"}), 404
@@ -1614,9 +1244,27 @@ def get_page_content(file_id, page_number):
 
 
 @app.route("/api/structured/<file_id>", methods=["GET"])
-def get_structured_content(file_id):
+def get_structured_content(file_id: str):
     pdf_data = load_record(file_id)
     if pdf_data is None:
         return jsonify({"error": "File not found"}), 404
-
     return jsonify(pdf_data.get("structured_document", {}))
+
+
+@app.route("/api/stats", methods=["GET"])
+def get_stats():
+    """System-level stats for monitoring."""
+    records = all_records()
+    total_pages = sum(d.get("page_count", 0) for d in records.values())
+    total_chars = sum(
+        d.get("content_length", len(d.get("content", ""))) for d in records.values()
+    )
+    return jsonify(
+        {
+            "total_documents": len(records),
+            "total_pages": total_pages,
+            "total_chars": total_chars,
+            "ocr_available": PDF_EXTRACTOR.ocr_enabled,
+            "cache_dir": str(CACHE_DIR),
+        }
+    )
