@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import os
 import ipaddress
 import re
 import tempfile
@@ -625,6 +626,31 @@ HTML_TEMPLATE = """
             line-height: 1.6;
         }
 
+        .progress-wrap {
+            margin-top: 12px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 10px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: #e5e7eb;
+        }
+
+        .progress-bar > div {
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: var(--accent);
+            transition: width 0.15s ease;
+        }
+
+        .mode-active {
+            background: var(--accent);
+            color: white;
+        }
+
         .hidden { display: none; }
         .muted { color: var(--muted); }
 
@@ -693,13 +719,29 @@ HTML_TEMPLATE = """
             <div class="stack">
                 <div class="panel">
                     <h3>Upload PDF</h3>
+                    <div class="row" style="margin-bottom: 12px;">
+                        <button type="button" class="btn btn-secondary" id="modeUrlButton" onclick="setUploadMode('url')">Paste URL</button>
+                        <button type="button" class="btn btn-secondary" id="modeDeviceButton" onclick="setUploadMode('device')">Upload from Device</button>
+                    </div>
                     <form id="uploadForm">
-                        <div class="row">
-                            <input type="text" id="fileUrl" name="file_url" placeholder="Paste Cloudinary, S3, or Firebase PDF URL" required>
-                            <button type="submit" class="btn">Fetch & Extract</button>
+                        <div id="urlUploadSection">
+                            <div class="row">
+                                <input type="text" id="fileUrl" name="file_url" placeholder="Paste Cloudinary, S3, or Firebase PDF URL">
+                            </div>
                         </div>
+                        <div id="deviceUploadSection" class="hidden">
+                            <div class="row">
+                                <input type="file" id="pdfFile" accept="application/pdf,.pdf">
+                            </div>
+                            <div class="muted" style="margin-top: 8px;">PDF only. Client-side limit: 50 MB. File uploads go directly to Cloudinary, not Flask.</div>
+                            <div class="progress-wrap">
+                                <div class="progress-bar"><div id="uploadProgressFill"></div></div>
+                                <div id="uploadProgressText" class="muted" style="margin-top: 8px;">Waiting for file selection.</div>
+                            </div>
+                        </div>
+                        <button type="submit" class="btn" id="uploadSubmitButton" style="margin-top: 12px;">Fetch & Extract</button>
                     </form>
-                    <div class="muted" style="margin-top: 8px;">Upload the PDF to cloud storage first, then paste its public URL here.</div>
+                    <div class="muted" id="uploadHint" style="margin-top: 8px;">Upload the PDF to cloud storage first, then paste its public URL here.</div>
                     <div id="uploadStatus" class="muted" style="margin-top: 10px;"></div>
                     <div id="requestDebugPanel" class="result" style="margin-top: 12px; max-height: 220px;"></div>
                 </div>
@@ -744,17 +786,124 @@ HTML_TEMPLATE = """
 
     <script>
         let currentFileId = null;
+        let uploadMode = 'url';
         const UPLOAD_HEADERS = { 'Content-Type': 'application/json' };
+        const MAX_DEVICE_UPLOAD_BYTES = 50 * 1024 * 1024;
+        const CLOUDINARY_CLOUD_NAME = "{{ cloudinary_cloud_name }}";
+        const CLOUDINARY_UPLOAD_PRESET = "{{ cloudinary_upload_preset }}";
 
-        function updateRequestDebug(payload, headers, payloadBytes) {
+        function setUploadProgress(percent, message) {
+            const fill = document.getElementById('uploadProgressFill');
+            const text = document.getElementById('uploadProgressText');
+            if (fill) {
+                fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+            }
+            if (text && message) {
+                text.textContent = message;
+            }
+        }
+
+        function updateRequestDebug(payload, headers, payloadBytes, modeLabel) {
             const debugPanel = document.getElementById('requestDebugPanel');
             debugPanel.textContent = [
-                'Request Debug',
+                `Request Debug (${modeLabel})`,
                 `Payload: ${JSON.stringify(payload, null, 2)}`,
                 `Headers: ${JSON.stringify(headers, null, 2)}`,
                 `Payload Bytes: ${payloadBytes}`,
                 'Expected request body: JSON only, no file, no FormData, no multipart/form-data'
             ].join('\n\n');
+        }
+
+        function setUploadMode(mode) {
+            uploadMode = mode;
+
+            const urlButton = document.getElementById('modeUrlButton');
+            const deviceButton = document.getElementById('modeDeviceButton');
+            const urlSection = document.getElementById('urlUploadSection');
+            const deviceSection = document.getElementById('deviceUploadSection');
+            const fileUrlInput = document.getElementById('fileUrl');
+            const fileInput = document.getElementById('pdfFile');
+            const submitButton = document.getElementById('uploadSubmitButton');
+            const hint = document.getElementById('uploadHint');
+
+            const isUrlMode = mode === 'url';
+
+            urlButton.classList.toggle('mode-active', isUrlMode);
+            deviceButton.classList.toggle('mode-active', !isUrlMode);
+
+            urlSection.classList.toggle('hidden', !isUrlMode);
+            deviceSection.classList.toggle('hidden', isUrlMode);
+
+            fileUrlInput.required = isUrlMode;
+            fileInput.required = !isUrlMode;
+
+            submitButton.textContent = isUrlMode ? 'Fetch & Extract' : 'Upload & Extract';
+            hint.textContent = isUrlMode
+                ? 'Upload the PDF to cloud storage first, then paste its public URL here.'
+                : 'Select a PDF and upload it directly to Cloudinary. Flask never receives the raw file.';
+
+            document.getElementById('uploadStatus').textContent = '';
+            document.getElementById('requestDebugPanel').textContent = '';
+            setUploadProgress(0, isUrlMode ? 'URL mode ready.' : 'Waiting for file selection.');
+        }
+
+        function getCloudinaryUploadEndpoint() {
+            if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_UPLOAD_PRESET) {
+                throw new Error(
+                    'Cloudinary config is missing. Set CLOUDINARY_CLOUD_NAME and CLOUDINARY_UPLOAD_PRESET.'
+                );
+            }
+
+            return `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`;
+        }
+
+        function uploadToCloudinary(file) {
+            return new Promise((resolve, reject) => {
+                let endpoint;
+                try {
+                    endpoint = getCloudinaryUploadEndpoint();
+                } catch (error) {
+                    reject(error);
+                    return;
+                }
+
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', endpoint, true);
+                xhr.responseType = 'json';
+
+                xhr.upload.onprogress = (event) => {
+                    if (!event.lengthComputable) {
+                        setUploadProgress(30, 'Uploading to Cloudinary...');
+                        return;
+                    }
+
+                    const percent = Math.round((event.loaded / event.total) * 100);
+                    setUploadProgress(percent, `Uploading to Cloudinary... ${percent}%`);
+                };
+
+                xhr.onload = () => {
+                    const data = xhr.response || {};
+                    if (xhr.status >= 200 && xhr.status < 300 && data.secure_url) {
+                        setUploadProgress(100, 'Cloudinary upload complete.');
+                        resolve(data.secure_url);
+                        return;
+                    }
+
+                    const message =
+                        data?.error?.message ||
+                        data?.message ||
+                        `Cloudinary upload failed with status ${xhr.status}.`;
+                    reject(new Error(message));
+                };
+
+                xhr.onerror = () => reject(new Error('Cloudinary upload failed.'));
+                xhr.onabort = () => reject(new Error('Cloudinary upload was cancelled.'));
+                xhr.send(formData);
+            });
         }
 
         async function readResponseBody(response) {
@@ -774,17 +923,7 @@ HTML_TEMPLATE = """
             };
         }
 
-        document.getElementById('uploadForm').addEventListener('submit', async (event) => {
-            event.preventDefault();
-
-            const fileUrlInput = document.getElementById('fileUrl');
-            const fileUrl = fileUrlInput.value.trim();
-
-            if (!fileUrl) {
-                alert('Please provide a cloud PDF URL');
-                return;
-            }
-
+        async function sendUrlToBackend(fileUrl, modeLabel) {
             const payload = { file_url: fileUrl };
             const payloadKeys = Object.keys(payload);
             const payloadJson = JSON.stringify(payload);
@@ -796,10 +935,10 @@ HTML_TEMPLATE = """
                 return;
             }
 
-            console.log('Upload request payload:', payload);
-            console.log('Upload request headers:', UPLOAD_HEADERS);
-            console.log('Upload request size (bytes):', payloadBytes);
-            updateRequestDebug(payload, UPLOAD_HEADERS, payloadBytes);
+            console.log('Backend upload request payload:', payload);
+            console.log('Backend upload request headers:', UPLOAD_HEADERS);
+            console.log('Backend upload request size (bytes):', payloadBytes);
+            updateRequestDebug(payload, UPLOAD_HEADERS, payloadBytes, modeLabel);
 
             if (payloadBytes > 1024) {
                 document.getElementById('uploadStatus').textContent =
@@ -807,36 +946,86 @@ HTML_TEMPLATE = """
                 return;
             }
 
-            document.getElementById('uploadStatus').textContent = 'Processing...';
+            document.getElementById('uploadStatus').textContent = 'Fetching and extracting...';
+
+            const response = await fetch('/api/upload', {
+                method: 'POST',
+                headers: UPLOAD_HEADERS,
+                body: payloadJson
+            });
+
+            const data = await readResponseBody(response);
+
+            if (!response.ok) {
+                throw new Error(data.error || 'Upload failed');
+            }
+
+            currentFileId = data.file_id;
+            document.getElementById('uploadStatus').textContent = 'Document loaded successfully';
+            document.getElementById('fileInfo').textContent = `File: ${data.filename} (${data.page_count} pages)`;
+            document.getElementById('languageContent').textContent = JSON.stringify(data.language_profile || {}, null, 2);
+            document.getElementById('languagePanel').classList.remove('hidden');
+            document.getElementById('summaryActions').classList.remove('hidden');
+            document.getElementById('summaryStatus').textContent = 'Click "Summarise Whole PDF" to generate a summary from the full extracted text.';
+            document.getElementById('summaryContent').textContent = '';
+            document.getElementById('extractedContent').textContent = data.preview || data.content || '';
+            document.getElementById('resultPanel').classList.remove('hidden');
+            document.getElementById('searchPanel').classList.remove('hidden');
+        }
+
+        document.getElementById('uploadForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
 
             try {
-                const response = await fetch('/api/upload', {
-                    method: 'POST',
-                    headers: UPLOAD_HEADERS,
-                    body: payloadJson
-                });
+                if (uploadMode === 'device') {
+                    const fileInput = document.getElementById('pdfFile');
+                    const file = fileInput.files[0];
 
-                const data = await readResponseBody(response);
+                    if (!file) {
+                        throw new Error('Please choose a PDF file first.');
+                    }
 
-                if (!response.ok) {
-                    throw new Error(data.error || 'Upload failed');
+                    const isPdfMime = file.type === 'application/pdf';
+                    const isPdfExtension = file.name.toLowerCase().endsWith('.pdf');
+                    if (!isPdfMime && !isPdfExtension) {
+                        throw new Error('Only PDF files are allowed.');
+                    }
+
+                    if (file.size > MAX_DEVICE_UPLOAD_BYTES) {
+                        throw new Error('PDF must be 50 MB or smaller.');
+                    }
+
+                    console.log('Device upload file:', {
+                        name: file.name,
+                        type: file.type,
+                        size: file.size
+                    });
+
+                    document.getElementById('uploadStatus').textContent = 'Uploading to Cloudinary...';
+                    setUploadProgress(0, 'Uploading to Cloudinary...');
+
+                    const secureUrl = await uploadToCloudinary(file);
+                    console.log('Cloudinary secure_url:', secureUrl);
+                    await sendUrlToBackend(secureUrl, 'device->cloudinary->backend');
+                    return;
                 }
 
-                currentFileId = data.file_id;
-                document.getElementById('uploadStatus').textContent = 'Document loaded successfully';
-                document.getElementById('fileInfo').textContent = `File: ${data.filename} (${data.page_count} pages)`;
-                document.getElementById('languageContent').textContent = JSON.stringify(data.language_profile || {}, null, 2);
-                document.getElementById('languagePanel').classList.remove('hidden');
-                document.getElementById('summaryActions').classList.remove('hidden');
-                document.getElementById('summaryStatus').textContent = 'Click "Summarise Whole PDF" to generate a summary from the full extracted text.';
-                document.getElementById('summaryContent').textContent = '';
-                document.getElementById('extractedContent').textContent = data.preview || data.content || '';
-                document.getElementById('resultPanel').classList.remove('hidden');
-                document.getElementById('searchPanel').classList.remove('hidden');
+                const fileUrlInput = document.getElementById('fileUrl');
+                const fileUrl = fileUrlInput.value.trim();
+
+                if (!fileUrl) {
+                    throw new Error('Please provide a cloud PDF URL.');
+                }
+
+                document.getElementById('uploadStatus').textContent = 'Processing...';
+                await sendUrlToBackend(fileUrl, 'url');
             } catch (error) {
                 document.getElementById('uploadStatus').textContent = `Error: ${error.message}`;
+                document.getElementById('uploadProgressText').textContent = error.message;
             }
         });
+
+        setUploadMode('url');
 
         async function searchInPDF() {
             const query = document.getElementById('searchQuery').value.trim();
@@ -924,7 +1113,11 @@ HTML_TEMPLATE = """
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(
+        HTML_TEMPLATE,
+        cloudinary_cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", ""),
+        cloudinary_upload_preset=os.getenv("CLOUDINARY_UPLOAD_PRESET", ""),
+    )
 
 
 @app.route("/healthz", methods=["GET"])
@@ -937,10 +1130,52 @@ def favicon():
     return ("", 204)
 
 
+def _log_upload_request() -> None:
+    print(
+        "UPLOAD REQUEST",
+        {
+            "method": request.method,
+            "content_type": request.headers.get("Content-Type", ""),
+            "content_length": request.content_length,
+            "accept": request.headers.get("Accept", ""),
+        },
+        flush=True,
+    )
+
+
+def _reject_file_upload() -> tuple:
+    return (
+        jsonify(
+            {
+                "error": "File upload is not allowed. Please provide a cloud file URL."
+            }
+        ),
+        400,
+    )
+
+
 @app.route("/api/upload", methods=["POST"])
 def upload_pdf():
     try:
+        _log_upload_request()
+
+        content_type = (request.headers.get("Content-Type") or "").lower()
+        if content_type.startswith("multipart/form-data"):
+            return _reject_file_upload()
+
+        if request.files:
+            return _reject_file_upload()
+
+        if not request.is_json:
+            return _reject_file_upload()
+
+        raw_payload = request.get_data(cache=True, as_text=False) or b""
+        print("UPLOAD PAYLOAD BYTES", len(raw_payload), flush=True)
+
         data = request.get_json(silent=True) or {}
+        if set(data.keys()) - {"file_url"}:
+            return _reject_file_upload()
+
         file_url = (data.get("file_url") or "").strip()
         if not file_url:
             return jsonify({"error": "Missing file_url"}), 400
