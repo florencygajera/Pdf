@@ -10,6 +10,7 @@ Key capabilities:
 - Font metadata preservation (for heading detection)
 """
 
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ import fitz  # PyMuPDF
 
 from app.config.constants import MIN_BLOCK_CHAR_COUNT
 from app.utils.logger import get_logger
+from app.utils.pdf_text_fallback import extract_text_from_pdf_bytes
 from app.utils.sorting import (
     merge_hyphenated_lines,
     sort_digital_blocks,
@@ -25,12 +27,27 @@ from app.utils.sorting import (
 logger = get_logger(__name__)
 
 
+def _build_synthetic_block(text: str) -> Dict[str, Any]:
+    return {
+        "x0": 0.0,
+        "y0": 0.0,
+        "x1": 0.0,
+        "y1": 0.0,
+        "text": text.strip(),
+        "avg_font_size": 12.0,
+        "is_bold": False,
+    }
+
+
 def _extract_page_blocks(page: fitz.Page) -> List[Dict[str, Any]]:
     """
     Extract all text blocks from a page with full coordinate data.
     Uses 'dict' mode to preserve block/line/span hierarchy.
     """
-    raw = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    try:
+        raw = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    except Exception:
+        return []
     blocks = []
 
     for block in raw.get("blocks", []):
@@ -78,9 +95,21 @@ def _extract_page_blocks(page: fitz.Page) -> List[Dict[str, Any]]:
     return blocks
 
 
+def _fallback_page_text(pdf_bytes: bytes) -> str:
+    """
+    Final fallback for malformed PDFs. Extract visible strings from raw content
+    streams or any literal text tokens in the file.
+    """
+    try:
+        return extract_text_from_pdf_bytes(pdf_bytes)
+    except Exception:
+        return ""
+
+
 def extract_digital_page(
     page: fitz.Page,
     page_number: int,
+    fallback_text: str = "",
 ) -> Dict[str, Any]:
     """
     Extract and sort text from a single digital PDF page.
@@ -95,6 +124,17 @@ def extract_digital_page(
     blocks = _extract_page_blocks(page)
 
     if not blocks:
+        if fallback_text.strip():
+            warnings.append(
+                f"Page {page_number}: PyMuPDF fallback extraction used."
+            )
+            synthetic = _build_synthetic_block(fallback_text)
+            return {
+                "text": fallback_text.strip(),
+                "blocks": [synthetic],
+                "warnings": warnings,
+            }
+
         warnings.append(f"Page {page_number}: no extractable text blocks found.")
         return {"text": "", "blocks": [], "warnings": warnings}
 
@@ -130,6 +170,10 @@ def extract_digital_page(
         paragraph_texts.append(" ".join(current_para))
 
     final_text = "\n\n".join(paragraph_texts).strip()
+
+    if not final_text.strip() and fallback_text.strip():
+        final_text = fallback_text.strip()
+        sorted_blocks = [_build_synthetic_block(final_text)]
 
     return {
         "text": final_text,
@@ -168,6 +212,12 @@ def extract_digital_pdf(
     targets = page_numbers or list(range(1, total + 1))
     results: List[Dict[str, Any]] = []
 
+    fallback_text = ""
+    try:
+        fallback_text = _fallback_page_text(pdf_path.read_bytes())
+    except Exception:
+        fallback_text = ""
+
     for page_num in targets:
         if page_num < 1 or page_num > total:
             logger.warning(f"Page {page_num} out of range (1..{total}), skipping.")
@@ -175,7 +225,7 @@ def extract_digital_pdf(
 
         page = doc[page_num - 1]
         try:
-            result = extract_digital_page(page, page_num)
+            result = extract_digital_page(page, page_num, fallback_text=fallback_text)
         except Exception as exc:
             logger.error(f"Error extracting page {page_num}: {exc}", exc_info=True)
             result = {

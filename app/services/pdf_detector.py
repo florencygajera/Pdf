@@ -21,6 +21,7 @@ from app.config.constants import (
 )
 from app.config.settings import settings
 from app.utils.logger import get_logger
+from app.utils.pdf_text_fallback import extract_text_from_pdf_bytes
 
 logger = get_logger(__name__)
 
@@ -54,7 +55,12 @@ def _compute_text_coverage(page: fitz.Page) -> float:
         return 0.0
 
     text_area = 0.0
-    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+    try:
+        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)[
+            "blocks"
+        ]
+    except Exception:
+        return 0.0
     for block in blocks:
         if block.get("type") == 0:  # text block
             r = fitz.Rect(block["bbox"])
@@ -63,12 +69,19 @@ def _compute_text_coverage(page: fitz.Page) -> float:
     return min(text_area / page_area, 1.0)
 
 
-def classify_page(page: fitz.Page, page_number: int) -> PageClassification:
+def classify_page(
+    page: fitz.Page,
+    page_number: int,
+    fallback_text: str = "",
+) -> PageClassification:
     """
     Classify a single PDF page.
     A page is considered 'digital' if it has enough extractable characters.
     """
-    raw_text = page.get_text("text")
+    try:
+        raw_text = page.get_text("text")
+    except Exception:
+        raw_text = ""
     char_count = len(raw_text.strip())
 
     # Check for embedded images
@@ -77,8 +90,15 @@ def classify_page(page: fitz.Page, page_number: int) -> PageClassification:
 
     text_coverage = _compute_text_coverage(page)
 
+    if char_count < 5 and fallback_text.strip():
+        char_count = max(char_count, len(fallback_text.strip()))
+
     # Decision: if char count is below threshold relative to page content
-    is_digital = char_count > 50 or text_coverage > settings.DIGITAL_TEXT_THRESHOLD
+    is_digital = (
+        char_count >= 5
+        or text_coverage > settings.DIGITAL_TEXT_THRESHOLD
+        or (char_count > 0 and not has_images)
+    )
 
     pdf_type = PDF_TYPE_DIGITAL if is_digital else PDF_TYPE_SCANNED
 
@@ -111,6 +131,8 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
         doc = fitz.open(str(pdf_path))
     except fitz.FileDataError as exc:
         raise ValueError(f"Corrupted PDF file: {exc}") from exc
+    except Exception as exc:
+        raise ValueError(f"Failed to open PDF: {exc}") from exc
 
     if doc.is_encrypted:
         # Attempt empty-password decrypt (some PDFs are protected but readable)
@@ -123,8 +145,13 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
         raise ValueError("PDF has zero pages.")
 
     page_classifications: List[PageClassification] = []
+    try:
+        fallback_text = extract_text_from_pdf_bytes(pdf_path.read_bytes())
+    except Exception:
+        fallback_text = ""
+
     for i, page in enumerate(doc):
-        pc = classify_page(page, page_number=i + 1)
+        pc = classify_page(page, page_number=i + 1, fallback_text=fallback_text)
         page_classifications.append(pc)
 
     doc.close()

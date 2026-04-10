@@ -91,7 +91,11 @@ def _resolve_job_status(job_id: str):
         status = data.get("status", STATE_DONE)
         return status, 100.0, "", data
 
-    # Check Celery
+    # If we never saw an upload, this job ID is unknown.
+    if not upload_path.exists():
+        return None, 0.0, "", None
+
+    # Check Celery only for known uploads.
     celery_status, pct, msg = _get_celery_job_state(job_id)
     if celery_status:
         return celery_status, pct, msg, None
@@ -100,7 +104,6 @@ def _resolve_job_status(job_id: str):
     if upload_path.exists():
         return STATE_PROCESSING, 5.0, "Processing started.", None
 
-    # Neither exists → unknown job_id
     return None, 0.0, "", None
 
 

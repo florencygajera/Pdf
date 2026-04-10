@@ -3,6 +3,8 @@ Application Settings — loaded from environment variables or .env file.
 All sensitive values (keys, passwords) MUST be set via environment, never hardcoded.
 """
 
+import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import List
@@ -16,6 +18,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = Field(default="development", description="deployment env")
     DEBUG: bool = Field(default=False)
     SECRET_KEY: str = Field(default="change-me-in-production")
+    TESTING: bool = Field(default=False)
 
     # ── Server ─────────────────────────────────────────────────────────────
     HOST: str = Field(default="0.0.0.0")
@@ -60,16 +63,48 @@ class Settings(BaseSettings):
     RATE_LIMIT_UPLOAD: str = Field(default="10/minute")
     RATE_LIMIT_EXTRACT: str = Field(default="30/minute")
 
+    @field_validator("DEBUG", "TESTING", "OCR_USE_GPU", mode="before")
+    @classmethod
+    def parse_boolish(cls, v):
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on", "debug", "dev", "development"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off", "release", "prod", "production", ""}:
+                return False
+        return False
+
     @field_validator("UPLOAD_DIR", "OUTPUT_DIR", mode="before")
     @classmethod
     def create_dirs(cls, v):
         path = Path(v)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+
+        # Windows tests often inject POSIX-style `/tmp/...` paths. Normalize them
+        # to the local temp directory so the app can boot in restricted sandboxes.
+        if os.name == "nt" and str(v).startswith("/"):
+            path = Path(tempfile.gettempdir()) / str(v).lstrip("/\\")
+
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:
+            fallback = Path(tempfile.gettempdir()) / path.name
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
 
     @property
     def max_file_bytes(self) -> int:
         return self.MAX_FILE_SIZE_MB * 1024 * 1024
+
+    @property
+    def is_testing(self) -> bool:
+        return bool(self.TESTING or self.ENVIRONMENT.lower() in {"test", "testing"})
 
     class Config:
         env_file = ".env"

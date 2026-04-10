@@ -27,6 +27,10 @@ def _enqueue_or_run(job_id: str, background_tasks: BackgroundTasks) -> None:
     Try to enqueue a Celery task.
     If Celery/Redis is unavailable, fall back to FastAPI BackgroundTasks.
     """
+    if settings.is_testing:
+        _run_inline(job_id)
+        return
+
     try:
         from app.workers.celery_worker import extract_pdf_task
 
