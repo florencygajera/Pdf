@@ -11,7 +11,7 @@ env/
 venv/
 ENV/
 .env.example
-
+.env
 
 # Testing / Coverage
 htmlcov/

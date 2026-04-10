@@ -26,8 +26,8 @@ Pillow==10.4.0
 numpy==1.26.4
 
 # ── Table Extraction ─────────────────────────────────────────────────────────
-camelot-py[cv]==0.11.0          # requires ghostscript system dep
-# tabula-py==2.9.3              # alt table extractor (Java required)
+camelot-py==0.10.1         # requires ghostscript system dep
+tabula-py==2.9.3              # alt table extractor (Java required)
 
 # ── Async Task Queue ─────────────────────────────────────────────────────────
 celery==5.4.0
@@ -40,8 +40,8 @@ structlog==24.4.0
 langdetect==1.0.9               # language detection
 
 # ── Optional: Layout Parser (ML-based layout detection) ─────────────────────
-# layoutparser[layoutmodels,tesseract]==0.3.4
-# detectron2 — install separately from: https://github.com/facebookresearch/detectron2
+layoutparser[layoutmodels,tesseract]==0.3.4
+#detectron2 — install separately from: https://github.com/facebookresearch/detectron2
 
 # ── Dev / Testing ────────────────────────────────────────────────────────────
 pytest==8.3.3
