@@ -7,10 +7,50 @@ import os
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from pydantic import ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings
+
+
+@lru_cache(maxsize=1)
+def _detect_cpu_count() -> int:
+    return max(1, os.cpu_count() or 1)
+
+
+@lru_cache(maxsize=1)
+def _detect_memory_gb() -> float:
+    try:
+        import psutil
+
+        return max(1.0, psutil.virtual_memory().total / (1024**3))
+    except Exception:
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                statex = MEMORYSTATUSEX()
+                statex.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(statex)):
+                    return max(1.0, statex.ullTotalPhys / (1024**3))
+            except Exception:
+                pass
+
+        # Conservative fallback when platform introspection is unavailable.
+        return 8.0
 
 
 class Settings(BaseSettings):
@@ -48,6 +88,26 @@ class Settings(BaseSettings):
     OCR_USE_GPU: bool = Field(default=False)
     OCR_CONFIDENCE_THRESHOLD: float = Field(
         default=0.6, description="Min confidence to accept OCR result"
+    )
+    OCR_PAGE_WORKERS: Optional[int] = Field(
+        default=None,
+        description="Override OCR page worker count; defaults to hardware-aware tuning",
+    )
+    OCR_CHUNK_WORKERS: Optional[int] = Field(
+        default=None,
+        description="Override OCR chunk worker count; defaults to hardware-aware tuning",
+    )
+    OCR_CHUNK_SIZE: Optional[int] = Field(
+        default=None,
+        description="Override OCR chunk size; defaults to hardware-aware tuning",
+    )
+    OCR_PDF2IMAGE_THREADS: Optional[int] = Field(
+        default=None,
+        description="Override pdf2image thread_count; defaults to hardware-aware tuning",
+    )
+    OCR_PARALLEL_INFERENCE: bool = Field(
+        default=True,
+        description="Allow OCR inference to run concurrently across a bounded pool",
     )
 
     # ── Digital Extraction ─────────────────────────────────────────────────
@@ -112,6 +172,75 @@ class Settings(BaseSettings):
     @property
     def is_testing(self) -> bool:
         return bool(self.TESTING or self.ENVIRONMENT.lower() in {"test", "testing"})
+
+    @property
+    def cpu_cores(self) -> int:
+        return _detect_cpu_count()
+
+    @property
+    def memory_gb(self) -> float:
+        return _detect_memory_gb()
+
+    @property
+    def effective_ocr_page_workers(self) -> int:
+        if self.OCR_PAGE_WORKERS and self.OCR_PAGE_WORKERS > 0:
+            return self.OCR_PAGE_WORKERS
+
+        cpu = self.cpu_cores
+        memory = self.memory_gb
+
+        if not self.OCR_PARALLEL_INFERENCE:
+            return 1
+        if self.OCR_USE_GPU:
+            return 1 if memory < 24 else 2
+        if memory < 8:
+            return 1
+        if memory < 12:
+            return min(2, cpu)
+        if memory < 24:
+            return min(3, max(2, cpu // 2))
+        return min(4, max(3, cpu // 2))
+
+    @property
+    def effective_ocr_chunk_workers(self) -> int:
+        if self.OCR_CHUNK_WORKERS and self.OCR_CHUNK_WORKERS > 0:
+            return self.OCR_CHUNK_WORKERS
+
+        cpu = self.cpu_cores
+        memory = self.memory_gb
+
+        if memory < 8:
+            return 1
+        if memory < 16:
+            return min(2, max(1, cpu // 4 or 1))
+        return min(2, max(1, cpu // 4 or 1))
+
+    @property
+    def effective_ocr_pdf2image_threads(self) -> int:
+        if self.OCR_PDF2IMAGE_THREADS and self.OCR_PDF2IMAGE_THREADS > 0:
+            return self.OCR_PDF2IMAGE_THREADS
+        return 2 if self.cpu_cores >= 4 else 1
+
+    def effective_ocr_chunk_size(self, total_pages: int) -> int:
+        if self.OCR_CHUNK_SIZE and self.OCR_CHUNK_SIZE > 0:
+            return self.OCR_CHUNK_SIZE
+
+        total_pages = max(1, total_pages)
+        workers = max(1, self.effective_ocr_page_workers)
+        memory = self.memory_gb
+
+        if total_pages <= workers * 2:
+            return total_pages
+
+        if memory < 12:
+            base = 6
+        elif memory < 24:
+            base = 10
+        else:
+            base = 12
+
+        target = max(4, total_pages // max(workers * 2, 1))
+        return max(4, min(base, target))
 
 @lru_cache
 def get_settings() -> Settings:

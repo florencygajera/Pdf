@@ -11,6 +11,7 @@ Key capabilities:
 """
 
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +26,11 @@ from app.utils.sorting import (
 )
 
 logger = get_logger(__name__)
+
+try:
+    fitz.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
 
 
 def _build_synthetic_block(text: str) -> Dict[str, Any]:
@@ -185,6 +191,7 @@ def extract_digital_page(
 def extract_digital_pdf(
     pdf_path: Path,
     page_numbers: Optional[List[int]] = None,
+    pdf_bytes: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
     """
     Extract text from all (or specified) pages of a digital PDF.
@@ -200,7 +207,10 @@ def extract_digital_pdf(
         ValueError: If PDF is corrupt or unreadable.
     """
     try:
-        doc = fitz.open(str(pdf_path))
+        if pdf_bytes is not None:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        else:
+            doc = fitz.open(str(pdf_path))
     except Exception as exc:
         raise ValueError(f"Failed to open PDF: {exc}") from exc
 
@@ -213,10 +223,18 @@ def extract_digital_pdf(
     results: List[Dict[str, Any]] = []
 
     fallback_text = ""
-    try:
-        fallback_text = _fallback_page_text(pdf_path.read_bytes())
-    except Exception:
-        fallback_text = ""
+    source_bytes = pdf_bytes
+    if source_bytes is None:
+        try:
+            source_bytes = pdf_path.read_bytes()
+        except Exception:
+            source_bytes = None
+
+    if source_bytes is not None:
+        try:
+            fallback_text = _fallback_page_text(source_bytes)
+        except Exception:
+            fallback_text = ""
 
     for page_num in targets:
         if page_num < 1 or page_num > total:

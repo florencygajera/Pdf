@@ -25,6 +25,11 @@ from app.utils.pdf_text_fallback import extract_text_from_pdf_bytes
 
 logger = get_logger(__name__)
 
+try:
+    fitz.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
+
 
 @dataclass
 class PageClassification:
@@ -171,6 +176,69 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
     logger.info(
         f"Document classification: {overall} | "
         f"total={total_pages}, digital={digital_count}, scanned={scanned_count}"
+    )
+
+    return DocumentClassification(
+        overall_type=overall,
+        pages=page_classifications,
+        digital_page_count=digital_count,
+        scanned_page_count=scanned_count,
+        total_pages=total_pages,
+    )
+
+
+def detect_pdf_type_from_bytes(pdf_bytes: bytes, file_name: str = "pdf") -> DocumentClassification:
+    """Detect PDF type from in-memory bytes to avoid repeated disk reads."""
+    if not pdf_bytes:
+        raise ValueError("PDF content is empty.")
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except fitz.FileDataError as exc:
+        raise ValueError(f"Corrupted PDF file: {exc}") from exc
+    except Exception as exc:
+        raise ValueError(f"Failed to open PDF: {exc}") from exc
+
+    if doc.is_encrypted:
+        if not doc.authenticate(""):
+            raise ValueError("PDF is password-encrypted. Provide decryption password.")
+
+    total_pages = len(doc)
+    if total_pages == 0:
+        raise ValueError("PDF has zero pages.")
+
+    try:
+        fallback_text = extract_text_from_pdf_bytes(pdf_bytes)
+    except Exception:
+        fallback_text = ""
+
+    page_classifications: List[PageClassification] = []
+    for i, page in enumerate(doc):
+        page_classifications.append(
+            classify_page(page, page_number=i + 1, fallback_text=fallback_text)
+        )
+
+    doc.close()
+
+    digital_count = sum(
+        1 for p in page_classifications if p.pdf_type == PDF_TYPE_DIGITAL
+    )
+    scanned_count = total_pages - digital_count
+
+    overall = (
+        PDF_TYPE_DIGITAL
+        if digital_count == total_pages
+        else PDF_TYPE_SCANNED
+        if scanned_count == total_pages
+        else PDF_TYPE_MIXED
+    )
+
+    logger.info(
+        "Document classification: %s | total=%s, digital=%s, scanned=%s",
+        overall,
+        total_pages,
+        digital_count,
+        scanned_count,
     )
 
     return DocumentClassification(

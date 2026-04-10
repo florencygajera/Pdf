@@ -7,6 +7,7 @@ Camelot is intentionally avoided here because its legacy PDF stack can emit
 PyPDF2 deprecation warnings in modern environments.
 """
 
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -69,11 +70,56 @@ def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
     return extracted
 
 
+def _pdfplumber_extract_from_bytes(pdf_bytes: bytes, page_num: int) -> List[Dict]:
+    """Byte-based pdfplumber extraction to avoid repeated disk reads."""
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber not installed.")
+        return []
+
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            if page_num > len(pdf.pages):
+                return []
+            page = pdf.pages[page_num - 1]
+            raw_tables = page.extract_tables() or []
+    except Exception as exc:
+        logger.error("pdfplumber(bytes) failed on page %s: %s", page_num, exc)
+        return []
+
+    extracted: List[Dict] = []
+    for i, tbl in enumerate(raw_tables):
+        if not tbl or len(tbl) < MIN_TABLE_ROWS:
+            continue
+        if not tbl[0] or len(tbl[0]) < MIN_TABLE_COLS:
+            continue
+
+        headers = [str(c) if c else "" for c in tbl[0]]
+        rows = [[str(c) if c else "" for c in row] for row in tbl[1:]]
+
+        extracted.append(
+            {
+                "page": page_num,
+                "table_index": i,
+                "headers": headers,
+                "rows": rows,
+                "extraction_method": "pdfplumber",
+                "accuracy": None,
+            }
+        )
+
+    return extracted
+
+
 def extract_tables_digital(
     pdf_path: Path,
     page_num: int,
+    pdf_bytes: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
     """Extract tables from a digital PDF page."""
+    if pdf_bytes is not None:
+        return _pdfplumber_extract_from_bytes(pdf_bytes, page_num)
     return _pdfplumber_extract(pdf_path, page_num)
 
 
@@ -191,4 +237,3 @@ def extract_tables_scanned(
         len(headers),
     )
     return [table]
-
