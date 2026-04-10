@@ -243,7 +243,7 @@ async function uploadFile(file) {
 
   statusText.textContent = "Uploading file...";
   jobStatusEl.textContent = "uploading";
-  setProgress(12);
+  setProgress(0);
   setBadge(apiHealth, "Uploading", "pill-warm");
 
   const response = await fetch("/api/v1/upload", {
@@ -260,7 +260,6 @@ async function uploadFile(file) {
   jobIdEl.textContent = currentJobId;
   statusText.textContent = "Upload accepted. Polling extraction job...";
   jobStatusEl.textContent = "queued";
-  setProgress(28);
   startPolling(currentJobId);
 }
 

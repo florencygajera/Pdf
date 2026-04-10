@@ -12,6 +12,7 @@ Checks:
 """
 
 import re
+import copy
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config.constants import HIGH_CONFIDENCE, LOW_CONFIDENCE, MEDIUM_CONFIDENCE
@@ -58,6 +59,7 @@ def stitch_page_boundaries(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     If page N ends without a sentence terminator and page N+1 starts with lowercase,
     merge the tail of page N with the head of page N+1.
     """
+    pages = copy.deepcopy(pages)
     if len(pages) <= 1:
         return pages
 

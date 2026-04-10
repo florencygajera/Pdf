@@ -9,6 +9,7 @@ Uses column detection heuristics for:
 Optionally uses LayoutParser for ML-based block classification (if installed).
 """
 
+from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config.constants import LINE_Y_TOLERANCE
@@ -16,6 +17,8 @@ from app.utils.logger import get_logger
 from app.utils.sorting import sort_digital_blocks
 
 logger = get_logger(__name__)
+_layout_model = None
+_layout_model_lock = Lock()
 
 # Threshold: fraction of page width — gaps wider than this suggest column boundary
 COLUMN_GAP_THRESHOLD = 0.08
@@ -126,13 +129,23 @@ def try_layoutparser(
         else:
             img_array = image
 
-        model = lp.Detectron2LayoutModel(
-            "lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config",
-            extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
-            label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"},
-        )
+        global _layout_model
+        if _layout_model is None:
+            with _layout_model_lock:
+                if _layout_model is None:
+                    _layout_model = lp.Detectron2LayoutModel(
+                        "lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config",
+                        extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
+                        label_map={
+                            0: "Text",
+                            1: "Title",
+                            2: "List",
+                            3: "Table",
+                            4: "Figure",
+                        },
+                    )
 
-        layout = model.detect(img_array)
+        layout = _layout_model.detect(img_array)
 
         regions = []
         for block in layout:

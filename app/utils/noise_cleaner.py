@@ -92,19 +92,27 @@ def remove_duplicate_lines(
     lines: List[str],
     similarity_threshold: float = 0.92,
 ) -> List[str]:
-    seen: List[str] = []
+    seen_exact: Set[str] = set()
+    seen_fuzzy: List[str] = []
+    result: List[str] = []
     for line in lines:
         normalized = clean_line(line)
         if not normalized:
             continue
-        if any(
-            _similarity(normalized.casefold(), prev.casefold()) >= similarity_threshold
-            for prev in seen
-        ):
+
+        key = normalized.casefold()
+        if key in seen_exact:
+            continue
+
+        recent_window = seen_fuzzy[-50:]
+        if any(_similarity(key, prev) >= similarity_threshold for prev in recent_window):
             logger.debug("Duplicate removed: %r", normalized[:80])
             continue
-        seen.append(normalized)
-    return seen
+
+        seen_exact.add(key)
+        seen_fuzzy.append(key)
+        result.append(normalized)
+    return result
 
 
 def clean_text_block(text: str) -> str:

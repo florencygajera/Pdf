@@ -28,7 +28,7 @@ async def health_live():
 async def health_ready():
     """
     Kubernetes readiness probe.
-    Checks Redis connectivity (required for Celery task queue).
+    Checks Redis connectivity and confirms at least one Celery worker responds.
     """
     checks = {"app": "ok"}
 
@@ -44,6 +44,17 @@ async def health_ready():
     except Exception as exc:
         checks["redis"] = f"error: {exc}"
         logger.warning(f"Redis readiness check failed: {exc}")
+
+    # Check Celery worker heartbeat so readiness reflects actual processing capacity.
+    try:
+        from app.workers.celery_worker import celery_app
+
+        inspector = celery_app.control.inspect(timeout=1.5)
+        ping_result = inspector.ping() if inspector else None
+        checks["celery_worker"] = "ok" if ping_result else "no workers responding"
+    except Exception as exc:
+        checks["celery_worker"] = f"error: {exc}"
+        logger.warning(f"Celery readiness check failed: {exc}")
 
     all_ok = all(v == "ok" for v in checks.values())
     status_code = 200 if all_ok else 503

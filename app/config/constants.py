@@ -25,7 +25,7 @@ MIN_BLOCK_CHAR_COUNT = 3
 ADAPTIVE_BLOCK_SIZE = 11  # OpenCV adaptiveThreshold block size (odd number)
 ADAPTIVE_C = 2  # Constant subtracted from mean
 DESKEW_MAX_ANGLE = 45  # Degrees — beyond this we assume it's intentional rotation
-MORPH_KERNEL_SIZE = (1, 1)  # Morphological operations kernel
+MORPH_KERNEL_SIZE = (2, 2)  # Morphological operations kernel
 
 # ── Table Detection ───────────────────────────────────────────────────────
 MIN_TABLE_ROWS = 2

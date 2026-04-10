@@ -8,6 +8,7 @@ Run worker with:
 """
 
 import json
+import os
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -137,7 +138,6 @@ def _write_failed_result(job_id: str, output_path: Path, error_msg: str) -> None
         "job_id": job_id,
         "status": STATE_FAILED,
         "error": error_msg,
-        "expires_at": expires_at.isoformat(),
         "text": "",
         "tables": [],
         "pages": [],
@@ -150,6 +150,11 @@ def _write_failed_result(job_id: str, output_path: Path, error_msg: str) -> None
             "warnings_truncated": False,
             "total_warning_count": 0,
         },
+        "expires_at": expires_at.isoformat(),
     }
-    with open(output_path, "w", encoding="utf-8") as f:
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, output_path)

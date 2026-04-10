@@ -15,6 +15,7 @@ Designed to stay safe under Windows Celery thread pools.
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -490,6 +491,10 @@ def save_result_to_disk(result: ExtractionResult, output_path: Path) -> None:
         datetime.now(timezone.utc)
         + timedelta(seconds=settings.RESULT_EXPIRES_SECONDS)
     ).isoformat()
-    with open(output_path, "w", encoding="utf-8") as f:
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, output_path)
     logger.info("Result saved to %s", output_path)

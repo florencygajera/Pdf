@@ -65,17 +65,60 @@ def adaptive_threshold(gray: np.ndarray) -> np.ndarray:
     )
 
 
+def _collect_text_like_pixels(binary: np.ndarray) -> np.ndarray:
+    """
+    Collect dark pixels that belong to character-like connected components.
+
+    Large horizontal rules, borders, and dense stamp blobs are filtered out so
+    they do not dominate the skew estimate.
+    """
+    dark_mask = (binary < 128).astype(np.uint8)
+    if not np.any(dark_mask):
+        return np.empty((0, 2), dtype=np.int32)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        dark_mask, connectivity=8
+    )
+    h, w = binary.shape
+    total_area = h * w
+    keep_labels = []
+
+    for label in range(1, num_labels):
+        x, y, comp_w, comp_h, area = stats[label]
+        if area < 12:
+            continue
+        if area > total_area * 0.08:
+            continue
+
+        bbox_area = max(1, comp_w * comp_h)
+        fill_ratio = area / bbox_area
+
+        # Long, thin components are usually rules, borders, or table lines.
+        if (comp_h <= 2 and comp_w > w * 0.25) or (comp_w <= 2 and comp_h > h * 0.25):
+            continue
+        if fill_ratio < 0.03 and max(comp_w, comp_h) > max(w, h) * 0.2:
+            continue
+
+        keep_labels.append(label)
+
+    if not keep_labels:
+        return np.empty((0, 2), dtype=np.int32)
+
+    selected = np.isin(labels, keep_labels)
+    return np.column_stack(np.where(selected))
+
+
 def deskew(binary: np.ndarray) -> Tuple[np.ndarray, float]:
     """
-    Detect and correct rotation angle using Hough Line Transform.
+    Detect and correct rotation angle using character-like connected components.
     Returns (corrected_image, angle_degrees).
     """
-    # Find all non-zero (text) pixels
-    coords = np.column_stack(np.where(binary < 128))  # dark pixels = text
+    coords = _collect_text_like_pixels(binary)
     if coords.size == 0:
-        return binary, 0.0
+        coords = np.column_stack(np.where(binary < 128))
+        if coords.size == 0:
+            return binary, 0.0
 
-    # minAreaRect returns the angle of the bounding rectangle
     rect = cv2.minAreaRect(coords.astype(np.float32))
     angle = rect[-1]
 

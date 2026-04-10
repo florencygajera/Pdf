@@ -8,10 +8,10 @@ DELETE /api/v1/extract/{job_id}       — cancel and clean up job files
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -34,6 +34,8 @@ from app.utils.logger import get_logger
 router = APIRouter()
 logger = get_logger(__name__)
 limiter = Limiter(key_func=get_remote_address)
+RESULT_NOT_FOUND = "not_found"
+RESULT_EXPIRED = "expired"
 
 
 def _get_celery_job_state(job_id: str):
@@ -69,9 +71,12 @@ def _load_output(job_id: str) -> dict:
     """Load the JSON result file for a completed job."""
     output_path = get_output_path(job_id)
     if not output_path.exists():
-        return {}
-    with open(output_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        return {"_state": RESULT_NOT_FOUND}
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"_state": RESULT_NOT_FOUND}
 
     expires_at = data.get("expires_at")
     if expires_at:
@@ -81,7 +86,7 @@ def _load_output(job_id: str) -> dict:
                 expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
             if expiry_dt <= datetime.now(timezone.utc):
                 output_path.unlink(missing_ok=True)
-                return {}
+                return {"_state": RESULT_EXPIRED}
         except Exception:
             pass
     else:
@@ -89,7 +94,7 @@ def _load_output(job_id: str) -> dict:
             age_seconds = datetime.now(timezone.utc).timestamp() - output_path.stat().st_mtime
             if age_seconds > settings.RESULT_EXPIRES_SECONDS:
                 output_path.unlink(missing_ok=True)
-                return {}
+                return {"_state": RESULT_EXPIRED}
         except Exception:
             pass
 
@@ -111,7 +116,11 @@ def _resolve_job_status(job_id: str):
     # Fast path: output file exists → job is done or failed
     if output_path.exists():
         data = _load_output(job_id)
-        if not data:
+        state_marker = data.get("_state")
+        if state_marker == RESULT_EXPIRED:
+            cleanup_job_files(job_id)
+            return RESULT_EXPIRED, 0.0, "Result expired.", None
+        if state_marker == RESULT_NOT_FOUND:
             cleanup_job_files(job_id)
             return None, 0.0, "", None
         status = data.get("status", STATE_DONE)
@@ -151,6 +160,7 @@ async def get_extraction_result(request: Request, job_id: str):
     - **202** → still processing (check `status` and `progress_percent`)
     - **200** → complete (full result in body)
     - **404** → unknown job_id
+    - **410** → result expired
     """
     status, pct, msg, data = _resolve_job_status(job_id)
 
@@ -160,6 +170,12 @@ async def get_extraction_result(request: Request, job_id: str):
             detail=f"Job '{job_id}' not found. Upload a PDF first.",
         )
 
+    if status == RESULT_EXPIRED:
+        raise HTTPException(
+            status_code=410,
+            detail=f"Job '{job_id}' has expired. Please upload the PDF again.",
+        )
+
     if status == STATE_FAILED:
         raise HTTPException(
             status_code=500,
@@ -167,9 +183,6 @@ async def get_extraction_result(request: Request, job_id: str):
         )
 
     if status in (STATE_PROCESSING, STATE_PENDING):
-        # Return 202 with progress info
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=202,
             content={
@@ -224,8 +237,20 @@ async def get_text_only(job_id: str):
     status, _, _, data = _resolve_job_status(job_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Job not found.")
+    if status == RESULT_EXPIRED:
+        raise HTTPException(
+            status_code=410,
+            detail=f"Job '{job_id}' has expired. Please upload the PDF again.",
+        )
     if status != STATE_DONE:
-        raise HTTPException(status_code=202, detail=f"Job status: {status}")
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": status,
+                "message": "Still processing.",
+            },
+        )
     return {"job_id": job_id, "text": data.get("text", "")}
 
 
@@ -239,8 +264,20 @@ async def get_tables_only(job_id: str):
     status, _, _, data = _resolve_job_status(job_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Job not found.")
+    if status == RESULT_EXPIRED:
+        raise HTTPException(
+            status_code=410,
+            detail=f"Job '{job_id}' has expired. Please upload the PDF again.",
+        )
     if status != STATE_DONE:
-        raise HTTPException(status_code=202, detail=f"Job status: {status}")
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": status,
+                "message": "Still processing.",
+            },
+        )
     tables = data.get("tables", [])
     return [TableData(**t) for t in tables]
 
@@ -257,7 +294,10 @@ async def delete_job(job_id: str):
     try:
         from app.workers.celery_worker import celery_app
 
-        celery_app.control.revoke(job_id, terminate=True, signal="SIGKILL")
+        celery_app.control.revoke(job_id, terminate=True, signal="SIGTERM")
+        import time
+
+        time.sleep(2)
         logger.info(f"Celery task {job_id} revoked.")
     except Exception:
         pass

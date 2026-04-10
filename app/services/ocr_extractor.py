@@ -61,7 +61,7 @@ class _PaddleOCRPool:
             self._init_error = exc
             raise
 
-        lang = settings.OCR_LANGUAGES[0] if settings.OCR_LANGUAGES else "en"
+        lang = ",".join(settings.OCR_LANGUAGES) if settings.OCR_LANGUAGES else "en"
         instance = PaddleOCR(
             use_angle_cls=True,
             lang=lang,
@@ -100,7 +100,13 @@ class _PaddleOCRPool:
                             "PaddleOCR is not available. Install: pip install paddlepaddle paddleocr"
                         ) from exc
                 else:
-                    instance = self._available.get()
+                    try:
+                        instance = self._available.get(timeout=60)
+                    except Empty as exc:
+                        raise RuntimeError(
+                            "OCR pool deadlocked: no instance returned within 60s. "
+                            "A worker may have crashed mid-inference."
+                        ) from exc
 
         try:
             yield instance
@@ -300,32 +306,30 @@ def ocr_single_page_image(image, page_number: int) -> Dict[str, Any]:
 def _process_images_in_threads(
     images: List,
     start_page: int,
-    target_set: Optional[set],
+    page_numbers: Optional[List[int]],
 ) -> List[Dict[str, Any]]:
     """Shared page-processing helper for both path- and bytes-based inputs."""
     results: List[Dict[str, Any]] = []
-    max_workers = min(settings.effective_ocr_page_workers, len(images)) if len(images) > 1 else 1
+    max_workers = (
+        min(settings.effective_ocr_page_workers, len(images)) if len(images) > 1 else 1
+    )
 
     def _process(item):
         idx, pil_image = item
-        page_num = start_page + idx
-        if target_set and page_num not in target_set:
-            return None
+        page_num = page_numbers[idx] if page_numbers else start_page + idx
         return ocr_single_page_image(pil_image, page_num)
 
     if max_workers == 1:
         for item in enumerate(images):
-            result = _process(item)
-            if result:
-                results.append(result)
+            results.append(_process(item))
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_process, item) for item in enumerate(images)]
             for future in as_completed(futures):
                 result = future.result()
-                if result:
-                    results.append(result)
-        results.sort(key=lambda item: item["page_number"])
+                results.append(result)
+
+    results.sort(key=lambda item: item["page_number"])
 
     gc.collect()
     return results
@@ -347,14 +351,22 @@ def extract_ocr_pdf(
         )
     except Exception as fitz_exc:
         try:
+            first_page = min(page_numbers) if page_numbers else None
+            last_page = max(page_numbers) if page_numbers else None
             all_images = convert_from_path(
                 str(pdf_path),
                 dpi=dpi,
                 fmt="PNG",
                 thread_count=settings.effective_ocr_pdf2image_threads,
-                first_page=min(page_numbers) if page_numbers else None,
-                last_page=max(page_numbers) if page_numbers else None,
+                first_page=first_page,
+                last_page=last_page,
             )
+            if page_numbers and first_page is not None and last_page is not None:
+                page_to_image = {
+                    page_num: image
+                    for page_num, image in zip(range(first_page, last_page + 1), all_images)
+                }
+                all_images = [page_to_image[p] for p in page_numbers if p in page_to_image]
         except PDFSyntaxError as exc:
             raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
         except PDFPageCountError as exc:
@@ -362,9 +374,8 @@ def extract_ocr_pdf(
         except Exception as exc:
             raise RuntimeError(f"pdf rendering failed: {fitz_exc}; pdf2image: {exc}") from exc
 
-    target_set = set(page_numbers) if page_numbers else None
     start_page = min(page_numbers) if page_numbers else 1
-    results = _process_images_in_threads(all_images, start_page, target_set)
+    results = _process_images_in_threads(all_images, start_page, page_numbers)
 
     logger.info(
         "OCR extraction complete | pages=%s | file=%s",
@@ -390,14 +401,22 @@ def extract_ocr_pdf_from_bytes(
         )
     except Exception as fitz_exc:
         try:
+            first_page = min(page_numbers) if page_numbers else None
+            last_page = max(page_numbers) if page_numbers else None
             all_images = convert_from_bytes(
                 pdf_bytes,
                 dpi=dpi,
                 fmt="PNG",
                 thread_count=settings.effective_ocr_pdf2image_threads,
-                first_page=min(page_numbers) if page_numbers else None,
-                last_page=max(page_numbers) if page_numbers else None,
+                first_page=first_page,
+                last_page=last_page,
             )
+            if page_numbers and first_page is not None and last_page is not None:
+                page_to_image = {
+                    page_num: image
+                    for page_num, image in zip(range(first_page, last_page + 1), all_images)
+                }
+                all_images = [page_to_image[p] for p in page_numbers if p in page_to_image]
         except PDFSyntaxError as exc:
             raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
         except PDFPageCountError as exc:
@@ -405,9 +424,8 @@ def extract_ocr_pdf_from_bytes(
         except Exception as exc:
             raise RuntimeError(f"pdf rendering failed: {fitz_exc}; pdf2image: {exc}") from exc
 
-    target_set = set(page_numbers) if page_numbers else None
     start_page = min(page_numbers) if page_numbers else 1
-    results = _process_images_in_threads(all_images, start_page, target_set)
+    results = _process_images_in_threads(all_images, start_page, page_numbers)
 
     logger.info("OCR extraction complete | pages=%s | bytes input", len(results))
     return results

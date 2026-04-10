@@ -64,7 +64,7 @@ def _run_inline(job_id: str) -> None:
         import json
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "job_id": job_id,
@@ -78,7 +78,11 @@ def _run_inline(job_id: str) -> None:
                         "pdf_type": "unknown",
                         "confidence_score": 0.0,
                         "processing_time_seconds": 0,
+                        "warnings": [],
+                        "warnings_truncated": False,
+                        "total_warning_count": 0,
                     },
+                    "expires_at": None,
                 },
                 f,
             )

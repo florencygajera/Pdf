@@ -144,9 +144,9 @@ class Settings(BaseSettings):
             return bool(v)
         if isinstance(v, str):
             normalized = v.strip().lower()
-            if normalized in {"1", "true", "yes", "y", "on", "debug", "dev", "development"}:
+            if normalized in {"1", "true", "yes", "y", "on"}:
                 return True
-            if normalized in {"0", "false", "no", "n", "off", "release", "prod", "production", ""}:
+            if normalized in {"0", "false", "no", "n", "off", ""}:
                 return False
         return False
 

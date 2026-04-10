@@ -13,6 +13,7 @@ Key capabilities:
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import re
 import fitz  # PyMuPDF
 
 from app.config.constants import MIN_BLOCK_CHAR_COUNT
@@ -24,6 +25,8 @@ from app.utils.sorting import (
 )
 
 logger = get_logger(__name__)
+
+_STREAM_LITERAL_RE = re.compile(rb"\((?:\\.|[^\\)])*\)")
 
 try:
     fitz.TOOLS.mupdf_display_errors(False)
@@ -78,6 +81,56 @@ def _extract_page_blocks(page: fitz.Page) -> List[Dict[str, Any]]:
         )
 
     return blocks
+
+
+def _extract_page_text_from_bytes(pdf_bytes: bytes, page_number: int) -> str:
+    """Extract text from a single page in a PDF byte stream as a last-resort fallback."""
+    if not pdf_bytes:
+        return ""
+
+    doc = None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if page_number < 1 or page_number > len(doc):
+            return ""
+        page = doc[page_number - 1]
+
+        chunks: List[str] = []
+        contents = page.get_contents() or []
+        if isinstance(contents, int):
+            contents = [contents]
+
+        for xref in contents:
+            try:
+                stream = doc.xref_stream(xref)
+            except Exception:
+                stream = None
+            if not stream:
+                continue
+            for match in _STREAM_LITERAL_RE.finditer(stream):
+                literal = match.group(0)[1:-1]
+                try:
+                    text = literal.decode("latin-1", errors="ignore")
+                except Exception:
+                    continue
+                chunks.append(text.replace("\\n", "\n").replace("\\r", "\r").strip())
+
+        chunks = [chunk for chunk in chunks if chunk]
+        if chunks:
+            return "\n".join(chunks).strip()
+
+        if len(doc) == 1:
+            return extract_text_from_pdf_bytes(pdf_bytes)
+
+        return ""
+    except Exception:
+        return ""
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def extract_digital_page(
@@ -137,10 +190,7 @@ def extract_digital_page(
             sorted_blocks = [_build_synthetic_block(final_text)]
 
     if not final_text.strip() and pdf_bytes is not None:
-        try:
-            fallback_text = extract_text_from_pdf_bytes(pdf_bytes)
-        except Exception:
-            fallback_text = ""
+        fallback_text = _extract_page_text_from_bytes(pdf_bytes, page_number)
         if fallback_text.strip():
             warnings.append(f"Page {page_number}: PyMuPDF fallback extraction used.")
             final_text = fallback_text.strip()
