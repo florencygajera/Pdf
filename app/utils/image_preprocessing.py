@@ -230,6 +230,7 @@ def preprocess_page_image(
     apply_stamp_removal: bool = True,
     apply_deskew: bool = True,
     prefer_light: bool = False,
+    quality_profile: Optional[dict] = None,
 ) -> Tuple[np.ndarray, dict]:
     """
     Full preprocessing pipeline for a single PDF page image.
@@ -252,7 +253,7 @@ def preprocess_page_image(
     # 2. Contrast enhancement
     gray = enhance_contrast(gray)
 
-    quality = estimate_page_complexity(gray)
+    quality = quality_profile or estimate_page_complexity(gray)
     meta["quality"] = quality
 
     use_light_path = prefer_light or not quality["needs_full_preprocess"]

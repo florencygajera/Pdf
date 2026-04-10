@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import gc
 import multiprocessing as mp
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from io import BytesIO
@@ -106,13 +107,9 @@ class _PaddleOCRPool:
                     try:
                         instance = self._available.get(timeout=60)
                     except Empty:
-                        logger.warning(
-                            "OCR pool stalled for 60s; rebuilding a fresh instance."
+                        raise RuntimeError(
+                            "OCR pool timeout — no free instance available"
                         )
-                        self._available = Queue()
-                        self._created = 0
-                        instance = self._create_instance()
-                        self._created += 1
 
         try:
             yield instance
@@ -255,6 +252,41 @@ def _render_pages_with_fitz(
         doc.close()
 
 
+def _render_single_page_with_fitz(
+    *,
+    pdf_path: Optional[Path] = None,
+    pdf_bytes: Optional[bytes] = None,
+    page_number: int,
+    dpi: int,
+) -> Optional[Image.Image]:
+    """Render one page with PyMuPDF and return None if the page fails."""
+    try:
+        if pdf_bytes is not None:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        elif pdf_path is not None:
+            doc = fitz.open(str(pdf_path))
+        else:
+            return None
+    except Exception:
+        return None
+
+    try:
+        if page_number < 1 or page_number > len(doc):
+            return None
+        page = doc[page_number - 1]
+        scale = max(1.0, dpi / 72.0)
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        mode = "RGB" if pix.n < 4 else "RGBA"
+        image = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+        if mode == "RGBA":
+            image = image.convert("RGB")
+        return image
+    except Exception:
+        return None
+    finally:
+        doc.close()
+
+
 def _render_pages_for_ocr(
     *,
     pdf_path: Optional[Path] = None,
@@ -263,51 +295,81 @@ def _render_pages_for_ocr(
     dpi: int,
 ) -> List[Image.Image]:
     """Render pages with PyMuPDF first, falling back to pdf2image if needed."""
-    try:
-        return _render_pages_with_fitz(
+    page_list = page_numbers or []
+    if not page_list:
+        if pdf_bytes is not None:
+            try:
+                with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+                    page_list = list(range(1, len(doc) + 1))
+            except Exception:
+                page_list = []
+        elif pdf_path is not None:
+            try:
+                with fitz.open(str(pdf_path)) as doc:
+                    page_list = list(range(1, len(doc) + 1))
+            except Exception:
+                page_list = []
+
+    images: List[Image.Image] = []
+    fallback_pages: List[int] = []
+
+    for page_num in page_list:
+        image = _render_single_page_with_fitz(
             pdf_path=pdf_path,
             pdf_bytes=pdf_bytes,
-            page_numbers=page_numbers,
+            page_number=page_num,
             dpi=dpi,
         )
-    except Exception as fitz_exc:
-        try:
-            first_page = min(page_numbers) if page_numbers else None
-            last_page = max(page_numbers) if page_numbers else None
-            if pdf_bytes is not None:
-                images = convert_from_bytes(
-                    pdf_bytes,
-                    dpi=dpi,
-                    fmt="PNG",
-                    thread_count=settings.effective_ocr_pdf2image_threads,
-                    first_page=first_page,
-                    last_page=last_page,
-                )
-            elif pdf_path is not None:
-                images = convert_from_path(
-                    str(pdf_path),
-                    dpi=dpi,
-                    fmt="PNG",
-                    thread_count=settings.effective_ocr_pdf2image_threads,
-                    first_page=first_page,
-                    last_page=last_page,
-                )
-            else:
-                raise ValueError("pdf_path or pdf_bytes is required")
+        if image is None:
+            fallback_pages.append(page_num)
+        else:
+            images.append(image)
 
-            if page_numbers and first_page is not None and last_page is not None:
-                page_to_image = {
-                    page_num: image
-                    for page_num, image in zip(range(first_page, last_page + 1), images)
-                }
-                images = [page_to_image[p] for p in page_numbers if p in page_to_image]
-            return images
-        except PDFSyntaxError as exc:
-            raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
-        except PDFPageCountError as exc:
-            raise ValueError(f"Cannot count PDF pages: {exc}") from exc
-        except Exception as exc:
-            raise RuntimeError(f"pdf rendering failed: {fitz_exc}; pdf2image: {exc}") from exc
+    if fallback_pages:
+        try:
+            if pdf_bytes is not None:
+                with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+                    total = len(doc)
+            elif pdf_path is not None:
+                with fitz.open(str(pdf_path)) as doc:
+                    total = len(doc)
+            else:
+                total = 0
+        except Exception:
+            total = 0
+
+        for page_num in fallback_pages:
+            try:
+                if pdf_bytes is not None:
+                    images.extend(
+                        convert_from_bytes(
+                            pdf_bytes,
+                            dpi=dpi,
+                            fmt="PNG",
+                            thread_count=settings.effective_ocr_pdf2image_threads,
+                            first_page=page_num,
+                            last_page=page_num,
+                        )
+                    )
+                elif pdf_path is not None:
+                    images.extend(
+                        convert_from_path(
+                            str(pdf_path),
+                            dpi=dpi,
+                            fmt="PNG",
+                            thread_count=settings.effective_ocr_pdf2image_threads,
+                            first_page=page_num,
+                            last_page=page_num,
+                        )
+                    )
+            except PDFSyntaxError as exc:
+                raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
+            except PDFPageCountError as exc:
+                raise ValueError(f"Cannot count PDF pages: {exc}") from exc
+            except Exception as exc:
+                logger.warning("Single-page fallback rendering failed for page %s: %s", page_num, exc)
+
+    return images
 
 
 def _filter_by_confidence(ocr_results: List, threshold: float) -> List:
@@ -480,6 +542,7 @@ def ocr_single_page_image(
             image,
             prefer_light=not profile["needs_full_preprocess"],
             apply_deskew=profile["edge_ratio"] > 0.05,
+            quality_profile=profile,
         )
     except Exception as exc:
         logger.error(
@@ -696,32 +759,21 @@ def extract_ocr_pdf_from_bytes(
 ) -> List[Dict[str, Any]]:
     """Bytes-based OCR pipeline to avoid repeated disk reads."""
     dpi = dpi or settings.OCR_DPI
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = Path(tmp.name)
+
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        total_pages = len(doc)
-        doc.close()
-    except Exception:
-        total_pages = 0
-
-    normalized_pages = _normalize_page_numbers(page_numbers, total_pages) if total_pages else (page_numbers or [])
-    if not normalized_pages and total_pages:
-        normalized_pages = list(range(1, total_pages + 1))
-
-    all_images = _render_pages_for_ocr(
-        pdf_bytes=pdf_bytes,
-        page_numbers=normalized_pages,
-        dpi=dpi,
-    )
-    results = _process_images_in_threads(
-        all_images,
-        start_page=normalized_pages[0] if normalized_pages else 1,
-        page_numbers=normalized_pages,
-        dpi=dpi,
-        parallel=False,
-    )
-
-    logger.info("OCR extraction complete | pages=%s | bytes input", len(results))
-    return results
+        return extract_ocr_pdf(
+            tmp_path,
+            page_numbers=page_numbers,
+            dpi=dpi,
+        )
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def extract_ocr_pdf_local(

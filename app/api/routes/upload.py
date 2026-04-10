@@ -15,7 +15,13 @@ from slowapi.util import get_remote_address
 from app.config.settings import settings
 from app.api.security import require_api_key
 from app.models.response_model import ErrorResponse, UploadResponse
-from app.utils.file_handler import save_upload_streaming
+from app.utils.file_handler import (
+    hash_file_sha256,
+    load_cached_result,
+    save_upload_streaming,
+    store_cached_result,
+    get_output_path,
+)
 from app.utils.logger import get_logger
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
@@ -53,13 +59,21 @@ def _run_inline(job_id: str) -> None:
         run_extraction_pipeline,
         save_result_to_disk,
     )
-    from app.utils.file_handler import get_output_path, get_upload_path
+    from app.utils.file_handler import get_upload_path
 
     pdf_path = get_upload_path(job_id)
     output_path = get_output_path(job_id)
+    hash_path = pdf_path.with_suffix(".sha256")
     try:
         result = run_extraction_pipeline(pdf_path, job_id)
         save_result_to_disk(result, output_path)
+        if hash_path.exists():
+            try:
+                file_hash = hash_path.read_text(encoding="utf-8").strip()
+                payload = result.model_dump()
+                store_cached_result(file_hash, payload)
+            except Exception as exc:
+                logger.debug("Inline cache write skipped for job %s: %s", job_id, exc)
         logger.info(f"Inline extraction complete for job {job_id}")
     except Exception as exc:
         import json
@@ -120,6 +134,31 @@ async def upload_pdf(
     logger.info(
         f"Upload complete | job={job_id} | file={file.filename} | size={size_bytes}"
     )
+
+    file_hash = hash_file_sha256(saved_path)
+    hash_path = saved_path.with_suffix(".sha256")
+    hash_path.write_text(file_hash, encoding="utf-8")
+
+    cached_result = load_cached_result(file_hash)
+    if cached_result:
+        try:
+            from app.pipelines.extraction_pipeline import save_result_to_disk
+            from app.models.response_model import ExtractionResult
+
+            save_result_to_disk(ExtractionResult(**cached_result), get_output_path(job_id))
+            logger.info(
+                "Cache hit | job=%s | file_hash=%s | reused cached result",
+                job_id,
+                file_hash,
+            )
+            return UploadResponse(
+                job_id=job_id,
+                filename=file.filename or "unknown.pdf",
+                size_bytes=size_bytes,
+                message="File uploaded. Cached result reused immediately.",
+            )
+        except Exception as exc:
+            logger.warning("Cache reuse failed for job %s: %s", job_id, exc)
 
     _enqueue_or_run(job_id, background_tasks)
 

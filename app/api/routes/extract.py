@@ -6,6 +6,7 @@ GET  /api/v1/extract/{job_id}/tables  — get only tables as JSON
 DELETE /api/v1/extract/{job_id}       — cancel and clean up job files
 """
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import List
@@ -296,9 +297,7 @@ async def delete_job(job_id: str):
         from app.workers.celery_worker import celery_app
 
         celery_app.control.revoke(job_id, terminate=True, signal="SIGTERM")
-        import time
-
-        time.sleep(2)
+        await asyncio.sleep(2)
         logger.info(f"Celery task {job_id} revoked.")
     except Exception:
         pass

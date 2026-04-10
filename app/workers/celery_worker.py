@@ -24,7 +24,11 @@ from app.pipelines.extraction_pipeline import (
     run_extraction_pipeline,
     save_result_to_disk,
 )
-from app.utils.file_handler import get_output_path, get_upload_path
+from app.utils.file_handler import (
+    get_output_path,
+    get_upload_path,
+    store_cached_result,
+)
 
 # ── Celery App ────────────────────────────────────────────────────────────────
 celery_app = Celery(
@@ -105,6 +109,13 @@ def extract_pdf_task(self, job_id: str) -> dict:
             pdf_path, job_id, progress_callback=progress_cb
         )
         save_result_to_disk(result, output_path)
+        hash_path = pdf_path.with_suffix(".sha256")
+        if hash_path.exists():
+            try:
+                file_hash = hash_path.read_text(encoding="utf-8").strip()
+                store_cached_result(file_hash, result.model_dump())
+            except Exception as exc:
+                task_logger.debug("Cache store skipped for job %s: %s", job_id, exc)
 
         task_logger.info(f"Task complete | job={job_id} | output={output_path}")
         return {
@@ -128,15 +139,12 @@ def extract_pdf_task(self, job_id: str) -> dict:
         task_logger.error(
             f"Unexpected error for job {job_id}: {exc}\n{traceback.format_exc()}"
         )
-        try:
-            raise self.retry(exc=exc)
-        except self.MaxRetriesExceededError:
-            _write_failed_result(job_id, output_path, f"Max retries exceeded: {exc}")
-            return {
-                "status": STATE_FAILED,
-                "job_id": job_id,
-                "error": str(exc),
-            }
+        _write_failed_result(job_id, output_path, str(exc))
+        return {
+            "status": STATE_FAILED,
+            "job_id": job_id,
+            "error": str(exc),
+        }
 
 
 def _write_failed_result(job_id: str, output_path: Path, error_msg: str) -> None:
