@@ -125,6 +125,14 @@ class Settings(BaseSettings):
     CELERY_TASK_TIMEOUT: int = Field(
         default=600, description="Seconds before task killed"
     )
+    CELERY_WORKER_CONCURRENCY: Optional[int] = Field(
+        default=1,
+        description="Concurrent Celery tasks per worker process. Keep 1 for heavy OCR jobs.",
+    )
+    CELERY_WORKER_POOL: str = Field(
+        default="prefork",
+        description="Celery worker pool type. Use prefork for CPU-bound OCR workloads.",
+    )
     RESULT_EXPIRES_SECONDS: int = Field(
         default=3600, description="Seconds before completed output files expire"
     )
@@ -225,10 +233,16 @@ class Settings(BaseSettings):
         if memory < 12:
             return min(2, max(1, cpu // 4 or 1))
         if memory < 20:
-            return min(3, max(2, cpu // 3 or 1))
+            return min(4, max(2, cpu // 2 or 1))
         if memory < 32:
-            return min(4, max(3, cpu // 2 or 1))
-        return min(4, max(3, cpu // 2 or 1))
+            return min(5, max(3, cpu // 2 or 1))
+        return min(6, max(4, cpu - 1))
+
+    @property
+    def effective_celery_worker_concurrency(self) -> int:
+        if self.CELERY_WORKER_CONCURRENCY and self.CELERY_WORKER_CONCURRENCY > 0:
+            return self.CELERY_WORKER_CONCURRENCY
+        return 1
 
     @property
     def effective_ocr_pdf2image_threads(self) -> int:
@@ -265,12 +279,12 @@ class Settings(BaseSettings):
         if memory < 12:
             base = 8
         elif memory < 24:
-            base = 12
+            base = 10
         else:
-            base = 16
+            base = 12
 
         target = max(6, total_pages // max(workers * 2, 1))
-        return max(6, min(24, max(base, target)))
+        return max(6, min(12, max(base, target)))
 
 @lru_cache
 def get_settings() -> Settings:

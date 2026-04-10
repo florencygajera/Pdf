@@ -23,6 +23,32 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def estimate_page_complexity(image: np.ndarray) -> dict:
+    """
+    Cheap page-quality estimate used to decide whether a page needs the full
+    preprocessing stack.
+    """
+    gray = to_grayscale(image)
+    h, w = gray.shape[:2]
+    sample_w = min(384, w)
+    sample_h = max(1, int(h * (sample_w / max(w, 1))))
+    sample = cv2.resize(gray, (sample_w, sample_h), interpolation=cv2.INTER_AREA)
+
+    std = float(np.std(sample))
+    dark_ratio = float(np.mean(sample < 180))
+    edge_ratio = float(
+        np.mean(cv2.Canny(sample, 50, 150) > 0) if sample.size else 0.0
+    )
+    needs_full_preprocess = std < 28.0 or dark_ratio > 0.28 or edge_ratio > 0.10
+
+    return {
+        "std": std,
+        "dark_ratio": dark_ratio,
+        "edge_ratio": edge_ratio,
+        "needs_full_preprocess": needs_full_preprocess,
+    }
+
+
 def pil_to_cv2(image: Image.Image) -> np.ndarray:
     """Convert a PIL Image (RGB) to an OpenCV BGR numpy array."""
     return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
@@ -204,6 +230,7 @@ def preprocess_page_image(
     image: Image.Image,
     apply_stamp_removal: bool = True,
     apply_deskew: bool = True,
+    prefer_light: bool = False,
 ) -> Tuple[np.ndarray, dict]:
     """
     Full preprocessing pipeline for a single PDF page image.
@@ -226,24 +253,32 @@ def preprocess_page_image(
     # 2. Contrast enhancement
     gray = enhance_contrast(gray)
 
-    # 3. Denoise
-    gray = remove_noise(gray)
+    quality = estimate_page_complexity(gray)
+    meta["quality"] = quality
 
-    # 4. Adaptive threshold
-    binary = adaptive_threshold(gray)
+    use_light_path = prefer_light or not quality["needs_full_preprocess"]
+    meta["preprocess_mode"] = "light" if use_light_path else "full"
 
-    # 5. Stamp removal
-    if apply_stamp_removal:
-        binary = remove_stamp_artifacts(binary)
-
-    # 6. Deskew
-    angle = 0.0
-    if apply_deskew:
-        binary, angle = deskew(binary)
-    meta["deskew_angle"] = angle
-
-    # 7. Morphological cleanup
-    binary = morphological_cleanup(binary)
+    if use_light_path:
+        # Fast path: enough for clean scans and significantly cheaper than the
+        # full denoise/stamp/deskew stack.
+        binary = adaptive_threshold(gray)
+        angle = 0.0
+        if apply_deskew and quality["edge_ratio"] > 0.05:
+            binary, angle = deskew(binary)
+        meta["deskew_angle"] = angle
+        binary = morphological_cleanup(binary)
+    else:
+        # Full path for dirty / blurry / noisy scans.
+        gray = remove_noise(gray)
+        binary = adaptive_threshold(gray)
+        if apply_stamp_removal:
+            binary = remove_stamp_artifacts(binary)
+        angle = 0.0
+        if apply_deskew:
+            binary, angle = deskew(binary)
+        meta["deskew_angle"] = angle
+        binary = morphological_cleanup(binary)
 
     # Convert back to 3-channel for PaddleOCR (expects BGR)
     output = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)

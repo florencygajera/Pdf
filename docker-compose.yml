@@ -54,10 +54,12 @@ services:
       target: runtime
     command: >
       celery -A app.workers.celery_worker worker
+      --pool=prefork
       --loglevel=info
-      --concurrency=2
+      --concurrency=1
+      --prefetch-multiplier=1
       --queues=celery
-      --max-tasks-per-child=50
+      --max-tasks-per-child=5
     restart: unless-stopped
     environment:
       - ENVIRONMENT=production

@@ -31,7 +31,7 @@ from pdf2image.exceptions import PDFPageCountError, PDFSyntaxError
 
 from app.config.constants import LINE_Y_TOLERANCE_OCR
 from app.config.settings import settings
-from app.utils.image_preprocessing import preprocess_page_image
+from app.utils.image_preprocessing import estimate_page_complexity, preprocess_page_image
 from app.utils.logger import get_logger
 from app.utils.sorting import merge_hyphenated_lines, sort_ocr_results
 
@@ -455,26 +455,32 @@ def ocr_single_page_image(
     warnings: List[str] = []
     raw_image = _page_array_from_image(image)
     rendered_image = raw_image if include_rendered_image else None
+    profile = estimate_page_complexity(raw_image)
     fast_page: Optional[Dict[str, Any]] = None
 
-    try:
-        fast_arr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
-        fast_results = _run_paddle_ocr(fast_arr)
-        if fast_results:
-            fast_page = _build_ocr_page_result(
-                page_number=page_number,
-                warnings=warnings[:],
-                raw_results=fast_results,
-                include_rendered_image=include_rendered_image,
-                rendered_image=rendered_image,
-            )
-            if _ocr_result_looks_good(fast_page):
-                return fast_page
-    except Exception as exc:
-        logger.debug("Fast OCR path failed on page %s: %s", page_number, exc)
+    if not profile["needs_full_preprocess"]:
+        try:
+            fast_arr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
+            fast_results = _run_paddle_ocr(fast_arr)
+            if fast_results:
+                fast_page = _build_ocr_page_result(
+                    page_number=page_number,
+                    warnings=warnings[:],
+                    raw_results=fast_results,
+                    include_rendered_image=include_rendered_image,
+                    rendered_image=rendered_image,
+                )
+                if _ocr_result_looks_good(fast_page):
+                    return fast_page
+        except Exception as exc:
+            logger.debug("Fast OCR path failed on page %s: %s", page_number, exc)
 
     try:
-        processed_arr, preprocess_meta = preprocess_page_image(image)
+        processed_arr, preprocess_meta = preprocess_page_image(
+            image,
+            prefer_light=not profile["needs_full_preprocess"],
+            apply_deskew=profile["edge_ratio"] > 0.05,
+        )
     except Exception as exc:
         logger.error(
             "Preprocessing failed on page %s: %s", page_number, exc, exc_info=True
@@ -520,7 +526,6 @@ def ocr_single_page_image(
         rendered_image=rendered_image,
     )
 
-    # If the light pass also looks good, keep the better of the two results.
     if fast_page is not None and _ocr_result_looks_good(fast_page):
         fast_score = len(fast_page.get("text", "")) + float(
             fast_page.get("confidence", 0.0)

@@ -4,7 +4,7 @@ Handles async/background PDF extraction jobs.
 Tasks are queued when a PDF is uploaded and polled via /extract/{job_id}.
 
 Run worker with:
-  celery -A app.workers.celery_worker worker --loglevel=info --concurrency=2
+  celery -A app.workers.celery_worker worker --pool=prefork --loglevel=info --concurrency=1
 """
 
 import json
@@ -43,6 +43,8 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,  # One task at a time per worker
     task_acks_late=True,  # Acknowledge only after completion (safer)
     result_expires=settings.RESULT_EXPIRES_SECONDS,
+    worker_concurrency=settings.effective_celery_worker_concurrency,
+    worker_pool=settings.CELERY_WORKER_POOL,
 )
 
 task_logger = get_task_logger(__name__)
