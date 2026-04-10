@@ -1,48 +1,249 @@
-# PDF Content Extractor
+# 📄 Hybrid PDF Extraction System
 
-Production-ready Flask app for uploading PDFs, extracting text, and searching within the extracted content.
+Production-grade extraction pipeline for government documents. Handles **digital PDFs**, **scanned PDFs**, and **mixed documents** with near-zero error rates.
 
-Upload flow:
-- Paste a cloud PDF URL directly into the app, or
-- Choose `Upload from Device` to send the file directly to Cloudinary from the browser, then pass the resulting `secure_url` to Flask.
+---
 
-The Flask app accepts only `{"file_url":"https://..."}` at `/api/upload`, streams the file temporarily for extraction, and returns only a small preview. The remote download is capped for Vercel-safe processing.
+## 🏗️ Architecture
 
-## Local run
+```
+Upload → PDF Type Detection → [Digital Engine | OCR Engine]
+       → Table Extraction → Layout Reconstruction
+       → Noise Removal → Validation → JSON Output
+```
 
-```powershell
-cd e:\pdf
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
+| Layer | Technology |
+|---|---|
+| Digital Extraction | PyMuPDF (fitz) |
+| OCR | PaddleOCR (CPU/GPU) |
+| Image Preprocessing | OpenCV |
+| PDF→Image | pdf2image + Poppler |
+| Table Extraction (digital) | Camelot → pdfplumber fallback |
+| Table Extraction (scanned) | OpenCV grid detection |
+| Layout Detection | Coordinate heuristics + optional LayoutParser |
+| API | FastAPI + Async |
+| Task Queue | Celery + Redis |
+| Containerization | Docker + docker-compose |
+
+---
+
+## 📁 Project Structure
+
+```
+pdf_extractor/
+├── app/
+│   ├── main.py                     # FastAPI app factory
+│   ├── config/
+│   │   ├── settings.py             # Pydantic-settings (env vars)
+│   │   └── constants.py            # System-wide constants
+│   ├── api/routes/
+│   │   ├── health.py               # /healthz, /readyz
+│   │   ├── upload.py               # POST /api/v1/upload
+│   │   └── extract.py              # GET /api/v1/extract/{job_id}
+│   ├── services/
+│   │   ├── pdf_detector.py         # Digital vs Scanned classification
+│   │   ├── digital_extractor.py    # PyMuPDF text extraction
+│   │   ├── ocr_extractor.py        # PaddleOCR pipeline
+│   │   ├── layout_engine.py        # Multi-column reading order
+│   │   ├── table_extractor.py      # Camelot + OCR grid tables
+│   │   ├── noise_cleaner.py        # Dedup, regex, watermark removal
+│   │   └── validator.py            # Confidence scoring, QA
+│   ├── pipelines/
+│   │   └── extraction_pipeline.py  # Master orchestrator
+│   ├── utils/
+│   │   ├── file_handler.py         # Streaming upload, temp file lifecycle
+│   │   ├── image_preprocessing.py  # OpenCV pipeline (deskew, denoise)
+│   │   ├── sorting.py              # Reading-order sort algorithms
+│   │   └── logger.py              # Structured JSON/text logger
+│   ├── models/
+│   │   └── response_model.py       # Pydantic I/O contracts
+│   └── workers/
+│       └── celery_worker.py        # Async extraction task
+├── tests/
+│   ├── conftest.py
+│   └── test_all.py                 # 20+ unit + integration tests
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+└── README.md
+```
+
+---
+
+## 🚀 Quick Start
+
+### Option A — Docker Compose (recommended)
+
+```bash
+# 1. Clone and configure
+cp .env.example .env
+# Edit .env as needed
+
+# 2. Start all services (API + Celery worker + Redis)
+docker compose up --build
+
+# 3. Upload a PDF
+curl -X POST http://localhost:8000/api/v1/upload \
+  -F "file=@/path/to/document.pdf"
+# → {"job_id": "abc-123", ...}
+
+# 4. Poll for result
+curl http://localhost:8000/api/v1/extract/abc-123
+```
+
+### Option B — Local Development
+
+```bash
+# Prerequisites: Python 3.11+, Redis, Poppler, Ghostscript
+
+# 1. Install system deps (Ubuntu/Debian)
+sudo apt-get install poppler-utils ghostscript
+
+# 2. Install Python packages
+pip install paddlepaddle          # CPU version
 pip install -r requirements.txt
-python app.py
+
+# 3. Start Redis
+redis-server &
+
+# 4. Start Celery worker
+celery -A app.workers.celery_worker worker --loglevel=info &
+
+# 5. Start API
+uvicorn app.main:app --reload --port 8000
 ```
 
-Open `http://127.0.0.1:5000`.
+---
 
-## Vercel deploy
+## 🔌 API Reference
 
-- Keep the project root at `e:\pdf`
-- Make sure `requirements.txt` is at the root
-- Redeploy after pushing the latest commit
-- Set these environment variables for device uploads:
-  - `CLOUDINARY_CLOUD_NAME`
-  - `CLOUDINARY_UPLOAD_PRESET`
-  - Use an unsigned preset that allows `raw` uploads for PDF files
-- If you split the frontend and API onto different origins later, set `CORS_ALLOWED_ORIGINS` to a comma-separated list of allowed origins.
+### `POST /api/v1/upload`
+Upload a PDF for extraction.
 
-## Upload limits
-
-- Device uploads are limited to 50 MB on the client side before Cloudinary upload starts.
-- Flask never receives the raw device file.
-- URL uploads stay JSON-only and never send multipart form data to the backend.
-- On Vercel, search and summary requests may land on a different serverless instance than the upload request. If that happens, re-upload the PDF before searching or summarizing.
-
-## Optional OCR extras
-
-If you want the standalone `pdf.py` OCR helper, install:
-
-```powershell
-pip install -r requirements-ocr.txt
+**Request:** `multipart/form-data` with `file` field  
+**Response:**
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "filename": "gazette.pdf",
+  "size_bytes": 5242880,
+  "message": "File uploaded. Use job_id to poll /extract/{job_id}."
+}
 ```
+
+### `GET /api/v1/extract/{job_id}`
+Poll for result. Returns **202** while processing, **200** when done.
+
+**200 Response:**
+```json
+{
+  "job_id": "...",
+  "status": "done",
+  "text": "Full extracted clean text...",
+  "tables": [
+    {
+      "page": 3,
+      "table_index": 0,
+      "headers": ["Name", "Rank", "Unit"],
+      "rows": [["Ramesh Kumar", "Havildar", "5 Para SF"]],
+      "extraction_method": "camelot-lattice"
+    }
+  ],
+  "pages": [...],
+  "metadata": {
+    "pages": 12,
+    "pdf_type": "mixed",
+    "confidence_score": 0.87,
+    "processing_time_seconds": 34.2,
+    "languages_detected": ["en", "hi"],
+    "ocr_engine": "PaddleOCR"
+  }
+}
+```
+
+### `GET /api/v1/extract/{job_id}/status` — lightweight progress check
+### `GET /api/v1/extract/{job_id}/text` — text only
+### `GET /api/v1/extract/{job_id}/tables` — tables only  
+### `DELETE /api/v1/extract/{job_id}` — cancel and cleanup
+### `GET /healthz` — liveness probe
+### `GET /readyz` — readiness probe (checks Redis)
+
+---
+
+## ⚙️ Configuration
+
+All settings are via environment variables (see `.env.example`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_FILE_SIZE_MB` | `100` | Max upload size |
+| `OCR_DPI` | `300` | PDF→image resolution |
+| `OCR_LANGUAGES` | `["en"]` | PaddleOCR languages |
+| `OCR_USE_GPU` | `false` | Enable GPU OCR |
+| `OCR_CONFIDENCE_THRESHOLD` | `0.6` | Min OCR confidence |
+| `REDIS_URL` | `redis://localhost:6379/0` | Celery broker |
+| `CELERY_TASK_TIMEOUT` | `600` | Seconds before task kill |
+| `LOG_FORMAT` | `json` | `json` or `text` |
+
+---
+
+## 🧪 Running Tests
+
+```bash
+# All tests with coverage
+pytest tests/ -v --cov=app --cov-report=term-missing
+
+# Specific test class
+pytest tests/test_all.py::TestNoiseCleaner -v
+
+# Just API tests
+pytest tests/test_all.py::TestAPIRoutes -v
+```
+
+---
+
+## 🌐 Multi-Language Support
+
+Set `OCR_LANGUAGES` in your `.env`:
+```
+OCR_LANGUAGES=["en","hi"]    # English + Hindi
+OCR_LANGUAGES=["en","ch"]    # English + Chinese
+```
+
+PaddleOCR supports 80+ languages. See the [PaddleOCR docs](https://github.com/PaddlePaddle/PaddleOCR) for language codes.
+
+---
+
+## 📊 Monitoring (Flower)
+
+```bash
+# Start with monitoring profile
+docker compose --profile monitoring up
+
+# Access Flower dashboard
+open http://localhost:5555
+```
+
+---
+
+## 🔒 Production Checklist
+
+- [ ] Set strong `SECRET_KEY` in `.env`
+- [ ] Set `ENVIRONMENT=production` (disables `/docs`)
+- [ ] Configure `ALLOWED_HOSTS` and `CORS_ORIGINS`
+- [ ] Set `LOG_FORMAT=json` for log aggregation
+- [ ] Mount persistent volumes for `uploads/` and `outputs/`
+- [ ] Set resource limits for Celery workers
+- [ ] Configure Redis persistence (AOF/RDB)
+- [ ] Set up log rotation
+
+---
+
+## 🐛 Troubleshooting
+
+**`pdf2image` fails:** Install Poppler: `sudo apt-get install poppler-utils`  
+**Camelot fails:** Install Ghostscript: `sudo apt-get install ghostscript`  
+**PaddleOCR import error:** `pip install paddlepaddle paddleocr`  
+**Memory crash on large files:** Reduce `CHUNK_SIZE_PAGES` in `constants.py`  
+**Low OCR accuracy:** Increase `OCR_DPI` to 400, ensure good scan quality

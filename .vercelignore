@@ -1,9 +1,0 @@
-.venv
-venv
-__pycache__
-debug_images
-uploads
-cache
-*.pyc
-*_extracted.txt
-*_extracted.json

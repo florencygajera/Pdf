@@ -1,0 +1,94 @@
+version: "3.9"
+
+# ── Full stack: FastAPI + Celery Worker + Redis ─────────────────────────────
+services:
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+  api:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - REDIS_URL=redis://redis:6379/0
+      - MAX_FILE_SIZE_MB=100
+      - OCR_DPI=300
+      - OCR_USE_GPU=false
+      - LOG_FORMAT=json
+      - LOG_LEVEL=INFO
+      - RATE_LIMIT_UPLOAD=10/minute
+      - RATE_LIMIT_EXTRACT=60/minute
+    env_file:
+      - .env                          # secrets — never commit this file
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads:/tmp/pdf_uploads
+      - outputs:/tmp/pdf_outputs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    command: >
+      celery -A app.workers.celery_worker worker
+      --loglevel=info
+      --concurrency=2
+      --queues=celery
+      --max-tasks-per-child=50
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=production
+      - REDIS_URL=redis://redis:6379/0
+      - MAX_FILE_SIZE_MB=100
+      - OCR_DPI=300
+      - OCR_USE_GPU=false
+      - LOG_FORMAT=json
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads:/tmp/pdf_uploads
+      - outputs:/tmp/pdf_outputs
+
+  flower:
+    image: mher/flower:2.0
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - FLOWER_PORT=5555
+    depends_on:
+      - redis
+    profiles:
+      - monitoring            # start with: docker compose --profile monitoring up
+
+volumes:
+  redis_data:
+  uploads:
+  outputs:

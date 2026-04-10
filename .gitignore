@@ -1,11 +1,26 @@
-.venv/
-venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-debug_images/
-uploads/
-cache/
-*_extracted.txt
-*_extracted.json
-.python-version
-.vercel/
+*.py[cod]
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.venv/
+env/
+venv/
+ENV/
+.env.example
+
+
+# Testing / Coverage
+htmlcov/
+.tox/
+.pytest_cache/
+
+# IDE / Editor Settings
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.kilocode/
