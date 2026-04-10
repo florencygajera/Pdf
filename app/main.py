@@ -21,7 +21,7 @@ from app.config.settings import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
+FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend"
 
 # ─── Rate Limiter ────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)

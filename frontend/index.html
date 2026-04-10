@@ -3,81 +3,159 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PDF Extractor</title>
+    <title>PDF Extraction Studio</title>
     <meta
       name="description"
-      content="Simple PDF upload and extraction interface."
+      content="A clean demo UI for uploading PDFs and reviewing extraction results."
     />
     <link rel="stylesheet" href="/assets/styles.css" />
     <script defer src="/assets/app.js"></script>
   </head>
   <body>
-    <main class="shell">
-      <section class="hero">
-        <p class="eyebrow">PDF Extraction</p>
-        <h1>Clean upload. Clear results.</h1>
-        <p class="lede">
-          Upload a PDF, follow the job status, and inspect extracted text in one
-          minimal workspace.
-        </p>
-      </section>
-
-      <section class="panel">
-        <form id="upload-form" class="card">
-          <label class="upload" for="file-input">
-            <input id="file-input" name="file" type="file" accept="application/pdf,.pdf" />
-            <span class="upload-copy">
-              <strong>Choose a PDF</strong>
-              <span>Drag and drop is supported in the browser native picker.</span>
-            </span>
-          </label>
-          <div class="actions">
-            <button type="submit">Upload and Extract</button>
-            <button type="button" id="clear-btn" class="secondary">Clear</button>
-          </div>
-          <p id="file-meta" class="meta">No file selected.</p>
-        </form>
-
-        <div class="card">
-          <div class="section-head">
-            <h2>Status</h2>
-            <span id="job-badge" class="badge muted">Idle</span>
-          </div>
-          <p id="status-text" class="status-text">
-            Upload a file to start extraction.
-          </p>
-          <div class="progress">
-            <div id="progress-bar" class="progress-bar"></div>
-          </div>
-          <p id="job-id" class="meta"></p>
+    <div class="page-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Hybrid PDF Extraction</p>
+          <h1>PDF Extraction Studio</h1>
         </div>
-
-        <div class="card result-card">
-          <div class="section-head">
-            <h2>Result</h2>
-            <button id="copy-btn" type="button" class="secondary">Copy text</button>
-          </div>
-          <pre id="result-text" class="result">Waiting for extraction result...</pre>
+        <div class="status-group">
+          <span id="api-health" class="pill pill-warm">Checking API...</span>
+          <span id="ready-health" class="pill pill-muted">Readiness...</span>
         </div>
+      </header>
 
-        <div class="grid">
-          <div class="card">
+      <main class="layout">
+        <section class="hero card glass">
+          <div class="hero-copy">
+            <p class="lead">
+              Upload a PDF, watch the extraction progress, and review the final
+              text, metadata, and tables in a calm, presentation-ready layout.
+            </p>
+            <div class="feature-row">
+              <div class="feature">
+                <span class="feature-label">API-driven</span>
+                <strong>Upload, status, extract</strong>
+              </div>
+              <div class="feature">
+                <span class="feature-label">Output</span>
+                <strong>Text, tables, metadata</strong>
+              </div>
+              <div class="feature">
+                <span class="feature-label">Mode</span>
+                <strong>Digital + OCR</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="summary-grid">
+            <div class="summary-card">
+              <span>Job</span>
+              <strong id="job-id">No job yet</strong>
+            </div>
+            <div class="summary-card">
+              <span>Status</span>
+              <strong id="job-status">Idle</strong>
+            </div>
+            <div class="summary-card">
+              <span>Progress</span>
+              <strong id="job-progress">0%</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="workspace">
+          <div class="stack">
+            <form id="upload-form" class="card upload-card">
+              <label id="drop-zone" class="drop-zone" for="file-input">
+                <input
+                  id="file-input"
+                  name="file"
+                  type="file"
+                  accept="application/pdf,.pdf"
+                />
+                <div class="drop-copy">
+                  <span class="drop-icon">PDF</span>
+                  <div>
+                    <strong>Choose a PDF to extract</strong>
+                    <p>
+                      Supported input: digital, scanned, or mixed documents.
+                    </p>
+                  </div>
+                </div>
+              </label>
+
+              <div class="file-row">
+                <p id="file-meta" class="meta">No file selected.</p>
+                <p id="status-text" class="status-text">
+                  Upload a file to begin.
+                </p>
+              </div>
+
+              <div class="progress-shell" aria-hidden="true">
+                <div id="progress-bar" class="progress-bar"></div>
+              </div>
+
+              <div class="actions">
+                <button type="submit">Upload and Extract</button>
+                <button type="button" id="refresh-btn" class="secondary">
+                  Refresh status
+                </button>
+                <button type="button" id="clear-btn" class="secondary">
+                  Clear
+                </button>
+              </div>
+            </form>
+
+            <section class="card api-card">
+              <div class="section-head">
+                <h2>API endpoints</h2>
+              </div>
+              <div class="endpoint-list">
+                <div><code>POST /api/v1/upload</code><span>Upload a PDF and create a job.</span></div>
+                <div><code>GET /api/v1/extract/{job_id}</code><span>Fetch the final result.</span></div>
+                <div><code>GET /api/v1/extract/{job_id}/status</code><span>Check live progress.</span></div>
+                <div><code>GET /api/v1/extract/{job_id}/text</code><span>Fetch extracted text only.</span></div>
+                <div><code>GET /api/v1/extract/{job_id}/tables</code><span>Fetch extracted tables.</span></div>
+              </div>
+            </section>
+          </div>
+
+          <section class="card result-card">
             <div class="section-head">
-              <h2>Metadata</h2>
+              <div>
+                <p class="eyebrow small">Live Result</p>
+                <h2>Extraction output</h2>
+              </div>
+              <div class="result-actions">
+                <button type="button" id="copy-btn" class="secondary">Copy text</button>
+                <button type="button" id="download-btn" class="secondary">Download JSON</button>
+              </div>
             </div>
-            <dl id="metadata" class="details"></dl>
-          </div>
 
-          <div class="card">
-            <div class="section-head">
-              <h2>Tables</h2>
+            <div class="tabs" role="tablist" aria-label="Result views">
+              <button class="tab active" data-tab="text" type="button">Text</button>
+              <button class="tab" data-tab="metadata" type="button">Metadata</button>
+              <button class="tab" data-tab="tables" type="button">Tables</button>
+              <button class="tab" data-tab="raw" type="button">Raw JSON</button>
             </div>
-            <div id="tables" class="tables">
-              <p class="meta">No tables yet.</p>
+
+            <div class="tab-panels">
+              <div id="panel-text" class="panel-view active">
+                <pre id="result-text" class="result">Waiting for extraction result...</pre>
+              </div>
+              <div id="panel-metadata" class="panel-view">
+                <dl id="metadata" class="details"></dl>
+              </div>
+              <div id="panel-tables" class="panel-view">
+                <div id="tables" class="tables"></div>
+              </div>
+              <div id="panel-raw" class="panel-view">
+                <pre id="raw-json" class="result muted-pre">{}</pre>
+              </div>
             </div>
-          </div>
-        </div>
-      </section>
-    </main>
+          </section>
+        </section>
+      </main>
+    </div>
   </body>
 </html>
