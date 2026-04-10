@@ -119,17 +119,32 @@ def _extract_words_text(page: fitz.Page) -> str:
 
     for item in items[1:]:
         x0, y0, x1, y1, _ = item
-        if y0 <= current_bottom + line_tolerance or abs(y0 - current_top) <= line_tolerance:
+        if (
+            y0 <= current_bottom + line_tolerance
+            or abs(y0 - current_top) <= line_tolerance
+        ):
             current_words.append(item)
             current_bottom = max(current_bottom, y1)
         else:
-            lines.append({"words": sorted(current_words, key=lambda w: w[0]), "top": current_top, "bottom": current_bottom})
+            lines.append(
+                {
+                    "words": sorted(current_words, key=lambda w: w[0]),
+                    "top": current_top,
+                    "bottom": current_bottom,
+                }
+            )
             current_words = [item]
             current_top = y0
             current_bottom = y1
 
     if current_words:
-        lines.append({"words": sorted(current_words, key=lambda w: w[0]), "top": current_top, "bottom": current_bottom})
+        lines.append(
+            {
+                "words": sorted(current_words, key=lambda w: w[0]),
+                "top": current_top,
+                "bottom": current_bottom,
+            }
+        )
 
     paragraphs: List[str] = []
     current_para: List[str] = []
@@ -190,6 +205,23 @@ def _looks_reasonable(text: str) -> bool:
     return alnum >= 10 or len(words) >= 3 or len(stripped) >= 20
 
 
+def _should_fast_accept_raw_text(text: str) -> bool:
+    """Return True when raw PyMuPDF text is good enough to skip heavy reconstruction."""
+    stripped = text.strip()
+    if not _looks_reasonable(stripped):
+        return False
+
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    words = _WORD_RE.findall(stripped)
+
+    # Simple pages are where PyMuPDF already gives excellent order and layout.
+    # Skip block/word reconstruction for those pages to save work.
+    if len(lines) <= 6 and len(words) >= 5:
+        return True
+
+    return False
+
+
 def _extract_pdfplumber_page_text(pdf_path: Path, page_number: int) -> str:
     """Optional high-fidelity fallback for pages that still look weak."""
     try:
@@ -202,12 +234,15 @@ def _extract_pdfplumber_page_text(pdf_path: Path, page_number: int) -> str:
             if page_number < 1 or page_number > len(pdf.pages):
                 return ""
             page = pdf.pages[page_number - 1]
-            text = page.extract_text(
-                layout=True,
-                x_tolerance=2,
-                y_tolerance=2,
-                keep_blank_chars=False,
-            ) or ""
+            text = (
+                page.extract_text(
+                    layout=True,
+                    x_tolerance=2,
+                    y_tolerance=2,
+                    keep_blank_chars=False,
+                )
+                or ""
+            )
             return text.strip()
     except Exception:
         return ""
@@ -286,6 +321,14 @@ def extract_digital_page(
     except Exception:
         raw_text = ""
 
+    if _should_fast_accept_raw_text(raw_text):
+        return {
+            "text": raw_text,
+            "blocks": [_build_synthetic_block(raw_text)],
+            "warnings": warnings,
+            "page_width": float(page.rect.width),
+        }
+
     blocks = _extract_page_blocks(page)
     sorted_blocks = sort_digital_blocks(blocks) if blocks else []
 
@@ -296,7 +339,9 @@ def extract_digital_page(
         prev_y1: Optional[float] = None
 
         for block in sorted_blocks:
-            block_lines = [line.strip() for line in block["text"].splitlines() if line.strip()]
+            block_lines = [
+                line.strip() for line in block["text"].splitlines() if line.strip()
+            ]
             if not block_lines:
                 continue
             gap = block["y0"] - prev_y1 if prev_y1 is not None else 0.0
@@ -324,11 +369,17 @@ def extract_digital_page(
             final_text = best
         else:
             word_text = _extract_words_text(page)
-            candidates = [text for text in [raw_text, block_text, word_text] if text.strip()]
-            final_text = max(candidates, key=_score_text_candidate) if candidates else ""
+            candidates = [
+                text for text in [raw_text, block_text, word_text] if text.strip()
+            ]
+            final_text = (
+                max(candidates, key=_score_text_candidate) if candidates else ""
+            )
     else:
         word_text = _extract_words_text(page)
-        candidates = [text for text in [raw_text, block_text, word_text] if text.strip()]
+        candidates = [
+            text for text in [raw_text, block_text, word_text] if text.strip()
+        ]
         final_text = max(candidates, key=_score_text_candidate) if candidates else ""
 
     if not final_text.strip() and pdf_path is not None:

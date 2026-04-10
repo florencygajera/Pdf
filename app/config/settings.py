@@ -86,6 +86,10 @@ class Settings(BaseSettings):
         description="PaddleOCR language codes e.g. ['en','hi','ch']",
     )
     OCR_USE_GPU: bool = Field(default=False)
+    OCR_ENABLE_MKLDNN: bool = Field(
+        default=False,
+        description="Enable Paddle MKLDNN/oneDNN acceleration for OCR if the runtime is stable",
+    )
     OCR_CONFIDENCE_THRESHOLD: float = Field(
         default=0.6, description="Min confidence to accept OCR result"
     )
@@ -124,6 +128,10 @@ class Settings(BaseSettings):
     RESULT_EXPIRES_SECONDS: int = Field(
         default=3600, description="Seconds before completed output files expire"
     )
+    READINESS_REQUIRE_WORKER: bool = Field(
+        default=False,
+        description="If true, readiness requires a Celery worker heartbeat in addition to Redis",
+    )
 
     # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str = Field(default="INFO")
@@ -133,7 +141,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_UPLOAD: str = Field(default="10/minute")
     RATE_LIMIT_EXTRACT: str = Field(default="30/minute")
 
-    @field_validator("DEBUG", "TESTING", "OCR_USE_GPU", mode="before")
+    @field_validator("DEBUG", "TESTING", "OCR_USE_GPU", "OCR_ENABLE_MKLDNN", mode="before")
     @classmethod
     def parse_boolish(cls, v):
         if isinstance(v, bool):
@@ -214,9 +222,13 @@ class Settings(BaseSettings):
 
         if memory < 8:
             return 1
-        if memory < 16:
+        if memory < 12:
             return min(2, max(1, cpu // 4 or 1))
-        return min(3, max(1, cpu // 3 or 1))
+        if memory < 20:
+            return min(3, max(2, cpu // 3 or 1))
+        if memory < 32:
+            return min(4, max(3, cpu // 2 or 1))
+        return min(4, max(3, cpu // 2 or 1))
 
     @property
     def effective_ocr_pdf2image_threads(self) -> int:
@@ -229,13 +241,15 @@ class Settings(BaseSettings):
         return 1
 
     def effective_ocr_dpi(self, total_pages: int) -> int:
+        # Aim for the 120-150 DPI range for speed, while still allowing an
+        # explicit OCR_DPI override if the environment wants a higher ceiling.
         if total_pages <= 4:
-            return max(220, self.OCR_DPI)
+            return min(self.OCR_DPI, 150)
         if total_pages <= 20:
-            return min(self.OCR_DPI, 260)
+            return min(self.OCR_DPI, 144)
         if total_pages <= 60:
-            return min(self.OCR_DPI, 240)
-        return min(self.OCR_DPI, 220)
+            return min(self.OCR_DPI, 132)
+        return min(self.OCR_DPI, 120)
 
     def effective_ocr_chunk_size(self, total_pages: int) -> int:
         if self.OCR_CHUNK_SIZE and self.OCR_CHUNK_SIZE > 0:
@@ -249,14 +263,14 @@ class Settings(BaseSettings):
             return total_pages
 
         if memory < 12:
-            base = 6
-        elif memory < 24:
             base = 8
+        elif memory < 24:
+            base = 12
         else:
-            base = 10
+            base = 16
 
-        target = max(4, total_pages // max(workers * 3, 1))
-        return max(4, min(base, target))
+        target = max(6, total_pages // max(workers * 2, 1))
+        return max(6, min(24, max(base, target)))
 
 @lru_cache
 def get_settings() -> Settings:

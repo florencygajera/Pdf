@@ -31,6 +31,10 @@ async def health_ready():
     Checks Redis connectivity and confirms at least one Celery worker responds.
     """
     checks = {"app": "ok"}
+    require_worker = (
+        settings.READINESS_REQUIRE_WORKER
+        or settings.ENVIRONMENT.lower() == "production"
+    )
 
     # Check Redis
     try:
@@ -56,7 +60,10 @@ async def health_ready():
         checks["celery_worker"] = f"error: {exc}"
         logger.warning(f"Celery readiness check failed: {exc}")
 
-    all_ok = all(v == "ok" for v in checks.values())
+    all_ok = checks.get("app") == "ok" and checks.get("redis") == "ok"
+    if require_worker:
+        all_ok = all_ok and checks.get("celery_worker") == "ok"
+
     status_code = 200 if all_ok else 503
 
     return JSONResponse(

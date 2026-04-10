@@ -18,12 +18,11 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
-import numpy as np
+from typing import Any, Callable, Dict, List, Optional
 
 from app.config.constants import (
     PDF_TYPE_DIGITAL,
@@ -40,18 +39,13 @@ from app.models.response_model import (
 from app.services.digital_extractor import extract_digital_pdf
 from app.services.layout_engine import reconstruct_reading_order
 from app.services.noise_cleaner import clean_pages, clean_text_block
-from app.services.ocr_extractor import extract_ocr_pdf_from_bytes
+from app.services.ocr_extractor import extract_ocr_pdf_local
 from app.services.pdf_detector import DocumentClassification, detect_pdf_type_from_bytes
-from app.services.table_extractor import extract_tables_digital, extract_tables_scanned
+from app.services.table_extractor import extract_tables_digital
 from app.services.validator import validate_extraction_result
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-def _blank_scanned_image() -> np.ndarray:
-    """Small defensive fallback when a rendered page image is unavailable."""
-    return np.zeros((100, 100, 3), dtype=np.uint8)
 
 
 def _chunk_list(lst: List, size: int) -> List[List]:
@@ -230,12 +224,12 @@ def _process_digital_pages(
 
 
 def _process_scanned_chunk(
-    pdf_bytes: bytes,
+    pdf_path: Path,
     chunk: List[int],
     dpi: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    return extract_ocr_pdf_from_bytes(
-        pdf_bytes,
+    return extract_ocr_pdf_local(
+        pdf_path,
         page_numbers=chunk,
         dpi=dpi or settings.effective_ocr_dpi(len(chunk)),
     )
@@ -257,7 +251,6 @@ def _process_scanned_pages(
     if not scanned_page_nums:
         return []
 
-    pdf_bytes = pdf_bytes or pdf_path.read_bytes()
     chunk_size = settings.effective_ocr_chunk_size(len(scanned_page_nums))
     chunks = _chunk_list(scanned_page_nums, chunk_size)
     all_results: List[Dict[str, Any]] = []
@@ -273,11 +266,14 @@ def _process_scanned_pages(
         settings.effective_ocr_page_workers,
     )
 
-    with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+    with ProcessPoolExecutor(
+        max_workers=chunk_workers,
+        mp_context=mp.get_context("spawn"),
+    ) as executor:
         futures = {
             executor.submit(
                 _process_scanned_chunk,
-                pdf_bytes,
+                pdf_path,
                 chunk,
                 settings.effective_ocr_dpi(len(chunk)),
             ): idx
@@ -286,58 +282,9 @@ def _process_scanned_pages(
 
         for completed_idx, future in enumerate(as_completed(futures), start=1):
             ocr_data = future.result()
-
-            # Scanned table detection is lightweight, but still parallelizable by page.
-            table_workers = min(4, len(ocr_data)) if len(ocr_data) > 1 else 1
-            if table_workers > 1:
-                with ThreadPoolExecutor(max_workers=table_workers) as table_pool:
-                    table_futures = {}
-                    for page_info in ocr_data:
-                        raw_ocr = page_info.get("raw_results", [])
-                        rendered_image = page_info.get("rendered_image")
-                        if not raw_ocr:
-                            page_info["tables"] = []
-                            page_info.pop("rendered_image", None)
-                            all_results.append(page_info)
-                            continue
-                        if rendered_image is None:
-                            rendered_image = _blank_scanned_image()
-                        table_futures[
-                            table_pool.submit(
-                                extract_tables_scanned,
-                                rendered_image,
-                                raw_ocr,
-                                page_info["page_number"],
-                            )
-                        ] = page_info
-
-                    for table_future in as_completed(table_futures):
-                        page_info = table_futures[table_future]
-                        page_info["tables"] = table_future.result()
-                        page_info.pop("rendered_image", None)
-                        all_results.append(page_info)
-            else:
-                for page_info in ocr_data:
-                    raw_ocr = page_info.get("raw_results", [])
-                    rendered_image = page_info.get("rendered_image")
-                    if raw_ocr:
-                        if rendered_image is None:
-                            rendered_image = _blank_scanned_image()
-                        try:
-                            page_info["tables"] = extract_tables_scanned(
-                                rendered_image, raw_ocr, page_info["page_number"]
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Scanned table extraction failed page %s: %s",
-                                page_info["page_number"],
-                                exc,
-                            )
-                            page_info["tables"] = []
-                    else:
-                        page_info["tables"] = []
-                    page_info.pop("rendered_image", None)
-                    all_results.append(page_info)
+            for page_info in ocr_data:
+                page_info.pop("rendered_image", None)
+                all_results.append(page_info)
 
             _run_with_progress_lock(
                 progress_callback,
