@@ -27,6 +27,7 @@ from app.utils.sorting import (
 logger = get_logger(__name__)
 
 _STREAM_LITERAL_RE = re.compile(rb"\((?:\\.|[^\\)])*\)")
+_WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
 
 try:
     fitz.TOOLS.mupdf_display_errors(False)
@@ -83,6 +84,135 @@ def _extract_page_blocks(page: fitz.Page) -> List[Dict[str, Any]]:
     return blocks
 
 
+def _extract_words_text(page: fitz.Page) -> str:
+    """Reconstruct text from word boxes when plain text extraction is weak."""
+    try:
+        words = page.get_text("words", sort=True)
+    except Exception:
+        return ""
+
+    if not words:
+        return ""
+
+    items = []
+    heights = []
+    for word in words:
+        if len(word) < 5:
+            continue
+        x0, y0, x1, y1, text = word[:5]
+        token = str(text).strip()
+        if not token:
+            continue
+        items.append((float(x0), float(y0), float(x1), float(y1), token))
+        heights.append(max(1.0, float(y1) - float(y0)))
+
+    if not items:
+        return ""
+
+    items.sort(key=lambda item: (item[1], item[0]))
+    line_tolerance = max(3.0, sorted(heights)[len(heights) // 2] * 0.7)
+
+    lines: List[Dict[str, Any]] = []
+    current_words: List[tuple] = [items[0]]
+    current_top = items[0][1]
+    current_bottom = items[0][3]
+
+    for item in items[1:]:
+        x0, y0, x1, y1, _ = item
+        if y0 <= current_bottom + line_tolerance or abs(y0 - current_top) <= line_tolerance:
+            current_words.append(item)
+            current_bottom = max(current_bottom, y1)
+        else:
+            lines.append({"words": sorted(current_words, key=lambda w: w[0]), "top": current_top, "bottom": current_bottom})
+            current_words = [item]
+            current_top = y0
+            current_bottom = y1
+
+    if current_words:
+        lines.append({"words": sorted(current_words, key=lambda w: w[0]), "top": current_top, "bottom": current_bottom})
+
+    paragraphs: List[str] = []
+    current_para: List[str] = []
+    avg_height = sorted(heights)[len(heights) // 2] if heights else 12.0
+
+    for idx, line in enumerate(lines):
+        line_text = " ".join(word[4] for word in line["words"]).strip()
+        if not line_text:
+            continue
+
+        if current_para:
+            gap = line["top"] - lines[idx - 1]["bottom"]
+            if gap > max(8.0, avg_height * 1.4):
+                paragraphs.append(" ".join(current_para).strip())
+                current_para = []
+        current_para.append(line_text)
+
+    if current_para:
+        paragraphs.append(" ".join(current_para).strip())
+
+    return "\n\n".join(paragraphs).strip()
+
+
+def _score_text_candidate(text: str) -> float:
+    """Heuristic quality score for competing text reconstructions."""
+    if not text or not text.strip():
+        return -1e9
+
+    stripped = text.strip()
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    words = _WORD_RE.findall(stripped)
+    alnum = sum(1 for ch in stripped if ch.isalnum())
+    one_word_lines = sum(1 for line in lines if len(line.split()) == 1)
+    tiny_lines = sum(1 for line in lines if len(line) <= 2)
+    weird_spacing = stripped.count("  ")
+
+    return (
+        alnum
+        + len(words) * 2.0
+        + len(lines) * 3.0
+        - one_word_lines * 2.5
+        - tiny_lines * 4.0
+        - weird_spacing * 0.5
+    )
+
+
+def _looks_reasonable(text: str) -> bool:
+    """Fast heuristic for deciding whether a page already has good text."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    words = _WORD_RE.findall(stripped)
+    alnum = sum(1 for ch in stripped if ch.isalnum())
+
+    # Good enough if it has some real text content. This keeps the fast path
+    # fast for the common case while still letting weak pages fall back.
+    return alnum >= 10 or len(words) >= 3 or len(stripped) >= 20
+
+
+def _extract_pdfplumber_page_text(pdf_path: Path, page_number: int) -> str:
+    """Optional high-fidelity fallback for pages that still look weak."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return ""
+
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            if page_number < 1 or page_number > len(pdf.pages):
+                return ""
+            page = pdf.pages[page_number - 1]
+            text = page.extract_text(
+                layout=True,
+                x_tolerance=2,
+                y_tolerance=2,
+                keep_blank_chars=False,
+            ) or ""
+            return text.strip()
+    except Exception:
+        return ""
+
+
 def _extract_page_text_from_bytes(pdf_bytes: bytes, page_number: int) -> str:
     """Extract text from a single page in a PDF byte stream as a last-resort fallback."""
     if not pdf_bytes:
@@ -137,6 +267,7 @@ def extract_digital_page(
     page: fitz.Page,
     page_number: int,
     pdf_bytes: Optional[bytes] = None,
+    pdf_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Extract and sort text from a single digital PDF page.
@@ -158,6 +289,7 @@ def extract_digital_page(
     blocks = _extract_page_blocks(page)
     sorted_blocks = sort_digital_blocks(blocks) if blocks else []
 
+    block_text = ""
     if sorted_blocks:
         paragraph_texts: List[str] = []
         current_para: List[str] = []
@@ -178,16 +310,32 @@ def extract_digital_page(
         if current_para:
             paragraph_texts.append(" ".join(current_para))
 
-        final_text = "\n\n".join(paragraph_texts).strip()
-        final_text = merge_hyphenated_lines(final_text.splitlines())
-        final_text = "\n".join(final_text).strip()
+        block_text = "\n\n".join(paragraph_texts).strip()
+        block_text = merge_hyphenated_lines(block_text.splitlines())
+        block_text = "\n".join(block_text).strip()
     else:
-        final_text = raw_text
+        block_text = ""
 
-    if not final_text and raw_text:
-        final_text = raw_text
-        if not sorted_blocks:
-            sorted_blocks = [_build_synthetic_block(final_text)]
+    word_text = ""
+    candidates = [text for text in [raw_text, block_text] if text.strip()]
+    if candidates:
+        best = max(candidates, key=_score_text_candidate)
+        if _looks_reasonable(best):
+            final_text = best
+        else:
+            word_text = _extract_words_text(page)
+            candidates = [text for text in [raw_text, block_text, word_text] if text.strip()]
+            final_text = max(candidates, key=_score_text_candidate) if candidates else ""
+    else:
+        word_text = _extract_words_text(page)
+        candidates = [text for text in [raw_text, block_text, word_text] if text.strip()]
+        final_text = max(candidates, key=_score_text_candidate) if candidates else ""
+
+    if not final_text.strip() and pdf_path is not None:
+        pdfplumber_text = _extract_pdfplumber_page_text(pdf_path, page_number)
+        if pdfplumber_text.strip():
+            candidates.append(pdfplumber_text)
+            final_text = max(candidates, key=_score_text_candidate)
 
     if not final_text.strip() and pdf_bytes is not None:
         fallback_text = _extract_page_text_from_bytes(pdf_bytes, page_number)
@@ -260,7 +408,12 @@ def extract_digital_pdf(
 
         page = doc[page_num - 1]
         try:
-            result = extract_digital_page(page, page_num, pdf_bytes=pdf_bytes)
+            result = extract_digital_page(
+                page,
+                page_num,
+                pdf_bytes=pdf_bytes,
+                pdf_path=pdf_path,
+            )
         except Exception as exc:
             logger.error(f"Error extracting page {page_num}: {exc}", exc_info=True)
             result = {
