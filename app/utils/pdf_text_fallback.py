@@ -1,89 +1,88 @@
-"""
-Fallback text extraction for malformed PDFs.
+"""Fallback text extraction helpers for malformed PDFs.
 
-PyMuPDF can fail on intentionally tiny or slightly malformed PDFs used in the
-tests. This helper extracts visible text strings directly from PDF content
-streams as a last-resort fallback.
+These are intentionally conservative: they only run when the normal PyMuPDF
+page-level extraction path fails or returns nothing useful.
 """
 
 from __future__ import annotations
 
-import re
+from io import BytesIO
+from typing import Optional
 
-_STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.DOTALL)
-_LITERAL_RE = re.compile(rb"\((?:\\.|[^\\)])*\)")
+import fitz
 
+from app.utils.logger import get_logger
 
-def _decode_pdf_literal(data: bytes) -> str:
-    text = data.decode("latin-1", errors="ignore")
-    out = []
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch != "\\":
-            out.append(ch)
-            i += 1
-            continue
-
-        i += 1
-        if i >= len(text):
-            break
-
-        nxt = text[i]
-        escapes = {
-            "n": "\n",
-            "r": "\r",
-            "t": "\t",
-            "b": "\b",
-            "f": "\f",
-            "\\": "\\",
-            "(": "(",
-            ")": ")",
-        }
-        if nxt in escapes:
-            out.append(escapes[nxt])
-            i += 1
-            continue
-
-        if nxt.isdigit():
-            oct_digits = nxt
-            j = i + 1
-            while j < len(text) and len(oct_digits) < 3 and text[j].isdigit():
-                oct_digits += text[j]
-                j += 1
-            try:
-                out.append(chr(int(oct_digits, 8)))
-                i = j
-                continue
-            except ValueError:
-                pass
-
-        out.append(nxt)
-        i += 1
-
-    return "".join(out).strip()
+logger = get_logger(__name__)
 
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, page_number: Optional[int] = None) -> str:
+    """Best-effort text extraction from a PDF byte stream."""
     if not pdf_bytes:
         return ""
 
-    chunks = []
-    for stream in _STREAM_RE.findall(pdf_bytes):
-        literals = [
-            _decode_pdf_literal(match.group(0)[1:-1])
-            for match in _LITERAL_RE.finditer(stream)
-        ]
-        literals = [chunk for chunk in literals if chunk.strip()]
-        if literals:
-            chunks.extend(literals)
+    try:
+        from pypdf import PdfReader
 
-    if chunks:
-        return "\n".join(chunks).strip()
+        reader = PdfReader(BytesIO(pdf_bytes))
+        if page_number is not None:
+            if page_number < 1 or page_number > len(reader.pages):
+                return ""
+            try:
+                text = reader.pages[page_number - 1].extract_text() or ""
+                if text.strip():
+                    return text.strip()
+            except Exception:
+                pass
+        else:
+            parts = []
+            for page in reader.pages:
+                try:
+                    text = page.extract_text() or ""
+                except Exception:
+                    text = ""
+                if text.strip():
+                    parts.append(text.strip())
+            if parts:
+                return "\n\n---\n\n".join(parts).strip()
+    except Exception as exc:
+        logger.debug("pypdf fallback extraction failed: %s", exc)
 
-    literals = [
-        _decode_pdf_literal(match.group(0)[1:-1])
-        for match in _LITERAL_RE.finditer(pdf_bytes)
-        if _decode_pdf_literal(match.group(0)[1:-1]).strip()
-    ]
-    return "\n".join(literals).strip()
+    doc = None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if page_number is not None:
+            if page_number < 1 or page_number > len(doc):
+                return ""
+            page = doc[page_number - 1]
+            try:
+                text = page.get_text("text").strip()
+                if text:
+                    return text
+            except Exception:
+                pass
+            try:
+                blocks = page.get_text("blocks", sort=True) or []
+                texts = [str(block[4]).strip() for block in blocks if len(block) >= 5 and str(block[4]).strip()]
+                return "\n\n".join(texts).strip()
+            except Exception:
+                return ""
+
+        parts = []
+        for page in doc:
+            try:
+                text = page.get_text("text").strip()
+                if text:
+                    parts.append(text)
+            except Exception:
+                continue
+        return "\n\n---\n\n".join(parts).strip()
+    except Exception as exc:
+        logger.debug("Fallback text extraction failed: %s", exc)
+        return ""
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass

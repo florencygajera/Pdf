@@ -16,7 +16,7 @@ STATE_FAILED = "failed"
 # ── Layout / Sorting ───────────────────────────────────────────────────────
 # Y-axis tolerance: two bounding boxes within this many pts are on the same line
 LINE_Y_TOLERANCE = 5  # points  (digital)
-LINE_Y_TOLERANCE_OCR = 8  # pixels  (ocr — after 300 DPI conversion)
+LINE_Y_TOLERANCE_OCR = 4  # pixels  (ocr — tuned for ~150 DPI conversion)
 
 # Minimum character count for a text block to be kept (filters noise)
 MIN_BLOCK_CHAR_COUNT = 3

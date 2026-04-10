@@ -151,13 +151,39 @@ def classify_page(
 
     text_coverage = _compute_text_coverage(page)
 
+    if char_count < 20:
+        try:
+            blocks = page.get_text("blocks", sort=True)
+            block_text = " ".join(
+                str(block[4]).strip()
+                for block in blocks
+                if len(block) >= 5 and str(block[4]).strip()
+            ).strip()
+            if block_text:
+                char_count = max(char_count, len(block_text))
+        except Exception:
+            pass
+
+    if char_count < 20:
+        try:
+            words = page.get_text("words")
+            word_text = " ".join(
+                str(word[4]).strip()
+                for word in words
+                if len(word) >= 5 and str(word[4]).strip()
+            ).strip()
+            if word_text:
+                char_count = max(char_count, len(word_text))
+        except Exception:
+            pass
+
     if char_count < 5 and fallback_text.strip():
         char_count = max(char_count, len(fallback_text.strip()))
 
     # Require meaningful text density. Tiny overlays, page numbers, and
     # watermarks should not flip a scanned page to "digital".
     is_digital = (
-        (char_count >= 50 and text_coverage > 0.01)
+        (char_count >= 20 and text_coverage > 0.005)
         or (text_coverage > settings.DIGITAL_TEXT_THRESHOLD)
     )
 
@@ -218,12 +244,15 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
             pc = classify_page(page, page_number=i + 1, fallback_text=fallback_text)
             page_classifications.append(pc)
 
-        if total_pages == 1 and fallback_text.strip() and page_classifications:
+        if total_pages == 1 and page_classifications:
             pc = page_classifications[0]
+            rescue_text = fallback_text.strip()
             page_classifications[0] = PageClassification(
                 page_number=pc.page_number,
-                pdf_type=PDF_TYPE_DIGITAL,
-                char_count=max(pc.char_count, len(fallback_text.strip())),
+                pdf_type=PDF_TYPE_DIGITAL
+                if rescue_text or not pc.has_images
+                else pc.pdf_type,
+                char_count=max(pc.char_count, len(rescue_text)),
                 has_images=pc.has_images,
                 text_coverage=pc.text_coverage,
             )
@@ -290,12 +319,15 @@ def detect_pdf_type_from_bytes(pdf_bytes: bytes, file_name: str = "pdf") -> Docu
                 classify_page(page, page_number=i + 1, fallback_text=fallback_text)
             )
 
-        if total_pages == 1 and fallback_text.strip() and page_classifications:
+        if total_pages == 1 and page_classifications:
             pc = page_classifications[0]
+            rescue_text = fallback_text.strip()
             page_classifications[0] = PageClassification(
                 page_number=pc.page_number,
-                pdf_type=PDF_TYPE_DIGITAL,
-                char_count=max(pc.char_count, len(fallback_text.strip())),
+                pdf_type=PDF_TYPE_DIGITAL
+                if rescue_text or not pc.has_images
+                else pc.pdf_type,
+                char_count=max(pc.char_count, len(rescue_text)),
                 has_images=pc.has_images,
                 text_coverage=pc.text_coverage,
             )

@@ -11,9 +11,7 @@ Optimized for Windows + Celery thread pools:
 from __future__ import annotations
 
 import gc
-import os
 import multiprocessing as mp
-from functools import lru_cache
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from io import BytesIO
@@ -107,11 +105,14 @@ class _PaddleOCRPool:
                 else:
                     try:
                         instance = self._available.get(timeout=60)
-                    except Empty as exc:
-                        raise RuntimeError(
-                            "OCR pool deadlocked: no instance returned within 60s. "
-                            "A worker may have crashed mid-inference."
-                        ) from exc
+                    except Empty:
+                        logger.warning(
+                            "OCR pool stalled for 60s; rebuilding a fresh instance."
+                        )
+                        self._available = Queue()
+                        self._created = 0
+                        instance = self._create_instance()
+                        self._created += 1
 
         try:
             yield instance
@@ -124,6 +125,8 @@ _ocr_pool_lock = Lock()
 _paddle_runtime_configured = False
 _paddle_runtime_lock = Lock()
 _ocr_runtime_warning_emitted = False
+_ocr_executor = None
+_ocr_executor_lock = Lock()
 
 
 def _normalize_page_numbers(page_numbers: Optional[List[int]], total_pages: int) -> List[int]:
@@ -138,13 +141,6 @@ def _chunk_list(lst: List, size: int) -> List[List]:
     return [lst[i : i + size] for i in range(0, len(lst), size)]
 
 
-@lru_cache(maxsize=8)
-def _load_pdf_bytes_cached(path_str: str, mtime_ns: int, size: int) -> bytes:
-    """Load PDF bytes once per worker process for path-based OCR chunks."""
-    with open(path_str, "rb") as f:
-        return f.read()
-
-
 def _get_ocr_pool() -> _PaddleOCRPool:
     global _ocr_pool
     if _ocr_pool is not None:
@@ -156,6 +152,36 @@ def _get_ocr_pool() -> _PaddleOCRPool:
 
         _ocr_pool = _PaddleOCRPool(max_instances=settings.effective_ocr_page_workers)
         return _ocr_pool
+
+
+def _ocr_worker_initializer() -> None:
+    """Initialize Paddle runtime and preload the shared OCR pool inside each worker."""
+    _configure_paddle_runtime()
+    pool = _get_ocr_pool()
+    try:
+        with pool.borrow():
+            pass
+    except Exception as exc:
+        logger.debug("OCR worker warm-up skipped: %s", exc)
+
+
+def _get_ocr_executor():
+    """Return a long-lived OCR process pool reused across requests."""
+    global _ocr_executor
+    if _ocr_executor is not None:
+        return _ocr_executor
+
+    with _ocr_executor_lock:
+        if _ocr_executor is not None:
+            return _ocr_executor
+
+        ctx = mp.get_context("spawn")
+        _ocr_executor = ProcessPoolExecutor(
+            max_workers=max(1, settings.effective_ocr_chunk_workers),
+            mp_context=ctx,
+            initializer=_ocr_worker_initializer,
+        )
+        return _ocr_executor
 
 
 def _configure_paddle_runtime() -> None:
@@ -397,44 +423,13 @@ def _ocr_result_looks_good(page_result: Dict[str, Any]) -> bool:
     return len(text) >= 20 or len(text.split()) >= 3
 
 
-def _ocr_chunk_worker(payload) -> List[Dict[str, Any]]:
-    """
-    OCR a chunk inside a separate process.
-
-    Each process renders its own pages and processes them sequentially. The
-    model pool is still reused within the process, but we avoid cross-thread
-    sharing entirely.
-    """
-    pdf_bytes, page_numbers, dpi = payload
-    images = _render_pages_for_ocr(
-        pdf_bytes=pdf_bytes,
-        page_numbers=page_numbers,
-        dpi=dpi,
-    )
-    start_page = page_numbers[0] if page_numbers else 1
-    return _process_images_in_threads(
-        images,
-        start_page=start_page,
-        page_numbers=page_numbers,
-        parallel=False,
-    )
-
-
 def _ocr_chunk_worker_from_path(payload) -> List[Dict[str, Any]]:
     """OCR a chunk in a separate process using the PDF path as the source."""
     path_str, mtime_ns, size, page_numbers, dpi = payload
-    pdf_bytes = _load_pdf_bytes_cached(path_str, mtime_ns, size)
-    images = _render_pages_for_ocr(
-        pdf_bytes=pdf_bytes,
+    return extract_ocr_pdf_local(
+        Path(path_str),
         page_numbers=page_numbers,
         dpi=dpi,
-    )
-    start_page = page_numbers[0] if page_numbers else 1
-    return _process_images_in_threads(
-        images,
-        start_page=start_page,
-        page_numbers=page_numbers,
-        parallel=False,
     )
 
 
@@ -627,33 +622,29 @@ def extract_ocr_pdf(
 
     if use_process_pool:
         logger.info(
-            "OCR using process pool | pages=%s | chunks=%s | workers=%s | dpi=%s",
+            "OCR using shared process pool | pages=%s | chunks=%s | workers=%s | dpi=%s",
             len(normalized_pages),
             len(chunks),
             settings.effective_ocr_chunk_workers,
             dpi,
         )
         try:
-            ctx = mp.get_context("spawn")
             stat = pdf_path.stat()
             path_key = str(pdf_path)
-            with ProcessPoolExecutor(
-                max_workers=min(settings.effective_ocr_chunk_workers, len(chunks)),
-                mp_context=ctx,
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        _ocr_chunk_worker_from_path,
-                        (path_key, stat.st_mtime_ns, stat.st_size, chunk, dpi),
-                    )
-                    for chunk in chunks
-                ]
-                results: List[Dict[str, Any]] = []
-                for future in as_completed(futures):
-                    results.extend(future.result())
+            executor = _get_ocr_executor()
+            futures = [
+                executor.submit(
+                    _ocr_chunk_worker_from_path,
+                    (path_key, stat.st_mtime_ns, stat.st_size, chunk, dpi),
+                )
+                for chunk in chunks
+            ]
+            results = []
+            for future in as_completed(futures):
+                results.extend(future.result())
         except Exception as exc:
             logger.warning(
-                "Process pool OCR failed, falling back to sequential/threaded mode: %s",
+                "Shared process pool OCR failed, falling back to sequential mode: %s",
                 exc,
             )
             all_images = _render_pages_for_ocr(
@@ -665,7 +656,7 @@ def extract_ocr_pdf(
                 all_images,
                 start_page=normalized_pages[0] if normalized_pages else 1,
                 page_numbers=normalized_pages,
-                parallel=True,
+                parallel=False,
             )
     else:
         all_images = _render_pages_for_ocr(
@@ -677,9 +668,10 @@ def extract_ocr_pdf(
             all_images,
             start_page=normalized_pages[0] if normalized_pages else 1,
             page_numbers=normalized_pages,
-            parallel=True,
+            parallel=False,
         )
 
+    results.sort(key=lambda item: item.get("page_number", 0))
     logger.info(
         "OCR extraction complete | pages=%s | file=%s",
         len(results),
@@ -706,63 +698,17 @@ def extract_ocr_pdf_from_bytes(
     if not normalized_pages and total_pages:
         normalized_pages = list(range(1, total_pages + 1))
 
-    chunk_size = settings.effective_ocr_chunk_size(len(normalized_pages) or 1)
-    chunks = _chunk_list(normalized_pages, chunk_size) if normalized_pages else []
-    use_process_pool = (
-        settings.OCR_PARALLEL_INFERENCE
-        and len(chunks) > 1
-        and settings.effective_ocr_chunk_workers > 1
+    all_images = _render_pages_for_ocr(
+        pdf_bytes=pdf_bytes,
+        page_numbers=normalized_pages,
+        dpi=dpi,
     )
-
-    if use_process_pool:
-        logger.info(
-            "OCR using process pool | pages=%s | chunks=%s | workers=%s | dpi=%s",
-            len(normalized_pages),
-            len(chunks),
-            settings.effective_ocr_chunk_workers,
-            dpi,
-        )
-        try:
-            ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(
-                max_workers=min(settings.effective_ocr_chunk_workers, len(chunks)),
-                mp_context=ctx,
-            ) as executor:
-                futures = [
-                    executor.submit(_ocr_chunk_worker, (pdf_bytes, chunk, dpi))
-                    for chunk in chunks
-                ]
-                results: List[Dict[str, Any]] = []
-                for future in as_completed(futures):
-                    results.extend(future.result())
-        except Exception as exc:
-            logger.warning(
-                "Process pool OCR failed, falling back to sequential/threaded mode: %s",
-                exc,
-            )
-            all_images = _render_pages_for_ocr(
-                pdf_bytes=pdf_bytes,
-                page_numbers=normalized_pages,
-                dpi=dpi,
-            )
-            results = _process_images_in_threads(
-                all_images,
-                start_page=normalized_pages[0] if normalized_pages else 1,
-                page_numbers=normalized_pages,
-                parallel=False,
-            )
-    else:
-        all_images = _render_pages_for_ocr(
-            pdf_bytes=pdf_bytes,
-            page_numbers=normalized_pages,
-            dpi=dpi,
-        )
-        results = _process_images_in_threads(
-            all_images,
-            start_page=normalized_pages[0] if normalized_pages else 1,
-            page_numbers=normalized_pages,
-            parallel=False,
-        )
+    results = _process_images_in_threads(
+        all_images,
+        start_page=normalized_pages[0] if normalized_pages else 1,
+        page_numbers=normalized_pages,
+        parallel=False,
+    )
 
     logger.info("OCR extraction complete | pages=%s | bytes input", len(results))
     return results

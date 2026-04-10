@@ -10,7 +10,7 @@ import json
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -22,6 +22,7 @@ from app.config.constants import (
     STATE_PROCESSING,
 )
 from app.config.settings import settings
+from app.api.security import require_api_key
 from app.models.response_model import (
     ErrorResponse,
     ExtractionResult,
@@ -31,7 +32,7 @@ from app.models.response_model import (
 from app.utils.file_handler import cleanup_job_files, get_output_path, get_upload_path
 from app.utils.logger import get_logger
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 logger = get_logger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 RESULT_NOT_FOUND = "not_found"

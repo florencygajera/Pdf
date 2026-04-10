@@ -180,7 +180,7 @@ All settings are via environment variables (see `.env.example`):
 | Variable | Default | Description |
 |---|---|---|
 | `MAX_FILE_SIZE_MB` | `100` | Max upload size |
-| `OCR_DPI` | `300` | PDF→image resolution |
+| `OCR_DPI` | `150` | PDF→image resolution |
 | `OCR_LANGUAGES` | `["en"]` | PaddleOCR languages |
 | `OCR_USE_GPU` | `false` | Enable GPU OCR |
 | `OCR_CONFIDENCE_THRESHOLD` | `0.6` | Min OCR confidence |

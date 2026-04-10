@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = Field(default="development", description="deployment env")
     DEBUG: bool = Field(default=False)
     SECRET_KEY: str = Field(default="change-me-in-production")
+    API_KEY: Optional[str] = Field(default=None)
     TESTING: bool = Field(default=False)
 
     # ── Server ─────────────────────────────────────────────────────────────
@@ -80,7 +81,7 @@ class Settings(BaseSettings):
     ALLOWED_EXTENSIONS: List[str] = Field(default=["pdf"])
 
     # ── OCR ───────────────────────────────────────────────────────────────
-    OCR_DPI: int = Field(default=300, description="DPI for PDF→image conversion")
+    OCR_DPI: int = Field(default=150, description="DPI for PDF→image conversion")
     OCR_LANGUAGES: List[str] = Field(
         default=["en"],
         description="PaddleOCR language codes e.g. ['en','hi','ch']",

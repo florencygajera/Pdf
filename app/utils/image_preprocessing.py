@@ -270,7 +270,8 @@ def preprocess_page_image(
         binary = morphological_cleanup(binary)
     else:
         # Full path for dirty / blurry / noisy scans.
-        gray = remove_noise(gray)
+        if quality["std"] < 20.0 or quality["dark_ratio"] > 0.35:
+            gray = remove_noise(gray)
         binary = adaptive_threshold(gray)
         if apply_stamp_removal:
             binary = remove_stamp_artifacts(binary)

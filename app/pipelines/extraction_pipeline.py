@@ -18,8 +18,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
@@ -37,34 +36,14 @@ from app.models.response_model import (
     TableData,
 )
 from app.services.digital_extractor import extract_digital_pdf
-from app.services.layout_engine import reconstruct_reading_order
 from app.services.noise_cleaner import clean_pages, clean_text_block
-from app.services.ocr_extractor import extract_ocr_pdf_local
+from app.services.ocr_extractor import extract_ocr_pdf
 from app.services.pdf_detector import DocumentClassification, detect_pdf_type_from_bytes
 from app.services.table_extractor import extract_tables_digital
 from app.services.validator import validate_extraction_result
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-def _chunk_list(lst: List, size: int) -> List[List]:
-    """Split a list into chunks of given size."""
-    if size <= 0:
-        return [lst]
-    return [lst[i : i + size] for i in range(0, len(lst), size)]
-
-
-def _choose_chunk_size(total_pages: int, base: int = 10) -> int:
-    """
-    Pick a larger chunk size for long documents to reduce executor overhead.
-    More pages -> fewer, larger chunks.
-    """
-    if total_pages <= 12:
-        return max(4, base)
-    if total_pages <= 40:
-        return max(8, base)
-    return min(25, max(base, total_pages // 4 or base))
 
 
 def _build_page_result(
@@ -107,31 +86,6 @@ def _run_with_progress_lock(
         progress_callback(step, total, stage)
 
 
-def _process_digital_chunk(
-    pdf_path: Path,
-    pdf_bytes: bytes,
-    chunk: List[int],
-) -> List[Dict[str, Any]]:
-    """
-    Process a chunk of digital pages.
-
-    The chunk worker stays self-contained so it can safely run on a Windows
-    thread pool. Using in-memory bytes avoids re-reading the PDF from disk.
-    """
-    page_data = extract_digital_pdf(pdf_path, page_numbers=chunk, pdf_bytes=pdf_bytes)
-    for page_info in page_data:
-        if page_info.get("blocks"):
-            page_width = float(page_info.get("page_width", 612.0))
-            ordered_blocks = reconstruct_reading_order(
-                page_info["blocks"],
-                page_width=page_width,
-            )
-            page_info["text"] = "\n\n".join(
-                b["text"] for b in ordered_blocks if b.get("text")
-            )
-    return page_data
-
-
 def _extract_digital_tables_for_page(
     pdf_path: Path,
     pdf_bytes: bytes,
@@ -150,7 +104,7 @@ def _process_digital_pages(
     progress_callback: Optional[Callable] = None,
     pdf_bytes: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
-    """Process all digital pages using concurrent chunks and page-level table extraction."""
+    """Process all digital pages in a single extraction pass and then extract tables."""
     digital_page_nums = [
         p.page_number
         for p in doc_classification.pages
@@ -161,78 +115,46 @@ def _process_digital_pages(
         return []
 
     pdf_bytes = pdf_bytes or pdf_path.read_bytes()
-    chunk_size = _choose_chunk_size(len(digital_page_nums))
-    chunks = _chunk_list(digital_page_nums, chunk_size)
-    all_results: List[Dict[str, Any]] = []
     progress_lock = Lock()
-    chunk_workers = min(4, len(chunks)) if len(chunks) > 1 else 1
 
     logger.info(
-        "Processing %s digital pages in %s chunks | chunk_size=%s | workers=%s",
+        "Processing %s digital pages in a single pass",
         len(digital_page_nums),
-        len(chunks),
-        chunk_size,
-        chunk_workers,
     )
 
-    with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
-        futures = {
-            executor.submit(_process_digital_chunk, pdf_path, pdf_bytes, chunk): idx
-            for idx, chunk in enumerate(chunks)
-        }
+    page_data = extract_digital_pdf(pdf_path, page_numbers=digital_page_nums, pdf_bytes=pdf_bytes)
 
-        for completed_idx, future in enumerate(as_completed(futures), start=1):
-            chunk_results = future.result()
-
-            # Parallelize table extraction per page. This is usually cheaper than OCR
-            # and benefits nicely from thread pooling.
-            table_workers = min(4, len(chunk_results)) if len(chunk_results) > 1 else 1
-            if table_workers > 1:
-                with ThreadPoolExecutor(max_workers=table_workers) as table_pool:
-                    table_futures = {
-                        table_pool.submit(
-                            _extract_digital_tables_for_page,
-                            pdf_path,
-                            pdf_bytes,
-                            page_info["page_number"],
-                        ): page_info
-                        for page_info in chunk_results
-                    }
-                    for table_future in as_completed(table_futures):
-                        page_info = table_futures[table_future]
-                        page_info["tables"] = table_future.result()
-                        page_info["confidence"] = 0.95
-                        all_results.append(page_info)
-            else:
-                for page_info in chunk_results:
-                    page_info["tables"] = _extract_digital_tables_for_page(
-                        pdf_path, pdf_bytes, page_info["page_number"]
-                    )
+    table_targets = [page_info for page_info in page_data if page_info.get("text", "").strip()]
+    if table_targets:
+        table_workers = min(4, len(table_targets)) if len(table_targets) > 1 else 1
+        if table_workers > 1:
+            with ThreadPoolExecutor(max_workers=table_workers) as table_pool:
+                table_futures = {
+                    table_pool.submit(
+                        _extract_digital_tables_for_page,
+                        pdf_path,
+                        pdf_bytes,
+                        page_info["page_number"],
+                    ): page_info
+                    for page_info in table_targets
+                }
+                for table_future in as_completed(table_futures):
+                    page_info = table_futures[table_future]
+                    page_info["tables"] = table_future.result()
                     page_info["confidence"] = 0.95
-                    all_results.append(page_info)
+        else:
+            for page_info in table_targets:
+                page_info["tables"] = _extract_digital_tables_for_page(
+                    pdf_path, pdf_bytes, page_info["page_number"]
+                )
+                page_info["confidence"] = 0.95
 
-            _run_with_progress_lock(
-                progress_callback,
-                progress_lock,
-                completed_idx,
-                len(chunks),
-                "digital",
-            )
+    for page_info in page_data:
+        page_info.setdefault("tables", [])
+        page_info["confidence"] = page_info.get("confidence", 0.95)
 
-    all_results.sort(key=lambda p: p.get("page_number", 0))
-    return all_results
-
-
-def _process_scanned_chunk(
-    pdf_path: Path,
-    chunk: List[int],
-    dpi: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    return extract_ocr_pdf_local(
-        pdf_path,
-        page_numbers=chunk,
-        dpi=dpi or settings.effective_ocr_dpi(len(chunk)),
-    )
+    _run_with_progress_lock(progress_callback, progress_lock, 1, 1, "digital")
+    return sorted(page_data, key=lambda p: p.get("page_number", 0))
 
 
 def _process_scanned_pages(
@@ -241,7 +163,7 @@ def _process_scanned_pages(
     progress_callback: Optional[Callable] = None,
     pdf_bytes: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
-    """Process scanned pages using concurrent OCR chunks."""
+    """Process scanned pages through a shared OCR executor."""
     scanned_page_nums = [
         p.page_number
         for p in doc_classification.pages
@@ -251,51 +173,20 @@ def _process_scanned_pages(
     if not scanned_page_nums:
         return []
 
-    chunk_size = settings.effective_ocr_chunk_size(len(scanned_page_nums))
-    chunks = _chunk_list(scanned_page_nums, chunk_size)
-    all_results: List[Dict[str, Any]] = []
     progress_lock = Lock()
-    chunk_workers = min(settings.effective_ocr_chunk_workers, len(chunks)) if len(chunks) > 1 else 1
-
     logger.info(
-        "Processing %s scanned pages via OCR in %s chunks | chunk_size=%s | workers=%s | page_workers=%s",
+        "Processing %s scanned pages via shared OCR executor",
         len(scanned_page_nums),
-        len(chunks),
-        chunk_size,
-        chunk_workers,
-        settings.effective_ocr_page_workers,
     )
 
-    with ProcessPoolExecutor(
-        max_workers=chunk_workers,
-        mp_context=mp.get_context("spawn"),
-    ) as executor:
-        futures = {
-            executor.submit(
-                _process_scanned_chunk,
-                pdf_path,
-                chunk,
-                settings.effective_ocr_dpi(len(chunk)),
-            ): idx
-            for idx, chunk in enumerate(chunks)
-        }
+    results = extract_ocr_pdf(
+        pdf_path,
+        page_numbers=scanned_page_nums,
+        dpi=settings.effective_ocr_dpi(len(scanned_page_nums)),
+    )
 
-        for completed_idx, future in enumerate(as_completed(futures), start=1):
-            ocr_data = future.result()
-            for page_info in ocr_data:
-                page_info.pop("rendered_image", None)
-                all_results.append(page_info)
-
-            _run_with_progress_lock(
-                progress_callback,
-                progress_lock,
-                completed_idx,
-                len(chunks),
-                "ocr",
-            )
-
-    all_results.sort(key=lambda p: p.get("page_number", 0))
-    return all_results
+    _run_with_progress_lock(progress_callback, progress_lock, 1, 1, "ocr")
+    return sorted(results, key=lambda p: p.get("page_number", 0))
 
 
 def run_extraction_pipeline(
@@ -324,8 +215,6 @@ def run_extraction_pipeline(
         raise ValueError(f"PDF validation failed: {exc}") from exc
 
     logger.info("[%s] Step 2: Extracting content", job_id)
-    # Keep OCR isolated: PaddleOCR is not safe to run concurrently with another
-    # OCR-capable branch in the same process.
     digital_results = _process_digital_pages(
         pdf_path,
         doc_classification,

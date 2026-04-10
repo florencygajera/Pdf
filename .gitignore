@@ -17,6 +17,8 @@ ENV/
 htmlcov/
 .tox/
 .pytest_cache/
+tmp_*.pdf
+tmp_minimal.pdf
 
 # IDE / Editor Settings
 .vscode/

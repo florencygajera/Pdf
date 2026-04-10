@@ -8,16 +8,17 @@ POST /api/v1/upload
 Rate-limited to prevent abuse.
 """
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.config.settings import settings
+from app.api.security import require_api_key
 from app.models.response_model import ErrorResponse, UploadResponse
 from app.utils.file_handler import save_upload_streaming
 from app.utils.logger import get_logger
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 logger = get_logger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
