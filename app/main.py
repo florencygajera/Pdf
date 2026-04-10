@@ -5,11 +5,13 @@ Production-grade hybrid PDF extraction for government documents.
 
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -19,6 +21,7 @@ from app.config.settings import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 
 # ─── Rate Limiter ────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
@@ -48,6 +51,9 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    if FRONTEND_DIR.exists():
+        app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR)), name="assets")
+
     # ── Rate Limiting ──────────────────────────────────────────────────────
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -76,6 +82,16 @@ def create_app() -> FastAPI:
         elapsed = round(time.time() - start, 4)
         response.headers["X-Process-Time"] = str(elapsed)
         return response
+
+    @app.get("/", include_in_schema=False)
+    async def homepage():
+        index_path = FRONTEND_DIR / "index.html"
+        if index_path.exists():
+            return FileResponse(str(index_path))
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Frontend not available."},
+        )
 
     # ── Global Exception Handler ───────────────────────────────────────────
     @app.exception_handler(Exception)

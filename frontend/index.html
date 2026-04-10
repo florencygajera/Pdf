@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF Extractor</title>
+    <meta
+      name="description"
+      content="Simple PDF upload and extraction interface."
+    />
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <script defer src="/assets/app.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">PDF Extraction</p>
+        <h1>Clean upload. Clear results.</h1>
+        <p class="lede">
+          Upload a PDF, follow the job status, and inspect extracted text in one
+          minimal workspace.
+        </p>
+      </section>
+
+      <section class="panel">
+        <form id="upload-form" class="card">
+          <label class="upload" for="file-input">
+            <input id="file-input" name="file" type="file" accept="application/pdf,.pdf" />
+            <span class="upload-copy">
+              <strong>Choose a PDF</strong>
+              <span>Drag and drop is supported in the browser native picker.</span>
+            </span>
+          </label>
+          <div class="actions">
+            <button type="submit">Upload and Extract</button>
+            <button type="button" id="clear-btn" class="secondary">Clear</button>
+          </div>
+          <p id="file-meta" class="meta">No file selected.</p>
+        </form>
+
+        <div class="card">
+          <div class="section-head">
+            <h2>Status</h2>
+            <span id="job-badge" class="badge muted">Idle</span>
+          </div>
+          <p id="status-text" class="status-text">
+            Upload a file to start extraction.
+          </p>
+          <div class="progress">
+            <div id="progress-bar" class="progress-bar"></div>
+          </div>
+          <p id="job-id" class="meta"></p>
+        </div>
+
+        <div class="card result-card">
+          <div class="section-head">
+            <h2>Result</h2>
+            <button id="copy-btn" type="button" class="secondary">Copy text</button>
+          </div>
+          <pre id="result-text" class="result">Waiting for extraction result...</pre>
+        </div>
+
+        <div class="grid">
+          <div class="card">
+            <div class="section-head">
+              <h2>Metadata</h2>
+            </div>
+            <dl id="metadata" class="details"></dl>
+          </div>
+
+          <div class="card">
+            <div class="section-head">
+              <h2>Tables</h2>
+            </div>
+            <div id="tables" class="tables">
+              <p class="meta">No tables yet.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
