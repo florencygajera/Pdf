@@ -9,9 +9,11 @@ Run worker with:
 
 import json
 import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from celery import Celery
+from celery.exceptions import SoftTimeLimitExceeded
 from celery.utils.log import get_task_logger
 
 from app.config.constants import STATE_DONE, STATE_FAILED, STATE_PROCESSING
@@ -35,10 +37,11 @@ celery_app.conf.update(
     accept_content=["json"],
     task_track_started=True,
     task_time_limit=settings.CELERY_TASK_TIMEOUT,
-    task_soft_time_limit=settings.CELERY_TASK_TIMEOUT - 30,
+    # Keep a sensible grace window, but never let the soft limit go non-positive.
+    task_soft_time_limit=max(30, settings.CELERY_TASK_TIMEOUT - 30),
     worker_prefetch_multiplier=1,  # One task at a time per worker
     task_acks_late=True,  # Acknowledge only after completion (safer)
-    result_expires=3600,  # Results expire after 1 hour
+    result_expires=settings.RESULT_EXPIRES_SECONDS,
 )
 
 task_logger = get_task_logger(__name__)
@@ -98,6 +101,11 @@ def extract_pdf_task(self, job_id: str) -> dict:
             "output_path": str(output_path),
         }
 
+    except SoftTimeLimitExceeded as exc:
+        task_logger.error(f"Soft time limit exceeded for job {job_id}: {exc}")
+        _write_failed_result(job_id, output_path, "Task timed out.")
+        raise
+
     except ValueError as exc:
         # Non-retryable: bad PDF, invalid content
         task_logger.error(f"Validation error for job {job_id}: {exc}")
@@ -122,10 +130,14 @@ def extract_pdf_task(self, job_id: str) -> dict:
 def _write_failed_result(job_id: str, output_path: Path, error_msg: str) -> None:
     """Write a minimal failed-state JSON so the API can return an informative error."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=settings.RESULT_EXPIRES_SECONDS
+    )
     data = {
         "job_id": job_id,
         "status": STATE_FAILED,
         "error": error_msg,
+        "expires_at": expires_at.isoformat(),
         "text": "",
         "tables": [],
         "pages": [],
@@ -134,7 +146,10 @@ def _write_failed_result(job_id: str, output_path: Path, error_msg: str) -> None
             "pdf_type": "unknown",
             "confidence_score": 0.0,
             "processing_time_seconds": 0,
+            "warnings": [],
+            "warnings_truncated": False,
+            "total_warning_count": 0,
         },
     }
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)

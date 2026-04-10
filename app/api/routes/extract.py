@@ -7,6 +7,7 @@ DELETE /api/v1/extract/{job_id}       — cancel and clean up job files
 """
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
@@ -70,7 +71,29 @@ def _load_output(job_id: str) -> dict:
     if not output_path.exists():
         return {}
     with open(output_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+
+    expires_at = data.get("expires_at")
+    if expires_at:
+        try:
+            expiry_dt = datetime.fromisoformat(expires_at)
+            if expiry_dt.tzinfo is None:
+                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            if expiry_dt <= datetime.now(timezone.utc):
+                output_path.unlink(missing_ok=True)
+                return {}
+        except Exception:
+            pass
+    else:
+        try:
+            age_seconds = datetime.now(timezone.utc).timestamp() - output_path.stat().st_mtime
+            if age_seconds > settings.RESULT_EXPIRES_SECONDS:
+                output_path.unlink(missing_ok=True)
+                return {}
+        except Exception:
+            pass
+
+    return data
 
 
 def _resolve_job_status(job_id: str):
@@ -88,6 +111,9 @@ def _resolve_job_status(job_id: str):
     # Fast path: output file exists → job is done or failed
     if output_path.exists():
         data = _load_output(job_id)
+        if not data:
+            cleanup_job_files(job_id)
+            return None, 0.0, "", None
         status = data.get("status", STATE_DONE)
         return status, 100.0, "", data
 

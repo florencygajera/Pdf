@@ -27,7 +27,7 @@ class TableData(BaseModel):
     headers: List[str]
     rows: List[List[Any]]
     extraction_method: str = Field(
-        ..., description="'camelot-lattice', 'camelot-flavor', 'pdfplumber', 'ocr-grid'"
+        ..., description="'pdfplumber', 'ocr-grid', 'unknown'"
     )
 
 
@@ -49,6 +49,8 @@ class ExtractionMetadata(BaseModel):
     languages_detected: List[str] = []
     ocr_engine: Optional[str] = None
     warnings: List[str] = []
+    warnings_truncated: bool = False
+    total_warning_count: int = 0
 
 
 class ExtractionResult(BaseModel):

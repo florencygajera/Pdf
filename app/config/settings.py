@@ -121,6 +121,9 @@ class Settings(BaseSettings):
     CELERY_TASK_TIMEOUT: int = Field(
         default=600, description="Seconds before task killed"
     )
+    RESULT_EXPIRES_SECONDS: int = Field(
+        default=3600, description="Seconds before completed output files expire"
+    )
 
     # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str = Field(default="INFO")

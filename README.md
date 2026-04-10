@@ -18,7 +18,7 @@ Upload → PDF Type Detection → [Digital Engine | OCR Engine]
 | OCR | PaddleOCR (CPU/GPU) |
 | Image Preprocessing | OpenCV |
 | PDF→Image | pdf2image + Poppler |
-| Table Extraction (digital) | Camelot → pdfplumber fallback |
+| Table Extraction (digital) | pdfplumber |
 | Table Extraction (scanned) | OpenCV grid detection |
 | Layout Detection | Coordinate heuristics + optional LayoutParser |
 | API | FastAPI + Async |
@@ -45,7 +45,7 @@ pdf_extractor/
 │   │   ├── digital_extractor.py    # PyMuPDF text extraction
 │   │   ├── ocr_extractor.py        # PaddleOCR pipeline
 │   │   ├── layout_engine.py        # Multi-column reading order
-│   │   ├── table_extractor.py      # Camelot + OCR grid tables
+│   │   ├── table_extractor.py      # pdfplumber + OCR grid tables
 │   │   ├── noise_cleaner.py        # Dedup, regex, watermark removal
 │   │   └── validator.py            # Confidence scoring, QA
 │   ├── pipelines/
@@ -95,14 +95,16 @@ curl http://localhost:8000/api/v1/extract/abc-123
 ### Option B — Local Development
 
 ```bash
-# Prerequisites: Python 3.11+, Redis, Poppler, Ghostscript
+# Prerequisites: Python 3.11+, Redis, Poppler
 
 # 1. Install system deps (Ubuntu/Debian)
-sudo apt-get install poppler-utils ghostscript
+sudo apt-get install poppler-utils
 
 # 2. Install Python packages
 pip install paddlepaddle          # CPU version
 pip install -r requirements.txt
+# Optional: only if you need ML-based layout analysis
+# pip install -r requirements-optional.txt
 
 # 3. Start Redis
 redis-server &
@@ -147,7 +149,7 @@ Poll for result. Returns **202** while processing, **200** when done.
       "table_index": 0,
       "headers": ["Name", "Rank", "Unit"],
       "rows": [["Ramesh Kumar", "Havildar", "5 Para SF"]],
-      "extraction_method": "camelot-lattice"
+      "extraction_method": "pdfplumber"
     }
   ],
   "pages": [...],
@@ -243,7 +245,7 @@ open http://localhost:5555
 ## 🐛 Troubleshooting
 
 **`pdf2image` fails:** Install Poppler: `sudo apt-get install poppler-utils`  
-**Camelot fails:** Install Ghostscript: `sudo apt-get install ghostscript`  
+**Digital tables empty:** The digital table path uses `pdfplumber`; ensure the PDF has selectable text.  
 **PaddleOCR import error:** `pip install paddlepaddle paddleocr`  
 **Memory crash on large files:** Reduce `CHUNK_SIZE_PAGES` in `constants.py`  
 **Low OCR accuracy:** Increase `OCR_DPI` to 400, ensure good scan quality

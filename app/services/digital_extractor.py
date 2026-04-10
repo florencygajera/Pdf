@@ -148,12 +148,18 @@ def extract_digital_page(
 
     if not final_text.strip():
         warnings.append(f"Page {page_number}: no extractable text blocks found.")
-        return {"text": "", "blocks": [], "warnings": warnings}
+        return {
+            "text": "",
+            "blocks": [],
+            "warnings": warnings,
+            "page_width": float(page.rect.width),
+        }
 
     return {
         "text": final_text,
         "blocks": sorted_blocks,
         "warnings": warnings,
+        "page_width": float(page.rect.width),
     }
 
 

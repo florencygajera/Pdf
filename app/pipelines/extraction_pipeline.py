@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 
 from app.config.constants import (
     PDF_TYPE_DIGITAL,
@@ -43,6 +46,11 @@ from app.services.validator import validate_extraction_result
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _blank_scanned_image() -> np.ndarray:
+    """Small defensive fallback when a rendered page image is unavailable."""
+    return np.zeros((100, 100, 3), dtype=np.uint8)
 
 
 def _chunk_list(lst: List, size: int) -> List[List]:
@@ -118,9 +126,10 @@ def _process_digital_chunk(
     page_data = extract_digital_pdf(pdf_path, page_numbers=chunk, pdf_bytes=pdf_bytes)
     for page_info in page_data:
         if page_info.get("blocks"):
+            page_width = float(page_info.get("page_width", 612.0))
             ordered_blocks = reconstruct_reading_order(
                 page_info["blocks"],
-                page_width=612.0,
+                page_width=page_width,
             )
             page_info["text"] = "\n\n".join(
                 b["text"] for b in ordered_blocks if b.get("text")
@@ -285,11 +294,13 @@ def _process_scanned_pages(
                     for page_info in ocr_data:
                         raw_ocr = page_info.get("raw_results", [])
                         rendered_image = page_info.get("rendered_image")
-                        if not raw_ocr or rendered_image is None:
+                        if not raw_ocr:
                             page_info["tables"] = []
                             page_info.pop("rendered_image", None)
                             all_results.append(page_info)
                             continue
+                        if rendered_image is None:
+                            rendered_image = _blank_scanned_image()
                         table_futures[
                             table_pool.submit(
                                 extract_tables_scanned,
@@ -308,7 +319,9 @@ def _process_scanned_pages(
                 for page_info in ocr_data:
                     raw_ocr = page_info.get("raw_results", [])
                     rendered_image = page_info.get("rendered_image")
-                    if raw_ocr and rendered_image is not None:
+                    if raw_ocr:
+                        if rendered_image is None:
+                            rendered_image = _blank_scanned_image()
                         try:
                             page_info["tables"] = extract_tables_scanned(
                                 rendered_image, raw_ocr, page_info["page_number"]
@@ -363,34 +376,20 @@ def run_extraction_pipeline(
         raise ValueError(f"PDF validation failed: {exc}") from exc
 
     logger.info("[%s] Step 2: Extracting content", job_id)
-    digital_results: List[Dict[str, Any]] = []
-    scanned_results: List[Dict[str, Any]] = []
-
-    # Digital and OCR branches are independent, so we run them concurrently.
-    branch_futures = {}
-    max_branch_workers = 2
-    with ThreadPoolExecutor(max_workers=max_branch_workers) as executor:
-        branch_futures[executor.submit(
-            _process_digital_pages,
-            pdf_path,
-            doc_classification,
-            progress_callback,
-            pdf_bytes,
-        )] = "digital"
-        branch_futures[executor.submit(
-            _process_scanned_pages,
-            pdf_path,
-            doc_classification,
-            progress_callback,
-            pdf_bytes,
-        )] = "scanned"
-
-        for future in as_completed(branch_futures):
-            kind = branch_futures[future]
-            if kind == "digital":
-                digital_results = future.result()
-            else:
-                scanned_results = future.result()
+    # Keep OCR isolated: PaddleOCR is not safe to run concurrently with another
+    # OCR-capable branch in the same process.
+    digital_results = _process_digital_pages(
+        pdf_path,
+        doc_classification,
+        progress_callback,
+        pdf_bytes,
+    )
+    scanned_results = _process_scanned_pages(
+        pdf_path,
+        doc_classification,
+        progress_callback,
+        pdf_bytes,
+    )
 
     all_page_results: List[Dict] = sorted(
         digital_results + scanned_results,
@@ -398,19 +397,10 @@ def run_extraction_pipeline(
     )
 
     logger.info("[%s] Step 3: Noise removal", job_id)
-    clean_indices: List[int] = []
-    clean_texts: List[str] = []
-    for idx, page in enumerate(all_page_results):
-        text = page.get("text", "")
-        if page.get("confidence", 0.0) >= 0.9 and text.strip():
-            continue
-        clean_indices.append(idx)
-        clean_texts.append(text)
-
-    if clean_texts:
-        cleaned_texts = clean_pages(clean_texts)
-        for idx, cleaned in zip(clean_indices, cleaned_texts):
-            all_page_results[idx]["text"] = cleaned
+    page_texts = [page.get("text", "") for page in all_page_results]
+    cleaned_texts = clean_pages(page_texts)
+    for idx, cleaned in enumerate(cleaned_texts):
+        all_page_results[idx]["text"] = cleaned
 
     all_tables: List[Dict] = []
     for page in all_page_results:
@@ -456,6 +446,8 @@ def run_extraction_pipeline(
     ]
 
     processing_time = round(time.time() - start_time, 3)
+    total_warning_count = len(warnings)
+    warnings_truncated = total_warning_count > 50
 
     metadata = ExtractionMetadata(
         pages=doc_classification.total_pages,
@@ -465,6 +457,8 @@ def run_extraction_pipeline(
         languages_detected=validation_report.get("languages", []),
         ocr_engine="PaddleOCR" if doc_classification.scanned_page_count > 0 else None,
         warnings=warnings[:50],
+        warnings_truncated=warnings_truncated,
+        total_warning_count=total_warning_count,
     )
 
     result = ExtractionResult(
@@ -491,6 +485,11 @@ def run_extraction_pipeline(
 def save_result_to_disk(result: ExtractionResult, output_path: Path) -> None:
     """Persist extraction result as JSON to disk."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = result.model_dump()
+    payload["expires_at"] = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=settings.RESULT_EXPIRES_SECONDS)
+    ).isoformat()
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result.model_dump(), f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     logger.info("Result saved to %s", output_path)

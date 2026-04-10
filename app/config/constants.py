@@ -30,7 +30,7 @@ MORPH_KERNEL_SIZE = (1, 1)  # Morphological operations kernel
 # ── Table Detection ───────────────────────────────────────────────────────
 MIN_TABLE_ROWS = 2
 MIN_TABLE_COLS = 2
-TABLE_SCORE_THRESHOLD = 0.7  # Camelot accuracy filter
+TABLE_SCORE_THRESHOLD = 0.7  # Digital table quality filter
 
 # ── Noise Removal ─────────────────────────────────────────────────────────
 # Regex patterns that indicate noise/stamps/artifacts

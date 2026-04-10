@@ -21,7 +21,7 @@ paddleocr==2.8.1
 # Image Processing
 opencv-python-headless==4.10.0.84
 Pillow==10.4.0
-numpy==1.26.4
+numpy>=1.26.4,<3.0
 
 # Async Task Queue
 celery==5.4.0
@@ -34,7 +34,7 @@ structlog==24.4.0
 langdetect==1.0.9
 
 # Optional Layout Parser
-layoutparser[layoutmodels,tesseract]==0.3.4
+# Install only if you need ML-based layout analysis.
 
 # Dev / Testing
 pytest==8.3.3

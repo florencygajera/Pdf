@@ -36,7 +36,7 @@ LABEL description="Production-grade hybrid PDF extraction service"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # pdf2image (poppler)
     poppler-utils \
-    # Camelot (ghostscript)
+    # Ghostscript (legacy PDF compatibility / optional tooling)
     ghostscript \
     # OpenCV
     libglib2.0-0 \

@@ -111,7 +111,7 @@ def _compute_text_coverage(page: fitz.Page) -> float:
     if page_area == 0:
         return 0.0
 
-    text_area = 0.0
+    union_rect = None
     try:
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)[
             "blocks"
@@ -121,8 +121,12 @@ def _compute_text_coverage(page: fitz.Page) -> float:
     for block in blocks:
         if block.get("type") == 0:  # text block
             r = fitz.Rect(block["bbox"])
-            text_area += r.width * r.height
+            union_rect = r if union_rect is None else (union_rect | r)
 
+    if union_rect is None:
+        return 0.0
+
+    text_area = union_rect.width * union_rect.height
     return min(text_area / page_area, 1.0)
 
 
@@ -150,11 +154,11 @@ def classify_page(
     if char_count < 5 and fallback_text.strip():
         char_count = max(char_count, len(fallback_text.strip()))
 
-    # Decision: if char count is below threshold relative to page content
+    # Require meaningful text density. Tiny overlays, page numbers, and
+    # watermarks should not flip a scanned page to "digital".
     is_digital = (
-        char_count >= 5
-        or text_coverage > settings.DIGITAL_TEXT_THRESHOLD
-        or (char_count > 0 and not has_images)
+        (char_count >= 50 and text_coverage > 0.01)
+        or (text_coverage > settings.DIGITAL_TEXT_THRESHOLD)
     )
 
     pdf_type = PDF_TYPE_DIGITAL if is_digital else PDF_TYPE_SCANNED
@@ -208,37 +212,48 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
         except Exception:
             fallback_text = ""
 
-    page_classifications: List[PageClassification] = []
-    for i, page in enumerate(doc):
-        pc = classify_page(page, page_number=i + 1, fallback_text=fallback_text)
-        page_classifications.append(pc)
+    try:
+        page_classifications: List[PageClassification] = []
+        for i, page in enumerate(doc):
+            pc = classify_page(page, page_number=i + 1, fallback_text=fallback_text)
+            page_classifications.append(pc)
 
-    doc.close()
+        if total_pages == 1 and fallback_text.strip() and page_classifications:
+            pc = page_classifications[0]
+            page_classifications[0] = PageClassification(
+                page_number=pc.page_number,
+                pdf_type=PDF_TYPE_DIGITAL,
+                char_count=max(pc.char_count, len(fallback_text.strip())),
+                has_images=pc.has_images,
+                text_coverage=pc.text_coverage,
+            )
 
-    digital_count = sum(
-        1 for p in page_classifications if p.pdf_type == PDF_TYPE_DIGITAL
-    )
-    scanned_count = total_pages - digital_count
+        digital_count = sum(
+            1 for p in page_classifications if p.pdf_type == PDF_TYPE_DIGITAL
+        )
+        scanned_count = total_pages - digital_count
 
-    if digital_count == total_pages:
-        overall = PDF_TYPE_DIGITAL
-    elif scanned_count == total_pages:
-        overall = PDF_TYPE_SCANNED
-    else:
-        overall = PDF_TYPE_MIXED
+        if digital_count == total_pages:
+            overall = PDF_TYPE_DIGITAL
+        elif scanned_count == total_pages:
+            overall = PDF_TYPE_SCANNED
+        else:
+            overall = PDF_TYPE_MIXED
 
-    logger.info(
-        f"Document classification: {overall} | "
-        f"total={total_pages}, digital={digital_count}, scanned={scanned_count}"
-    )
+        logger.info(
+            f"Document classification: {overall} | "
+            f"total={total_pages}, digital={digital_count}, scanned={scanned_count}"
+        )
 
-    return DocumentClassification(
-        overall_type=overall,
-        pages=page_classifications,
-        digital_page_count=digital_count,
-        scanned_page_count=scanned_count,
-        total_pages=total_pages,
-    )
+        return DocumentClassification(
+            overall_type=overall,
+            pages=page_classifications,
+            digital_page_count=digital_count,
+            scanned_page_count=scanned_count,
+            total_pages=total_pages,
+        )
+    finally:
+        doc.close()
 
 
 def detect_pdf_type_from_bytes(pdf_bytes: bytes, file_name: str = "pdf") -> DocumentClassification:
@@ -268,39 +283,50 @@ def detect_pdf_type_from_bytes(pdf_bytes: bytes, file_name: str = "pdf") -> Docu
         except Exception:
             fallback_text = ""
 
-    page_classifications: List[PageClassification] = []
-    for i, page in enumerate(doc):
-        page_classifications.append(
-            classify_page(page, page_number=i + 1, fallback_text=fallback_text)
+    try:
+        page_classifications: List[PageClassification] = []
+        for i, page in enumerate(doc):
+            page_classifications.append(
+                classify_page(page, page_number=i + 1, fallback_text=fallback_text)
+            )
+
+        if total_pages == 1 and fallback_text.strip() and page_classifications:
+            pc = page_classifications[0]
+            page_classifications[0] = PageClassification(
+                page_number=pc.page_number,
+                pdf_type=PDF_TYPE_DIGITAL,
+                char_count=max(pc.char_count, len(fallback_text.strip())),
+                has_images=pc.has_images,
+                text_coverage=pc.text_coverage,
+            )
+
+        digital_count = sum(
+            1 for p in page_classifications if p.pdf_type == PDF_TYPE_DIGITAL
+        )
+        scanned_count = total_pages - digital_count
+
+        overall = (
+            PDF_TYPE_DIGITAL
+            if digital_count == total_pages
+            else PDF_TYPE_SCANNED
+            if scanned_count == total_pages
+            else PDF_TYPE_MIXED
         )
 
-    doc.close()
+        logger.info(
+            "Document classification: %s | total=%s, digital=%s, scanned=%s",
+            overall,
+            total_pages,
+            digital_count,
+            scanned_count,
+        )
 
-    digital_count = sum(
-        1 for p in page_classifications if p.pdf_type == PDF_TYPE_DIGITAL
-    )
-    scanned_count = total_pages - digital_count
-
-    overall = (
-        PDF_TYPE_DIGITAL
-        if digital_count == total_pages
-        else PDF_TYPE_SCANNED
-        if scanned_count == total_pages
-        else PDF_TYPE_MIXED
-    )
-
-    logger.info(
-        "Document classification: %s | total=%s, digital=%s, scanned=%s",
-        overall,
-        total_pages,
-        digital_count,
-        scanned_count,
-    )
-
-    return DocumentClassification(
-        overall_type=overall,
-        pages=page_classifications,
-        digital_page_count=digital_count,
-        scanned_page_count=scanned_count,
-        total_pages=total_pages,
-    )
+        return DocumentClassification(
+            overall_type=overall,
+            pages=page_classifications,
+            digital_page_count=digital_count,
+            scanned_page_count=scanned_count,
+            total_pages=total_pages,
+        )
+    finally:
+        doc.close()

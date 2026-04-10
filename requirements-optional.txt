@@ -1,0 +1,1 @@
+layoutparser[layoutmodels,tesseract]==0.3.4

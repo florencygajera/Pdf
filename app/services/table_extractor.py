@@ -3,8 +3,8 @@ Table Extraction Engine
 
 The production path keeps table extraction safe and warning-free by relying on
 pdfplumber for digital PDFs and OpenCV/OCR grid detection for scanned pages.
-Camelot is intentionally avoided here because its legacy PDF stack can emit
-PyPDF2 deprecation warnings in modern environments.
+This avoids the legacy PDF dependency chain that can emit deprecation warnings
+in modern environments.
 """
 
 from io import BytesIO
@@ -27,8 +27,8 @@ def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
     """
     Digital PDF fallback using pdfplumber only.
 
-    This keeps the extraction path stable and avoids the Camelot/PyPDF2
-    dependency chain that was emitting deprecation warnings.
+    This keeps the extraction path stable and avoids the legacy dependency
+    chain that was emitting deprecation warnings.
     """
     try:
         import pdfplumber
