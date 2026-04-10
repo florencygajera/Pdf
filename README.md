@@ -110,7 +110,7 @@ pip install -r requirements.txt
 redis-server &
 
 # 4. Start Celery worker
-celery -A app.workers.celery_worker worker --loglevel=info &
+celery -A app.workers.celery_worker worker --pool=solo --loglevel=info &
 
 # 5. Start API
 uvicorn app.main:app --reload --port 8000
@@ -169,7 +169,7 @@ Poll for result. Returns **202** while processing, **200** when done.
 ### `GET /api/v1/extract/{job_id}/tables` — tables only  
 ### `DELETE /api/v1/extract/{job_id}` — cancel and cleanup
 ### `GET /healthz` — liveness probe
-### `GET /readyz` — readiness probe (checks Redis)
+### `GET /readyz` — readiness probe (checks Redis and, in strict mode, Celery worker heartbeat)
 
 ---
 
@@ -185,7 +185,7 @@ All settings are via environment variables (see `.env.example`):
 | `OCR_USE_GPU` | `false` | Enable GPU OCR |
 | `OCR_CONFIDENCE_THRESHOLD` | `0.6` | Min OCR confidence |
 | `REDIS_URL` | `redis://localhost:6379/0` | Celery broker |
-| `CELERY_TASK_TIMEOUT` | `600` | Seconds before task kill |
+| `CELERY_TASK_TIMEOUT` | `1800` | Seconds before task kill |
 | `LOG_FORMAT` | `json` | `json` or `text` |
 
 ---

@@ -19,6 +19,8 @@ htmlcov/
 .pytest_cache/
 tmp_*.pdf
 tmp_minimal.pdf
+uploads/
+*.pdf
 
 # IDE / Editor Settings
 .vscode/

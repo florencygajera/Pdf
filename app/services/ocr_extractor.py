@@ -27,7 +27,7 @@ from PIL import Image
 from pdf2image import convert_from_bytes, convert_from_path
 from pdf2image.exceptions import PDFPageCountError, PDFSyntaxError
 
-from app.config.constants import LINE_Y_TOLERANCE_OCR
+from app.config.constants import line_y_tolerance_ocr
 from app.config.settings import settings
 from app.utils.image_preprocessing import estimate_page_complexity, preprocess_page_image
 from app.utils.logger import get_logger
@@ -321,11 +321,12 @@ def _filter_by_confidence(ocr_results: List, threshold: float) -> List:
     return filtered
 
 
-def _ocr_results_to_text(ocr_results: List) -> str:
+def _ocr_results_to_text(ocr_results: List, dpi: int) -> str:
     if not ocr_results:
         return ""
 
-    sorted_results = sort_ocr_results(ocr_results)
+    y_tolerance = line_y_tolerance_ocr(dpi)
+    sorted_results = sort_ocr_results(ocr_results, y_tolerance=y_tolerance)
 
     def top_y(r):
         return min(pt[1] for pt in r[0])
@@ -337,7 +338,7 @@ def _ocr_results_to_text(ocr_results: List) -> str:
     for item in sorted_results:
         _, (text, _) = item
         y = top_y(item)
-        if current_y is None or abs(y - current_y) > LINE_Y_TOLERANCE_OCR:
+        if current_y is None or abs(y - current_y) > y_tolerance:
             if current_line:
                 lines.append(current_line)
             current_line = [text]
@@ -399,10 +400,11 @@ def _build_ocr_page_result(
     raw_results: List,
     include_rendered_image: bool,
     rendered_image: Optional[np.ndarray],
+    render_dpi: int,
 ) -> Dict[str, Any]:
     filtered = _filter_by_confidence(raw_results, settings.OCR_CONFIDENCE_THRESHOLD)
     confidence = _compute_page_confidence(filtered)
-    text = _ocr_results_to_text(filtered)
+    text = _ocr_results_to_text(filtered, dpi=render_dpi)
     return {
         "page_number": page_number,
         "text": text,
@@ -437,6 +439,7 @@ def ocr_single_page_image(
     image,
     page_number: int,
     include_rendered_image: bool = True,
+    dpi: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run OCR on a single PIL image.
@@ -448,6 +451,7 @@ def ocr_single_page_image(
       - run the full preprocessing pipeline only for pages that need it
     """
     warnings: List[str] = []
+    render_dpi = dpi or settings.OCR_DPI
     raw_image = _page_array_from_image(image)
     rendered_image = raw_image if include_rendered_image else None
     profile = estimate_page_complexity(raw_image)
@@ -464,6 +468,7 @@ def ocr_single_page_image(
                     raw_results=fast_results,
                     include_rendered_image=include_rendered_image,
                     rendered_image=rendered_image,
+                    render_dpi=render_dpi,
                 )
                 if _ocr_result_looks_good(fast_page):
                     return fast_page
@@ -519,6 +524,7 @@ def ocr_single_page_image(
         raw_results=heavy_results,
         include_rendered_image=include_rendered_image,
         rendered_image=rendered_image,
+        render_dpi=render_dpi,
     )
 
     if fast_page is not None and _ocr_result_looks_good(fast_page):
@@ -538,6 +544,7 @@ def _process_images_in_threads(
     images: List,
     start_page: int,
     page_numbers: Optional[List[int]],
+    dpi: int,
     parallel: bool = True,
 ) -> List[Dict[str, Any]]:
     """Shared page-processing helper for both path- and bytes-based inputs."""
@@ -549,7 +556,7 @@ def _process_images_in_threads(
     def _process(item):
         idx, pil_image = item
         page_num = page_numbers[idx] if page_numbers else start_page + idx
-        return ocr_single_page_image(pil_image, page_num)
+        return ocr_single_page_image(pil_image, page_num, dpi=dpi)
 
     if not parallel or max_workers == 1:
         for item in enumerate(images):
@@ -656,6 +663,7 @@ def extract_ocr_pdf(
                 all_images,
                 start_page=normalized_pages[0] if normalized_pages else 1,
                 page_numbers=normalized_pages,
+                dpi=dpi,
                 parallel=False,
             )
     else:
@@ -668,6 +676,7 @@ def extract_ocr_pdf(
             all_images,
             start_page=normalized_pages[0] if normalized_pages else 1,
             page_numbers=normalized_pages,
+            dpi=dpi,
             parallel=False,
         )
 
@@ -707,6 +716,7 @@ def extract_ocr_pdf_from_bytes(
         all_images,
         start_page=normalized_pages[0] if normalized_pages else 1,
         page_numbers=normalized_pages,
+        dpi=dpi,
         parallel=False,
     )
 
@@ -740,6 +750,7 @@ def extract_ocr_pdf_local(
             pil_image,
             page_num,
             include_rendered_image=False,
+            dpi=dpi,
         )
 
         if page_info.get("text") or page_info.get("raw_results"):

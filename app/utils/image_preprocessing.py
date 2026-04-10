@@ -68,12 +68,11 @@ def to_grayscale(image: np.ndarray) -> np.ndarray:
 
 def remove_noise(gray: np.ndarray) -> np.ndarray:
     """
-    Apply Non-Local Means Denoising — effective for printed document scans.
-    h=10: filter strength (higher = more denoising, less detail).
+    Apply a fast blur-based cleanup.
+    This is substantially faster than Non-Local Means and is good enough for
+    typed-text OCR pages in the common case.
     """
-    return cv2.fastNlMeansDenoising(
-        gray, h=10, templateWindowSize=7, searchWindowSize=21
-    )
+    return cv2.GaussianBlur(gray, (3, 3), 0)
 
 
 def adaptive_threshold(gray: np.ndarray) -> np.ndarray:

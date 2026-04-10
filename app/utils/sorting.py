@@ -7,9 +7,9 @@ Reading order: top-to-bottom, left-to-right (standard Western documents).
 Uses a Y-tolerance band to group blocks on the same visual line.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from app.config.constants import LINE_Y_TOLERANCE, LINE_Y_TOLERANCE_OCR
+from app.config.constants import LINE_Y_TOLERANCE, line_y_tolerance_ocr
 
 
 def sort_digital_blocks(
@@ -51,7 +51,7 @@ def sort_digital_blocks(
 
 def sort_ocr_results(
     ocr_results: List[Tuple],
-    y_tolerance: int = LINE_Y_TOLERANCE_OCR,
+    y_tolerance: Optional[int] = None,
 ) -> List[Tuple]:
     """
     Sort PaddleOCR results in reading order.
@@ -63,6 +63,9 @@ def sort_ocr_results(
     """
     if not ocr_results:
         return []
+
+    if y_tolerance is None:
+        y_tolerance = line_y_tolerance_ocr()
 
     def top_y(result):
         box = result[0]  # 4-point bounding box
