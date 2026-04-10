@@ -49,6 +49,58 @@ class DocumentClassification:
     total_pages: int
 
 
+def _page_fallback_text_from_bytes(pdf_bytes: bytes, page_number: int) -> str:
+    """
+    Best-effort per-page fallback text extraction.
+
+    This avoids using one whole-document fallback string for every page, which
+    can leak text from page 1 into later pages and skew classification.
+    """
+    if not pdf_bytes or page_number < 1:
+        return ""
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return ""
+
+    try:
+        if page_number > len(doc):
+            return ""
+
+        page = doc[page_number - 1]
+        try:
+            text = page.get_text("text").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        try:
+            blocks = page.get_text("blocks", sort=True)
+            parts = [
+                str(block[4]).strip()
+                for block in blocks
+                if len(block) >= 5 and str(block[4]).strip()
+            ]
+            if parts:
+                return "\n".join(parts).strip()
+        except Exception:
+            pass
+
+        try:
+            words = page.get_text("words")
+            parts = [str(word[4]).strip() for word in words if len(word) >= 5 and str(word[4]).strip()]
+            if parts:
+                return " ".join(parts).strip()
+        except Exception:
+            pass
+
+        return ""
+    finally:
+        doc.close()
+
+
 def _compute_text_coverage(page: fitz.Page) -> float:
     """
     Compute what fraction of the page area is covered by text bounding boxes.
@@ -150,7 +202,7 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
         raise ValueError("PDF has zero pages.")
 
     fallback_text = ""
-    if total_pages <= 3:
+    if total_pages == 1:
         try:
             fallback_text = extract_text_from_pdf_bytes(pdf_path.read_bytes())
         except Exception:
@@ -210,7 +262,7 @@ def detect_pdf_type_from_bytes(pdf_bytes: bytes, file_name: str = "pdf") -> Docu
         raise ValueError("PDF has zero pages.")
 
     fallback_text = ""
-    if total_pages <= 3:
+    if total_pages == 1:
         try:
             fallback_text = extract_text_from_pdf_bytes(pdf_bytes)
         except Exception:

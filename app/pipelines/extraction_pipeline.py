@@ -284,17 +284,16 @@ def _process_scanned_pages(
                     table_futures = {}
                     for page_info in ocr_data:
                         raw_ocr = page_info.get("raw_results", [])
-                        if not raw_ocr:
+                        rendered_image = page_info.get("rendered_image")
+                        if not raw_ocr or rendered_image is None:
                             page_info["tables"] = []
+                            page_info.pop("rendered_image", None)
                             all_results.append(page_info)
                             continue
-                        import numpy as np
-
-                        dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
                         table_futures[
                             table_pool.submit(
                                 extract_tables_scanned,
-                                dummy_img,
+                                rendered_image,
                                 raw_ocr,
                                 page_info["page_number"],
                             )
@@ -303,17 +302,16 @@ def _process_scanned_pages(
                     for table_future in as_completed(table_futures):
                         page_info = table_futures[table_future]
                         page_info["tables"] = table_future.result()
+                        page_info.pop("rendered_image", None)
                         all_results.append(page_info)
             else:
                 for page_info in ocr_data:
                     raw_ocr = page_info.get("raw_results", [])
-                    if raw_ocr:
-                        import numpy as np
-
-                        dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
+                    rendered_image = page_info.get("rendered_image")
+                    if raw_ocr and rendered_image is not None:
                         try:
                             page_info["tables"] = extract_tables_scanned(
-                                dummy_img, raw_ocr, page_info["page_number"]
+                                rendered_image, raw_ocr, page_info["page_number"]
                             )
                         except Exception as exc:
                             logger.warning(
@@ -324,6 +322,7 @@ def _process_scanned_pages(
                             page_info["tables"] = []
                     else:
                         page_info["tables"] = []
+                    page_info.pop("rendered_image", None)
                     all_results.append(page_info)
 
             _run_with_progress_lock(

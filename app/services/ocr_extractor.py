@@ -240,6 +240,7 @@ def ocr_single_page_image(image, page_number: int) -> Dict[str, Any]:
     per-page and thread-safe.
     """
     warnings: List[str] = []
+    rendered_image = np.array(image)
 
     try:
         processed_arr, preprocess_meta = preprocess_page_image(image)
@@ -250,7 +251,7 @@ def ocr_single_page_image(image, page_number: int) -> Dict[str, Any]:
         warnings.append(f"Preprocessing failed: {exc}")
         import cv2
 
-        processed_arr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        processed_arr = cv2.cvtColor(rendered_image, cv2.COLOR_RGB2BGR)
         preprocess_meta = {}
 
     if preprocess_meta.get("deskew_angle", 0) != 0:
@@ -266,6 +267,7 @@ def ocr_single_page_image(image, page_number: int) -> Dict[str, Any]:
             "confidence": 0.0,
             "warnings": [f"OCR engine error: {exc}"],
             "raw_results": [],
+            "rendered_image": rendered_image,
         }
 
     if not raw_results:
@@ -278,6 +280,7 @@ def ocr_single_page_image(image, page_number: int) -> Dict[str, Any]:
             "confidence": 0.0,
             "warnings": warnings,
             "raw_results": [],
+            "rendered_image": rendered_image,
         }
 
     filtered = _filter_by_confidence(raw_results, settings.OCR_CONFIDENCE_THRESHOLD)
@@ -290,6 +293,7 @@ def ocr_single_page_image(image, page_number: int) -> Dict[str, Any]:
         "confidence": confidence,
         "warnings": warnings,
         "raw_results": filtered,
+        "rendered_image": rendered_image,
     }
 
 
