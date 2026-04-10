@@ -198,7 +198,7 @@ class Settings(BaseSettings):
         if memory < 12:
             return min(2, cpu)
         if memory < 24:
-            return min(3, max(2, cpu // 2))
+            return min(4, max(2, cpu // 2))
         return min(4, max(3, cpu // 2))
 
     @property
@@ -213,13 +213,26 @@ class Settings(BaseSettings):
             return 1
         if memory < 16:
             return min(2, max(1, cpu // 4 or 1))
-        return min(2, max(1, cpu // 4 or 1))
+        return min(3, max(1, cpu // 3 or 1))
 
     @property
     def effective_ocr_pdf2image_threads(self) -> int:
         if self.OCR_PDF2IMAGE_THREADS and self.OCR_PDF2IMAGE_THREADS > 0:
             return self.OCR_PDF2IMAGE_THREADS
-        return 2 if self.cpu_cores >= 4 else 1
+        if self.memory_gb >= 16 and self.cpu_cores >= 8:
+            return 4
+        if self.cpu_cores >= 4:
+            return 2
+        return 1
+
+    def effective_ocr_dpi(self, total_pages: int) -> int:
+        if total_pages <= 4:
+            return max(220, self.OCR_DPI)
+        if total_pages <= 20:
+            return min(self.OCR_DPI, 260)
+        if total_pages <= 60:
+            return min(self.OCR_DPI, 240)
+        return min(self.OCR_DPI, 220)
 
     def effective_ocr_chunk_size(self, total_pages: int) -> int:
         if self.OCR_CHUNK_SIZE and self.OCR_CHUNK_SIZE > 0:
@@ -235,11 +248,11 @@ class Settings(BaseSettings):
         if memory < 12:
             base = 6
         elif memory < 24:
-            base = 10
+            base = 8
         else:
-            base = 12
+            base = 10
 
-        target = max(4, total_pages // max(workers * 2, 1))
+        target = max(4, total_pages // max(workers * 3, 1))
         return max(4, min(base, target))
 
 @lru_cache

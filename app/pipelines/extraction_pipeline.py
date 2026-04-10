@@ -222,8 +222,13 @@ def _process_digital_pages(
 def _process_scanned_chunk(
     pdf_bytes: bytes,
     chunk: List[int],
+    dpi: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    return extract_ocr_pdf_from_bytes(pdf_bytes, page_numbers=chunk)
+    return extract_ocr_pdf_from_bytes(
+        pdf_bytes,
+        page_numbers=chunk,
+        dpi=dpi or settings.effective_ocr_dpi(len(chunk)),
+    )
 
 
 def _process_scanned_pages(
@@ -260,7 +265,12 @@ def _process_scanned_pages(
 
     with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
         futures = {
-            executor.submit(_process_scanned_chunk, pdf_bytes, chunk): idx
+            executor.submit(
+                _process_scanned_chunk,
+                pdf_bytes,
+                chunk,
+                settings.effective_ocr_dpi(len(chunk)),
+            ): idx
             for idx, chunk in enumerate(chunks)
         }
 

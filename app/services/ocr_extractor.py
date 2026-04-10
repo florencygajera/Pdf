@@ -13,12 +13,15 @@ from __future__ import annotations
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
+import fitz
 import numpy as np
+from PIL import Image
 from pdf2image import convert_from_bytes, convert_from_path
 from pdf2image.exceptions import PDFPageCountError, PDFSyntaxError
 
@@ -29,6 +32,11 @@ from app.utils.logger import get_logger
 from app.utils.sorting import merge_hyphenated_lines, sort_ocr_results
 
 logger = get_logger(__name__)
+
+try:
+    fitz.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
 
 
 class _PaddleOCRPool:
@@ -115,6 +123,48 @@ def _get_ocr_pool() -> _PaddleOCRPool:
 
         _ocr_pool = _PaddleOCRPool(max_instances=settings.effective_ocr_page_workers)
         return _ocr_pool
+
+
+def _render_pages_with_fitz(
+    *,
+    pdf_path: Optional[Path] = None,
+    pdf_bytes: Optional[bytes] = None,
+    page_numbers: Optional[List[int]] = None,
+    dpi: int,
+) -> List[Image.Image]:
+    """
+    Render selected PDF pages directly with PyMuPDF.
+
+    This avoids the Poppler dependency required by pdf2image and is usually
+    faster on Windows for OCR workloads.
+    """
+    if pdf_bytes is not None:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    elif pdf_path is not None:
+        doc = fitz.open(str(pdf_path))
+    else:
+        raise ValueError("pdf_path or pdf_bytes is required")
+
+    try:
+        pages = page_numbers or list(range(1, len(doc) + 1))
+        scale = max(1.0, dpi / 72.0)
+        matrix = fitz.Matrix(scale, scale)
+        images: List[Image.Image] = []
+
+        for page_num in pages:
+            if page_num < 1 or page_num > len(doc):
+                continue
+            page = doc[page_num - 1]
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            mode = "RGB" if pix.n < 4 else "RGBA"
+            image = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+            if mode == "RGBA":
+                image = image.convert("RGB")
+            images.append(image)
+
+        return images
+    finally:
+        doc.close()
 
 
 def _filter_by_confidence(ocr_results: List, threshold: float) -> List:
@@ -286,20 +336,27 @@ def extract_ocr_pdf(
     dpi = dpi or settings.OCR_DPI
 
     try:
-        all_images = convert_from_path(
-            str(pdf_path),
+        all_images = _render_pages_with_fitz(
+            pdf_path=pdf_path,
+            page_numbers=page_numbers,
             dpi=dpi,
-            fmt="PNG",
-            thread_count=settings.effective_ocr_pdf2image_threads,
-            first_page=min(page_numbers) if page_numbers else None,
-            last_page=max(page_numbers) if page_numbers else None,
         )
-    except PDFSyntaxError as exc:
-        raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
-    except PDFPageCountError as exc:
-        raise ValueError(f"Cannot count PDF pages: {exc}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"pdf2image conversion failed: {exc}") from exc
+    except Exception as fitz_exc:
+        try:
+            all_images = convert_from_path(
+                str(pdf_path),
+                dpi=dpi,
+                fmt="PNG",
+                thread_count=settings.effective_ocr_pdf2image_threads,
+                first_page=min(page_numbers) if page_numbers else None,
+                last_page=max(page_numbers) if page_numbers else None,
+            )
+        except PDFSyntaxError as exc:
+            raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
+        except PDFPageCountError as exc:
+            raise ValueError(f"Cannot count PDF pages: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"pdf rendering failed: {fitz_exc}; pdf2image: {exc}") from exc
 
     target_set = set(page_numbers) if page_numbers else None
     start_page = min(page_numbers) if page_numbers else 1
@@ -322,20 +379,27 @@ def extract_ocr_pdf_from_bytes(
     dpi = dpi or settings.OCR_DPI
 
     try:
-        all_images = convert_from_bytes(
-            pdf_bytes,
+        all_images = _render_pages_with_fitz(
+            pdf_bytes=pdf_bytes,
+            page_numbers=page_numbers,
             dpi=dpi,
-            fmt="PNG",
-            thread_count=settings.effective_ocr_pdf2image_threads,
-            first_page=min(page_numbers) if page_numbers else None,
-            last_page=max(page_numbers) if page_numbers else None,
         )
-    except PDFSyntaxError as exc:
-        raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
-    except PDFPageCountError as exc:
-        raise ValueError(f"Cannot count PDF pages: {exc}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"pdf2image conversion failed: {exc}") from exc
+    except Exception as fitz_exc:
+        try:
+            all_images = convert_from_bytes(
+                pdf_bytes,
+                dpi=dpi,
+                fmt="PNG",
+                thread_count=settings.effective_ocr_pdf2image_threads,
+                first_page=min(page_numbers) if page_numbers else None,
+                last_page=max(page_numbers) if page_numbers else None,
+            )
+        except PDFSyntaxError as exc:
+            raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
+        except PDFPageCountError as exc:
+            raise ValueError(f"Cannot count PDF pages: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"pdf rendering failed: {fitz_exc}; pdf2image: {exc}") from exc
 
     target_set = set(page_numbers) if page_numbers else None
     start_page = min(page_numbers) if page_numbers else 1

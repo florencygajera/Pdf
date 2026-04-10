@@ -10,8 +10,6 @@ Key capabilities:
 - Font metadata preservation (for heading detection)
 """
 
-import re
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -47,75 +45,45 @@ def _build_synthetic_block(text: str) -> Dict[str, Any]:
 
 def _extract_page_blocks(page: fitz.Page) -> List[Dict[str, Any]]:
     """
-    Extract all text blocks from a page with full coordinate data.
-    Uses 'dict' mode to preserve block/line/span hierarchy.
+    Extract text blocks from a page with coordinate data.
+
+    `page.get_text("blocks", sort=True)` is lighter than parsing the full
+    span dictionary and still preserves enough geometry for reading-order
+    reconstruction.
     """
     try:
-        raw = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        raw_blocks = page.get_text("blocks", sort=True)
     except Exception:
         return []
-    blocks = []
 
-    for block in raw.get("blocks", []):
-        if block.get("type") != 0:  # skip image blocks
+    blocks: List[Dict[str, Any]] = []
+
+    for block in raw_blocks:
+        if len(block) < 5:
             continue
-
-        block_text_parts: List[str] = []
-        font_sizes: List[float] = []
-        is_bold = False
-
-        for line in block.get("lines", []):
-            line_parts: List[str] = []
-            for span in line.get("spans", []):
-                text = span.get("text", "").strip()
-                if text:
-                    line_parts.append(text)
-                    font_sizes.append(span.get("size", 12.0))
-                    flags = span.get("flags", 0)
-                    if flags & 2**4:  # bold flag in PyMuPDF
-                        is_bold = True
-            if line_parts:
-                block_text_parts.append(" ".join(line_parts))
-
-        full_text = "\n".join(block_text_parts).strip()
-
-        # Skip blocks that are too short (likely noise/artifacts)
+        x0, y0, x1, y1, text = block[:5]
+        full_text = str(text).strip()
         if len(full_text) < MIN_BLOCK_CHAR_COUNT:
             continue
-
-        bbox = block["bbox"]
         blocks.append(
             {
-                "x0": bbox[0],
-                "y0": bbox[1],
-                "x1": bbox[2],
-                "y1": bbox[3],
+                "x0": float(x0),
+                "y0": float(y0),
+                "x1": float(x1),
+                "y1": float(y1),
                 "text": full_text,
-                "avg_font_size": sum(font_sizes) / len(font_sizes)
-                if font_sizes
-                else 12.0,
-                "is_bold": is_bold,
+                "avg_font_size": 12.0,
+                "is_bold": False,
             }
         )
 
     return blocks
 
 
-def _fallback_page_text(pdf_bytes: bytes) -> str:
-    """
-    Final fallback for malformed PDFs. Extract visible strings from raw content
-    streams or any literal text tokens in the file.
-    """
-    try:
-        return extract_text_from_pdf_bytes(pdf_bytes)
-    except Exception:
-        return ""
-
-
 def extract_digital_page(
     page: fitz.Page,
     page_number: int,
-    fallback_text: str = "",
+    pdf_bytes: Optional[bytes] = None,
 ) -> Dict[str, Any]:
     """
     Extract and sort text from a single digital PDF page.
@@ -127,59 +95,60 @@ def extract_digital_page(
     """
     warnings: List[str] = []
 
+    # Fast path: PyMuPDF's plain text extraction is usually the cleanest and
+    # cheapest representation when the PDF already contains searchable text.
+    try:
+        raw_text = page.get_text("text").strip()
+    except Exception:
+        raw_text = ""
+
     blocks = _extract_page_blocks(page)
+    sorted_blocks = sort_digital_blocks(blocks) if blocks else []
 
-    if not blocks:
+    if sorted_blocks:
+        paragraph_texts: List[str] = []
+        current_para: List[str] = []
+        prev_y1: Optional[float] = None
+
+        for block in sorted_blocks:
+            block_lines = [line.strip() for line in block["text"].splitlines() if line.strip()]
+            if not block_lines:
+                continue
+            gap = block["y0"] - prev_y1 if prev_y1 is not None else 0.0
+            if prev_y1 is not None and gap > max(12.0, block["avg_font_size"] * 1.3):
+                if current_para:
+                    paragraph_texts.append(" ".join(current_para))
+                    current_para = []
+            current_para.extend(block_lines)
+            prev_y1 = block["y1"]
+
+        if current_para:
+            paragraph_texts.append(" ".join(current_para))
+
+        final_text = "\n\n".join(paragraph_texts).strip()
+        final_text = merge_hyphenated_lines(final_text.splitlines())
+        final_text = "\n".join(final_text).strip()
+    else:
+        final_text = raw_text
+
+    if not final_text and raw_text:
+        final_text = raw_text
+        if not sorted_blocks:
+            sorted_blocks = [_build_synthetic_block(final_text)]
+
+    if not final_text.strip() and pdf_bytes is not None:
+        try:
+            fallback_text = extract_text_from_pdf_bytes(pdf_bytes)
+        except Exception:
+            fallback_text = ""
         if fallback_text.strip():
-            warnings.append(
-                f"Page {page_number}: PyMuPDF fallback extraction used."
-            )
-            synthetic = _build_synthetic_block(fallback_text)
-            return {
-                "text": fallback_text.strip(),
-                "blocks": [synthetic],
-                "warnings": warnings,
-            }
+            warnings.append(f"Page {page_number}: PyMuPDF fallback extraction used.")
+            final_text = fallback_text.strip()
+            sorted_blocks = [_build_synthetic_block(final_text)]
 
+    if not final_text.strip():
         warnings.append(f"Page {page_number}: no extractable text blocks found.")
         return {"text": "", "blocks": [], "warnings": warnings}
-
-    # Sort into correct reading order
-    sorted_blocks = sort_digital_blocks(blocks)
-
-    # Extract lines, merge hyphenated words
-    all_lines: List[str] = []
-    for block in sorted_blocks:
-        lines = block["text"].split("\n")
-        all_lines.extend(lines)
-
-    all_lines = merge_hyphenated_lines(all_lines)
-
-    # Join with newlines; double-newline between blocks for paragraph spacing
-    paragraph_texts = []
-    current_para: List[str] = []
-    prev_y1: Optional[float] = None
-
-    for block in sorted_blocks:
-        if (
-            prev_y1 is not None
-            and (block["y0"] - prev_y1) > block["avg_font_size"] * 1.5
-        ):
-            # Large gap → new paragraph
-            if current_para:
-                paragraph_texts.append(" ".join(current_para))
-                current_para = []
-        current_para.extend(block["text"].split("\n"))
-        prev_y1 = block["y1"]
-
-    if current_para:
-        paragraph_texts.append(" ".join(current_para))
-
-    final_text = "\n\n".join(paragraph_texts).strip()
-
-    if not final_text.strip() and fallback_text.strip():
-        final_text = fallback_text.strip()
-        sorted_blocks = [_build_synthetic_block(final_text)]
 
     return {
         "text": final_text,
@@ -222,19 +191,11 @@ def extract_digital_pdf(
     targets = page_numbers or list(range(1, total + 1))
     results: List[Dict[str, Any]] = []
 
-    fallback_text = ""
-    source_bytes = pdf_bytes
-    if source_bytes is None:
+    if pdf_bytes is None:
         try:
-            source_bytes = pdf_path.read_bytes()
+            pdf_bytes = pdf_path.read_bytes()
         except Exception:
-            source_bytes = None
-
-    if source_bytes is not None:
-        try:
-            fallback_text = _fallback_page_text(source_bytes)
-        except Exception:
-            fallback_text = ""
+            pdf_bytes = None
 
     for page_num in targets:
         if page_num < 1 or page_num > total:
@@ -243,7 +204,7 @@ def extract_digital_pdf(
 
         page = doc[page_num - 1]
         try:
-            result = extract_digital_page(page, page_num, fallback_text=fallback_text)
+            result = extract_digital_page(page, page_num, pdf_bytes=pdf_bytes)
         except Exception as exc:
             logger.error(f"Error extracting page {page_num}: {exc}", exc_info=True)
             result = {

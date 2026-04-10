@@ -149,12 +149,14 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
     if total_pages == 0:
         raise ValueError("PDF has zero pages.")
 
-    page_classifications: List[PageClassification] = []
-    try:
-        fallback_text = extract_text_from_pdf_bytes(pdf_path.read_bytes())
-    except Exception:
-        fallback_text = ""
+    fallback_text = ""
+    if total_pages <= 3:
+        try:
+            fallback_text = extract_text_from_pdf_bytes(pdf_path.read_bytes())
+        except Exception:
+            fallback_text = ""
 
+    page_classifications: List[PageClassification] = []
     for i, page in enumerate(doc):
         pc = classify_page(page, page_number=i + 1, fallback_text=fallback_text)
         page_classifications.append(pc)
@@ -207,10 +209,12 @@ def detect_pdf_type_from_bytes(pdf_bytes: bytes, file_name: str = "pdf") -> Docu
     if total_pages == 0:
         raise ValueError("PDF has zero pages.")
 
-    try:
-        fallback_text = extract_text_from_pdf_bytes(pdf_bytes)
-    except Exception:
-        fallback_text = ""
+    fallback_text = ""
+    if total_pages <= 3:
+        try:
+            fallback_text = extract_text_from_pdf_bytes(pdf_bytes)
+        except Exception:
+            fallback_text = ""
 
     page_classifications: List[PageClassification] = []
     for i, page in enumerate(doc):
