@@ -9,11 +9,18 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List
 
-from pydantic import Field, field_validator
+from pydantic import ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
+
     # ── App ────────────────────────────────────────────────────────────────
     ENVIRONMENT: str = Field(default="development", description="deployment env")
     DEBUG: bool = Field(default=False)
@@ -105,12 +112,6 @@ class Settings(BaseSettings):
     @property
     def is_testing(self) -> bool:
         return bool(self.TESTING or self.ENVIRONMENT.lower() in {"test", "testing"})
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = True
-
 
 @lru_cache
 def get_settings() -> Settings:
