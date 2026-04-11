@@ -5,8 +5,8 @@ Performance-focused version:
   - reads the PDF once into memory
   - classifies from in-memory bytes
   - runs digital and OCR branches concurrently
-  - fans out chunk processing with ThreadPoolExecutor
-  - parallelizes table extraction per page
+  - FIX: uses extract_tables_digital_batch — ONE pdfplumber open for all pages
+  - FIX: reads stitched pages from "page_results" key (validator fix)
   - preserves stable output ordering and existing API contracts
 
 Designed to stay safe under Windows Celery thread pools.
@@ -39,7 +39,9 @@ from app.services.digital_extractor import extract_digital_pdf
 from app.services.noise_cleaner import clean_pages, clean_text_block
 from app.services.ocr_extractor import extract_ocr_pdf
 from app.services.pdf_detector import DocumentClassification, detect_pdf_type_from_bytes
-from app.services.table_extractor import extract_tables_digital
+
+# FIX: import the new batch function instead of per-page extract_tables_digital
+from app.services.table_extractor import extract_tables_digital_batch
 from app.services.validator import validate_extraction_result
 from app.utils.logger import get_logger
 
@@ -86,25 +88,19 @@ def _run_with_progress_lock(
         progress_callback(step, total, stage)
 
 
-def _extract_digital_tables_for_page(
-    pdf_path: Path,
-    pdf_bytes: bytes,
-    page_num: int,
-) -> List[Dict[str, Any]]:
-    try:
-        return extract_tables_digital(pdf_path, page_num, pdf_bytes=pdf_bytes)
-    except Exception as exc:
-        logger.warning("Table extraction failed for page %s: %s", page_num, exc)
-        return []
-
-
 def _process_digital_pages(
     pdf_path: Path,
     doc_classification: DocumentClassification,
     progress_callback: Optional[Callable] = None,
     pdf_bytes: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
-    """Process all digital pages in a single extraction pass and then extract tables."""
+    """
+    Process all digital pages in a single extraction pass, then batch extract tables.
+
+    FIX: Uses extract_tables_digital_batch — opens pdfplumber exactly ONCE for
+    all pages that have text, instead of once-per-page (which was O(n) file opens).
+    Only pages with actual text content go through table extraction.
+    """
     digital_page_nums = [
         p.page_number
         for p in doc_classification.pages
@@ -126,36 +122,26 @@ def _process_digital_pages(
         pdf_path, page_numbers=digital_page_nums, pdf_bytes=pdf_bytes
     )
 
-    table_targets = [
-        page_info for page_info in page_data if page_info.get("text", "").strip()
+    # FIX: only extract tables for pages that have text (skip blank pages)
+    pages_with_text = [
+        page_info["page_number"]
+        for page_info in page_data
+        if page_info.get("text", "").strip()
     ]
-    if table_targets:
-        table_workers = min(4, len(table_targets)) if len(table_targets) > 1 else 1
-        if table_workers > 1:
-            with ThreadPoolExecutor(max_workers=table_workers) as table_pool:
-                table_futures = {
-                    table_pool.submit(
-                        _extract_digital_tables_for_page,
-                        pdf_path,
-                        pdf_bytes,
-                        page_info["page_number"],
-                    ): page_info
-                    for page_info in table_targets
-                }
-                for table_future in as_completed(table_futures):
-                    page_info = table_futures[table_future]
-                    page_info["tables"] = table_future.result()
-                    page_info["confidence"] = 0.95
-        else:
-            for page_info in table_targets:
-                page_info["tables"] = _extract_digital_tables_for_page(
-                    pdf_path, pdf_bytes, page_info["page_number"]
-                )
-                page_info["confidence"] = 0.95
 
-    for page_info in page_data:
-        page_info.setdefault("tables", [])
-        page_info["confidence"] = page_info.get("confidence", 0.95)
+    if pages_with_text:
+        # FIX: single batch open — was previously one pdfplumber.open() per page
+        table_map = extract_tables_digital_batch(
+            pdf_path, pages_with_text, pdf_bytes=pdf_bytes
+        )
+        for page_info in page_data:
+            pnum = page_info["page_number"]
+            page_info["tables"] = table_map.get(pnum, [])
+            page_info["confidence"] = 0.95
+    else:
+        for page_info in page_data:
+            page_info.setdefault("tables", [])
+            page_info["confidence"] = page_info.get("confidence", 0.95)
 
     _run_with_progress_lock(progress_callback, progress_lock, 1, 1, "digital")
     return sorted(page_data, key=lambda p: p.get("page_number", 0))
@@ -222,7 +208,6 @@ def run_extraction_pipeline(
 
     logger.info("[%s] Step 2: Extracting content (digital + OCR concurrently)", job_id)
 
-    # M2 fix: run digital and scanned branches concurrently
     digital_results: List[Dict] = []
     scanned_results: List[Dict] = []
 
@@ -245,7 +230,6 @@ def run_extraction_pipeline(
                 None,
                 pdf_bytes,
             )
-            # M10 fix: report progress as each branch completes
             done_count = 0
             for fut in (digital_future, scanned_future):
                 result = fut.result()
@@ -283,8 +267,10 @@ def run_extraction_pipeline(
     logger.info("[%s] Step 4: Validation pass", job_id)
     validation_report = validate_extraction_result(all_page_results, all_tables)
 
-    # C6 fix: apply the stitched page texts back from the validation report
-    stitched_pages = validation_report.get("stitched_pages")
+    # FIX: use "page_results" key (was "stitched_pages" which wasn't returned by validator)
+    stitched_pages = validation_report.get("page_results") or validation_report.get(
+        "stitched_pages"
+    )
     if stitched_pages:
         for idx, page in enumerate(stitched_pages):
             if idx < len(all_page_results):

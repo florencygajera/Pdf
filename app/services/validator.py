@@ -2,13 +2,11 @@
 Post-processing & Validation Layer
 Validates and scores extracted content for quality.
 
-Checks:
-  - Duplicate sentence removal
-  - Sentence continuity (broken mid-sentence across pages)
-  - Confidence scoring (per-page + overall)
-  - Language detection
-  - Empty page warnings
-  - Missing-text detection (OCR vs layout block comparison)
+Fixes applied:
+  - validate_extraction_result now returns "page_results" key (required by pipeline + tests)
+  - stitch_page_boundaries uses shallow copy (fast) with deep copy only on warning lists
+  - Language detection samples first 500 chars to avoid slow detection on huge docs
+  - Empty page short-circuits early
 """
 
 import re
@@ -23,34 +21,36 @@ logger = get_logger(__name__)
 # Sentence ending characters
 _SENTENCE_ENDERS = re.compile(r"[.!?।॥]$")  # includes Hindi/Devanagari punctuation
 
-
-def _detect_language(text: str) -> str:
-    """
-    Detect primary language using langdetect.
-    Falls back to 'unknown' if not installed or fails.
-    """
-    if not text or len(text) < 20:
-        return "unknown"
-
-    try:
-        from langdetect import detect
-
-        return detect(text)
-    except ImportError:
-        logger.debug("langdetect not installed. Skipping language detection.")
-        return "unknown"
-    except Exception as exc:
-        logger.debug(f"Language detection failed: {exc}")
-        return "unknown"
-
-
-# I2 fix: seed DetectorFactory once at module load time for deterministic results
+# FIX: seed DetectorFactory once at module load time for deterministic results
 try:
     from langdetect import DetectorFactory as _DetectorFactory
 
     _DetectorFactory.seed = 42
 except ImportError:
     pass
+
+
+def _detect_language(text: str) -> str:
+    """
+    Detect primary language using langdetect.
+    FIX: Truncates to 500 chars for speed. Falls back to 'unknown' if not installed.
+    """
+    if not text or len(text) < 20:
+        return "unknown"
+
+    # FIX: sample only first 500 chars — langdetect doesn't need the whole document
+    sample = text[:500]
+
+    try:
+        from langdetect import detect
+
+        return detect(sample)
+    except ImportError:
+        logger.debug("langdetect not installed. Skipping language detection.")
+        return "unknown"
+    except Exception as exc:
+        logger.debug(f"Language detection failed: {exc}")
+        return "unknown"
 
 
 def _sentence_ends_properly(text: str) -> bool:
@@ -64,12 +64,14 @@ def _sentence_ends_properly(text: str) -> bool:
 def stitch_page_boundaries(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Detect and stitch sentences that are broken across page boundaries.
-    If page N ends without a sentence terminator and page N+1 starts with lowercase,
-    merge the tail of page N with the head of page N+1.
 
-    Returns a new list — the original is not mutated.
+    FIX: Uses a shallow list copy + selective deep copy of 'warnings' only,
+    instead of copy.deepcopy on the entire page list (which is very slow for
+    large documents with many OCR raw_results).
     """
-    pages = copy.deepcopy(pages)
+    # Shallow copy of the list — items are new dicts sharing inner objects
+    pages = [dict(p) for p in pages]
+
     if len(pages) <= 1:
         return pages
 
@@ -86,7 +88,9 @@ def stitch_page_boundaries(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if last_char not in ".!?।॥\n" and first_word and first_word[0].islower():
             pages[i]["text"] = curr_text + " " + next_text
             pages[i + 1]["text"] = ""
-            pages[i].setdefault("warnings", []).append(
+            # Deep-copy only the warnings list to avoid mutating the original
+            pages[i]["warnings"] = list(pages[i].get("warnings", []))
+            pages[i]["warnings"].append(
                 f"Page boundary stitch: merged with page {i + 2}"
             )
             logger.debug(f"Stitched page boundary {i + 1} → {i + 2}")
@@ -181,16 +185,21 @@ def validate_extraction_result(
     """
     Full validation pass over extraction results.
 
+    FIX: Returns "page_results" key containing the stitched+flagged pages.
+    The pipeline uses this key to apply results back. Tests assert on it too.
+
     Returns validation report:
       {
         "overall_confidence": float,
         "languages": [str],
         "table_issues": [...],
         "page_warnings": {...},
-        "quality": "high" | "medium" | "low"
+        "quality": "high" | "medium" | "low",
+        "page_results": [...],   ← FIX: was missing, caused KeyError in pipeline
+        "stitched_pages": [...], ← alias kept for backward compat
       }
     """
-    # C6 fix: stitch_page_boundaries returns a new list — use its return value
+    # FIX: stitch_page_boundaries returns new list — use its return value
     page_results = stitch_page_boundaries(page_results)
 
     # Flag low-quality pages
@@ -199,7 +208,7 @@ def validate_extraction_result(
     # Overall confidence
     overall_conf = compute_confidence_score(page_results)
 
-    # Language detection on combined text
+    # Language detection on combined text (FIX: truncated inside _detect_language)
     all_text = " ".join(p.get("text", "") for p in page_results)
     language = _detect_language(all_text)
 
@@ -237,6 +246,10 @@ def validate_extraction_result(
         "table_issues": table_issues,
         "page_warnings": page_warnings,
         "quality": quality,
+        # FIX: expose processed pages so pipeline can read stitched text back
+        "page_results": page_results,
+        # backward-compat alias used by extraction_pipeline.py
+        "stitched_pages": page_results,
     }
 
     logger.info(

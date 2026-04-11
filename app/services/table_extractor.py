@@ -8,6 +8,10 @@ Fixes applied:
          always being None.
   I3  — extract_tables_scanned() now detects and returns ALL table grids on a
          page (previously always returned exactly one table with index 0).
+  FIX — Added extract_tables_digital_batch() — opens pdfplumber ONCE for all
+         requested pages, drastically reducing open() call overhead (was O(n) opens).
+  FIX — _pdfplumber_extract_from_bytes() now accepts optional page_num=None
+         to return all pages when called without a specific page number.
 """
 
 from io import BytesIO
@@ -80,8 +84,15 @@ def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
     return extracted
 
 
-def _pdfplumber_extract_from_bytes(pdf_bytes: bytes, page_num: int) -> List[Dict]:
-    """M8 fix: byte-based pdfplumber extraction — preferred over disk path."""
+def _pdfplumber_extract_from_bytes(
+    pdf_bytes: bytes,
+    page_num: Optional[int] = None,
+) -> List[Dict]:
+    """
+    FIX: Byte-based pdfplumber extraction — preferred over disk path.
+    page_num is now Optional. When None, extracts from all pages (used in batch mode).
+    When provided, extracts from that specific 1-indexed page only.
+    """
     try:
         import pdfplumber
     except ImportError:
@@ -90,36 +101,40 @@ def _pdfplumber_extract_from_bytes(pdf_bytes: bytes, page_num: int) -> List[Dict
 
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            if page_num > len(pdf.pages):
-                return []
-            page = pdf.pages[page_num - 1]
-            raw_tables = page.extract_tables() or []
+            if page_num is not None:
+                if page_num > len(pdf.pages):
+                    return []
+                pages_to_process = [(page_num, pdf.pages[page_num - 1])]
+            else:
+                pages_to_process = [(i + 1, page) for i, page in enumerate(pdf.pages)]
+
+            extracted: List[Dict] = []
+            for pnum, page in pages_to_process:
+                raw_tables = page.extract_tables() or []
+                for i, tbl in enumerate(raw_tables):
+                    if not tbl or len(tbl) < MIN_TABLE_ROWS:
+                        continue
+                    if not tbl[0] or len(tbl[0]) < MIN_TABLE_COLS:
+                        continue
+
+                    headers = [str(c) if c else "" for c in tbl[0]]
+                    rows = [[str(c) if c else "" for c in row] for row in tbl[1:]]
+
+                    extracted.append(
+                        {
+                            "page": pnum,
+                            "table_index": i,
+                            "headers": headers,
+                            "rows": rows,
+                            "extraction_method": "pdfplumber",
+                            "accuracy": _compute_table_accuracy(headers, rows),
+                        }
+                    )
+            return extracted
+
     except Exception as exc:
-        logger.error("pdfplumber(bytes) failed on page %s: %s", page_num, exc)
+        logger.error("pdfplumber(bytes) failed: %s", exc)
         return []
-
-    extracted: List[Dict] = []
-    for i, tbl in enumerate(raw_tables):
-        if not tbl or len(tbl) < MIN_TABLE_ROWS:
-            continue
-        if not tbl[0] or len(tbl[0]) < MIN_TABLE_COLS:
-            continue
-
-        headers = [str(c) if c else "" for c in tbl[0]]
-        rows = [[str(c) if c else "" for c in row] for row in tbl[1:]]
-
-        extracted.append(
-            {
-                "page": page_num,
-                "table_index": i,
-                "headers": headers,
-                "rows": rows,
-                "extraction_method": "pdfplumber",
-                "accuracy": _compute_table_accuracy(headers, rows),
-            }
-        )
-
-    return extracted
 
 
 def extract_tables_digital(
@@ -134,6 +149,66 @@ def extract_tables_digital(
     if pdf_bytes is not None:
         return _pdfplumber_extract_from_bytes(pdf_bytes, page_num)
     return _pdfplumber_extract(pdf_path, page_num)
+
+
+def extract_tables_digital_batch(
+    pdf_path: Path,
+    page_numbers: List[int],
+    pdf_bytes: Optional[bytes] = None,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    FIX: Extract tables from multiple pages by opening pdfplumber ONCE.
+
+    Previously, the pipeline called extract_tables_digital() per page which
+    opened a new pdfplumber handle for every page — O(n) expensive file opens.
+    This function opens the PDF once and extracts all requested pages in a
+    single pass, reducing overhead from O(n) to O(1) file opens.
+
+    Returns a dict mapping page_number → list of table dicts.
+    """
+    result: Dict[int, List[Dict[str, Any]]] = {p: [] for p in page_numbers}
+
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber not installed — skipping batch table extraction.")
+        return result
+
+    page_set = set(page_numbers)
+
+    try:
+        source = BytesIO(pdf_bytes) if pdf_bytes is not None else str(pdf_path)
+        with pdfplumber.open(source) as pdf:
+            for page_num in sorted(page_set):
+                if page_num < 1 or page_num > len(pdf.pages):
+                    continue
+                try:
+                    raw_tables = pdf.pages[page_num - 1].extract_tables() or []
+                except Exception as exc:
+                    logger.warning("pdfplumber batch failed page %s: %s", page_num, exc)
+                    continue
+
+                for i, tbl in enumerate(raw_tables):
+                    if not tbl or len(tbl) < MIN_TABLE_ROWS:
+                        continue
+                    if not tbl[0] or len(tbl[0]) < MIN_TABLE_COLS:
+                        continue
+                    headers = [str(c) if c else "" for c in tbl[0]]
+                    rows = [[str(c) if c else "" for c in row] for row in tbl[1:]]
+                    result[page_num].append(
+                        {
+                            "page": page_num,
+                            "table_index": i,
+                            "headers": headers,
+                            "rows": rows,
+                            "extraction_method": "pdfplumber",
+                            "accuracy": _compute_table_accuracy(headers, rows),
+                        }
+                    )
+    except Exception as exc:
+        logger.error("pdfplumber batch open failed: %s", exc)
+
+    return result
 
 
 def _detect_table_grid(

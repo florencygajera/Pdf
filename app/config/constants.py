@@ -17,6 +17,9 @@ STATE_FAILED = "failed"
 # Y-axis tolerance: two bounding boxes within this many pts are on the same line
 LINE_Y_TOLERANCE = 5  # points  (digital)
 
+# FIX: Added DEFAULT_OCR_RENDER_DPI constant referenced in tests
+DEFAULT_OCR_RENDER_DPI = 150
+
 
 def line_y_tolerance_ocr(dpi: int = 150) -> int:
     """Scale OCR line-merge tolerance proportionally to render DPI."""
