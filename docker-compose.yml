@@ -59,7 +59,7 @@ services:
       --concurrency=1
       --prefetch-multiplier=1
       --queues=celery
-      --max-tasks-per-child=5
+      --max-tasks-per-child=30
     restart: unless-stopped
     environment:
       - ENVIRONMENT=production

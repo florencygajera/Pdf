@@ -10,7 +10,6 @@ dist/
 env/
 venv/
 ENV/
-.env.example
 .env
 
 # Testing / Coverage
@@ -18,7 +17,6 @@ htmlcov/
 .tox/
 .pytest_cache/
 tmp_*.pdf
-tmp_minimal.pdf
 uploads/
 *.pdf
 

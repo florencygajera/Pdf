@@ -32,7 +32,10 @@ from pdf2image.exceptions import PDFPageCountError, PDFSyntaxError
 
 from app.config.constants import line_y_tolerance_ocr
 from app.config.settings import settings
-from app.utils.image_preprocessing import estimate_page_complexity, preprocess_page_image
+from app.utils.image_preprocessing import (
+    estimate_page_complexity,
+    preprocess_page_image,
+)
 from app.utils.logger import get_logger
 from app.utils.sorting import merge_hyphenated_lines, sort_ocr_results
 
@@ -128,7 +131,9 @@ _ocr_executor = None
 _ocr_executor_lock = Lock()
 
 
-def _normalize_page_numbers(page_numbers: Optional[List[int]], total_pages: int) -> List[int]:
+def _normalize_page_numbers(
+    page_numbers: Optional[List[int]], total_pages: int
+) -> List[int]:
     if page_numbers:
         return [p for p in page_numbers if 1 <= p <= total_pages]
     return list(range(1, total_pages + 1))
@@ -371,11 +376,17 @@ def _render_pages_for_ocr(
                         )
                     )
             except PDFSyntaxError as exc:
-                raise ValueError(f"PDF syntax error during image conversion: {exc}") from exc
+                raise ValueError(
+                    f"PDF syntax error during image conversion: {exc}"
+                ) from exc
             except PDFPageCountError as exc:
                 raise ValueError(f"Cannot count PDF pages: {exc}") from exc
             except Exception as exc:
-                logger.warning("Single-page fallback rendering failed for page %s: %s", page_num, exc)
+                logger.warning(
+                    "Single-page fallback rendering failed for page %s: %s",
+                    page_num,
+                    exc,
+                )
 
     return images
 
@@ -509,6 +520,29 @@ def _ocr_chunk_worker_from_path(payload) -> List[Dict[str, Any]]:
     )
 
 
+def _quick_complexity_check(raw_image: np.ndarray) -> bool:
+    """
+    Lightweight heuristic to decide if fast OCR path may work.
+
+    This is much faster than full estimate_page_complexity() which runs Canny.
+    Returns True if page likely needs full preprocessing.
+    """
+    try:
+        # Convert to grayscale for edge density check
+        fast_gray = cv2.cvtColor(raw_image, cv2.COLOR_RGB2GRAY)
+
+        # Calculate edge density proxy: high std = complex page with edges
+        edge_ratio = np.std(fast_gray) / 128.0
+
+        # Calculate brightness: very bright pages (faded scans) need full processing
+        brightness = np.mean(fast_gray)
+
+        # Page needs full processing if it's complex OR very bright (faded)
+        return edge_ratio > 1.5 or brightness > 200
+    except Exception:
+        return True  # Default to full processing on any error
+
+
 def ocr_single_page_image(
     image,
     page_number: int,
@@ -528,10 +562,13 @@ def ocr_single_page_image(
     render_dpi = dpi or settings.OCR_DPI
     raw_image = _page_array_from_image(image)
     rendered_image = raw_image if include_rendered_image else None
-    profile = estimate_page_complexity(raw_image)
+
+    # Use lightweight heuristic instead of full estimate_page_complexity
+    # This avoids running Canny edge detection twice (once on raw, once on grayscale)
+    needs_full = _quick_complexity_check(raw_image)
     fast_page: Optional[Dict[str, Any]] = None
 
-    if not profile["needs_full_preprocess"]:
+    if not needs_full:
         try:
             fast_arr = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
             fast_results = _run_paddle_ocr(fast_arr)
@@ -549,12 +586,13 @@ def ocr_single_page_image(
         except Exception as exc:
             logger.debug("Fast OCR path failed on page %s: %s", page_number, exc)
 
+    # Full path: let preprocess_page_image handle complexity estimation internally
+    # This ensures it runs exactly once per page
     try:
         processed_arr, preprocess_meta = preprocess_page_image(
             image,
-            prefer_light=not profile["needs_full_preprocess"],
-            apply_deskew=profile["edge_ratio"] > 0.05,
-            quality_profile=profile,
+            prefer_light=needs_full,
+            apply_deskew=True,  # Always check deskew in full path
         )
     except Exception as exc:
         logger.error(
@@ -603,12 +641,14 @@ def ocr_single_page_image(
     )
 
     if fast_page is not None and _ocr_result_looks_good(fast_page):
-        fast_score = len(fast_page.get("text", "")) + float(
-            fast_page.get("confidence", 0.0)
-        ) * 100.0
-        heavy_score = len(heavy_page.get("text", "")) + float(
-            heavy_page.get("confidence", 0.0)
-        ) * 100.0
+        fast_score = (
+            len(fast_page.get("text", ""))
+            + float(fast_page.get("confidence", 0.0)) * 100.0
+        )
+        heavy_score = (
+            len(heavy_page.get("text", ""))
+            + float(heavy_page.get("confidence", 0.0)) * 100.0
+        )
         if fast_score >= heavy_score:
             return fast_page
 
@@ -671,9 +711,7 @@ def _extract_scanned_tables_from_page(
     try:
         return extract_tables_scanned(rendered_image, raw_results, page_number)
     except Exception as exc:
-        logger.warning(
-            "Scanned table extraction failed page %s: %s", page_number, exc
-        )
+        logger.warning("Scanned table extraction failed page %s: %s", page_number, exc)
         return []
 
 
@@ -683,14 +721,22 @@ def extract_ocr_pdf(
     dpi: int = None,
 ) -> List[Dict[str, Any]]:
     """Full OCR extraction pipeline using the PDF on disk."""
-    dpi = dpi or settings.OCR_DPI
+    # Get page count first to determine effective DPI
     try:
         with fitz.open(str(pdf_path)) as doc:
             total_pages = len(doc)
     except Exception:
         total_pages = 0
 
-    normalized_pages = _normalize_page_numbers(page_numbers, total_pages) if total_pages else (page_numbers or [])
+    # Use effective DPI capping when no explicit DPI provided
+    # This caps at 120-150 DPI for large documents to maintain performance
+    dpi = dpi or settings.effective_ocr_dpi(total_pages or 1)
+
+    normalized_pages = (
+        _normalize_page_numbers(page_numbers, total_pages)
+        if total_pages
+        else (page_numbers or [])
+    )
     if not normalized_pages and total_pages:
         normalized_pages = list(range(1, total_pages + 1))
 
@@ -770,7 +816,16 @@ def extract_ocr_pdf_from_bytes(
     dpi: int = None,
 ) -> List[Dict[str, Any]]:
     """Bytes-based OCR pipeline to avoid repeated disk reads."""
-    dpi = dpi or settings.OCR_DPI
+    # Get page count first to determine effective DPI
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            total_pages = len(doc)
+    except Exception:
+        total_pages = 0
+
+    # Use effective DPI capping when no explicit DPI provided
+    dpi = dpi or settings.effective_ocr_dpi(total_pages or 1)
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp_path = Path(tmp.name)
@@ -799,7 +854,16 @@ def extract_ocr_pdf_local(
     This performs rendering + OCR sequentially inside the worker process to
     avoid nested process pools and excess IPC overhead.
     """
-    dpi = dpi or settings.OCR_DPI
+    # Get page count first to determine effective DPI
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            total_pages = len(doc)
+    except Exception:
+        total_pages = 0
+
+    # Use effective DPI capping when no explicit DPI provided
+    dpi = dpi or settings.effective_ocr_dpi(total_pages or 1)
+
     all_images = _render_pages_for_ocr(
         pdf_path=pdf_path,
         page_numbers=page_numbers,

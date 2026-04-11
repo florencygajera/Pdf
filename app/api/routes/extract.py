@@ -9,6 +9,7 @@ DELETE /api/v1/extract/{job_id}       — cancel and clean up job files
 import asyncio
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -17,6 +18,8 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.config.constants import (
+    RESULT_NOT_FOUND,
+    RESULT_EXPIRED,
     STATE_DONE,
     STATE_FAILED,
     STATE_PENDING,
@@ -30,129 +33,17 @@ from app.models.response_model import (
     JobStatus,
     TableData,
 )
-from app.utils.file_handler import cleanup_job_files, get_output_path, get_upload_path
+from app.utils.file_handler import (
+    cleanup_job_files,
+    get_output_path,
+    get_upload_path,
+)
 from app.utils.logger import get_logger
 
-router = APIRouter(dependencies=[Depends(require_api_key)])
 logger = get_logger(__name__)
+
+router = APIRouter(prefix="/extract", tags=["Extract"])
 limiter = Limiter(key_func=get_remote_address)
-RESULT_NOT_FOUND = "not_found"
-RESULT_EXPIRED = "expired"
-
-
-async def _revoke_celery_job(job_id: str) -> None:
-    """Best-effort revoke that does not block the request handler."""
-    try:
-        from app.workers.celery_worker import celery_app
-
-        celery_app.control.revoke(job_id, terminate=True, signal="SIGTERM")
-        logger.info(f"Celery task {job_id} revoked.")
-    except Exception as exc:
-        logger.debug(f"Celery revoke skipped for {job_id}: {exc}")
-
-
-def _get_celery_job_state(job_id: str):
-    """
-    Query Celery backend for task state.
-    Returns (state_str, progress_pct, message) or None if Celery unavailable.
-    """
-    try:
-        from celery.result import AsyncResult
-        from app.workers.celery_worker import celery_app
-
-        result = AsyncResult(job_id, app=celery_app)
-        state = result.state
-
-        if state == "PENDING":
-            return STATE_PENDING, 0.0, "Queued, waiting for worker."
-        elif state == STATE_PROCESSING:
-            meta = result.info or {}
-            return STATE_PROCESSING, meta.get("progress", 0.0), meta.get("message", "")
-        elif state == "SUCCESS":
-            return STATE_DONE, 100.0, "Complete."
-        elif state == "FAILURE":
-            return STATE_FAILED, 0.0, str(result.info)
-        else:
-            return state.lower(), 0.0, ""
-
-    except Exception as exc:
-        logger.debug(f"Celery state check failed: {exc}")
-        return None, 0.0, ""
-
-
-def _load_output(job_id: str) -> dict:
-    """Load the JSON result file for a completed job."""
-    output_path = get_output_path(job_id)
-    if not output_path.exists():
-        return {"_state": RESULT_NOT_FOUND}
-    try:
-        with open(output_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {"_state": RESULT_NOT_FOUND}
-
-    expires_at = data.get("expires_at")
-    if expires_at:
-        try:
-            expiry_dt = datetime.fromisoformat(expires_at)
-            if expiry_dt.tzinfo is None:
-                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
-            if expiry_dt <= datetime.now(timezone.utc):
-                output_path.unlink(missing_ok=True)
-                return {"_state": RESULT_EXPIRED}
-        except Exception:
-            pass
-    else:
-        try:
-            age_seconds = datetime.now(timezone.utc).timestamp() - output_path.stat().st_mtime
-            if age_seconds > settings.RESULT_EXPIRES_SECONDS:
-                output_path.unlink(missing_ok=True)
-                return {"_state": RESULT_EXPIRED}
-        except Exception:
-            pass
-
-    return data
-
-
-def _resolve_job_status(job_id: str):
-    """
-    Determine job status from multiple sources:
-    1. Celery backend (if available)
-    2. Output file on disk (fastest check)
-    3. Upload file existence (pending)
-
-    Returns (status, progress, message, result_data_or_None)
-    """
-    output_path = get_output_path(job_id)
-    upload_path = get_upload_path(job_id)
-
-    # Fast path: output file exists → job is done or failed
-    if output_path.exists():
-        data = _load_output(job_id)
-        state_marker = data.get("_state")
-        if state_marker == RESULT_EXPIRED:
-            cleanup_job_files(job_id)
-            return RESULT_EXPIRED, 0.0, "Result expired.", None
-        if state_marker == RESULT_NOT_FOUND:
-            cleanup_job_files(job_id)
-            return None, 0.0, "", None
-        status = data.get("status", STATE_DONE)
-        return status, 100.0, "", data
-
-    # If we never saw an upload, this job ID is unknown.
-    if not upload_path.exists():
-        return None, 0.0, "", None
-
-    # Check Celery only for known uploads.
-    celery_status, pct, msg = _get_celery_job_state(job_id)
-    if celery_status:
-        return celery_status, pct, msg, None
-
-    # Upload exists but no output → still processing
-    if upload_path.exists():
-        return STATE_PROCESSING, 5.0, "Processing started.", None
-
-    return None, 0.0, "", None
 
 
 @router.get(
@@ -175,7 +66,7 @@ async def get_extraction_result(request: Request, job_id: str):
     - **404** → unknown job_id
     - **410** → result expired
     """
-    status, pct, msg, data = _resolve_job_status(job_id)
+    status, pct, msg, data = await _resolve_job_status(job_id)
 
     if status is None:
         raise HTTPException(
@@ -229,7 +120,7 @@ async def get_job_status(job_id: str):
     Lightweight status check (no full result body).
     Returns just status + progress percentage.
     """
-    status, pct, msg, _ = _resolve_job_status(job_id)
+    status, pct, msg, _ = await _resolve_job_status(job_id)
     if status is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
@@ -247,7 +138,7 @@ async def get_job_status(job_id: str):
 )
 async def get_text_only(job_id: str):
     """Return only the clean extracted text for a completed job."""
-    status, _, _, data = _resolve_job_status(job_id)
+    status, _, _, data = await _resolve_job_status(job_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if status == RESULT_EXPIRED:
@@ -274,7 +165,7 @@ async def get_text_only(job_id: str):
 )
 async def get_tables_only(job_id: str):
     """Return only extracted tables for a completed job."""
-    status, _, _, data = _resolve_job_status(job_id)
+    status, _, _, data = await _resolve_job_status(job_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if status == RESULT_EXPIRED:
@@ -307,3 +198,115 @@ async def delete_job(job_id: str):
 
     cleanup_job_files(job_id)
     return {"job_id": job_id, "message": "Job cancelled and files cleaned up."}
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────────
+
+
+async def _load_output(job_id: str) -> dict:
+    """Load the JSON result file for a completed job (async, non-blocking)."""
+    output_path = get_output_path(job_id)
+    if not output_path.exists():
+        return {"_state": RESULT_NOT_FOUND}
+
+    try:
+        # Use asyncio.to_thread to run blocking sync file I/O in thread pool
+        # This avoids blocking the event loop during disk reads
+        content = await asyncio.to_thread(output_path.read_text, encoding="utf-8")
+        data = json.loads(content)
+    except (OSError, json.JSONDecodeError):
+        return {"_state": RESULT_NOT_FOUND}
+
+    expires_at = data.get("expires_at")
+    if expires_at:
+        try:
+            expiry_dt = datetime.fromisoformat(expires_at)
+            if expiry_dt.tzinfo is None:
+                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            if expiry_dt <= datetime.now(timezone.utc):
+                return {"_state": RESULT_EXPIRED, "expires_at": expires_at}
+        except (ValueError, TypeError):
+            pass
+
+    return data
+
+
+async def _resolve_job_status(job_id: str):
+    """
+    Resolve current job status, handling all three cases:
+      - unknown job_id (None)
+      - known but still processing (202)
+      - done, expired, or failed (result payload)
+    """
+    output_path = get_output_path(job_id)
+    upload_path = get_upload_path(job_id)
+
+    # Fast path: output exists → load and return it
+    if output_path.exists():
+        data = await _load_output(job_id)
+        state_marker = data.get("_state")
+
+        if state_marker == RESULT_EXPIRED:
+            return RESULT_EXPIRED, 0.0, "Result expired.", None
+        if state_marker == RESULT_NOT_FOUND:
+            cleanup_job_files(job_id)
+            return None, 0.0, "", None
+        status = data.get("status", STATE_DONE)
+        return status, 100.0, "", data
+
+    # If we never saw an upload, this job ID is unknown.
+    if not upload_path.exists():
+        return None, 0.0, "", None
+
+    # Check Celery only for known uploads.
+    celery_status, pct, msg = _get_celery_job_state(job_id)
+    if celery_status:
+        return celery_status, pct, msg, None
+
+    # Upload exists but no output → still processing
+    if upload_path.exists():
+        return STATE_PROCESSING, 5.0, "Processing started.", None
+
+    return None, 0.0, "", None
+
+
+def _get_celery_job_state(job_id: str):
+    """Check Celery AsyncResult state (if Celery is configured)."""
+    try:
+        from celery.result import AsyncResult
+    except Exception:
+        return None, 0.0, ""
+
+    try:
+        result = AsyncResult(job_id)
+        state = result.state
+        meta = result.info or {}
+
+        if state == "PENDING":
+            return STATE_PENDING, 0.0, "Waiting for worker."
+        elif state == "STARTED":
+            return STATE_PROCESSING, meta.get("progress", 0.0), meta.get("message", "")
+        elif state == "SUCCESS":
+            return STATE_DONE, 100.0, "Complete."
+        elif state == "FAILURE":
+            return STATE_FAILED, 0.0, str(result.info)
+        else:
+            return state.lower(), 0.0, ""
+
+    except Exception as exc:
+        logger.debug(f"Celery state check failed: {exc}")
+        return None, 0.0, ""
+
+
+async def _revoke_celery_job(job_id: str) -> None:
+    """Revoke a Celery task by ID (best-effort)."""
+    try:
+        from celery.result import AsyncResult
+        from celery.task.control import revoke
+    except Exception:
+        return
+
+    try:
+        revoke(job_id, terminate=False)
+    except Exception as exc:
+        logger.debug(f"Celery revocation failed: {exc}")
