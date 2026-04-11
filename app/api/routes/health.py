@@ -10,10 +10,9 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 from app.config.settings import settings
-from app.api.security import require_api_key
 from app.utils.logger import get_logger
 
-router = APIRouter(dependencies=[Depends(require_api_key)])
+router = APIRouter()
 logger = get_logger(__name__)
 
 _START_TIME = time.time()

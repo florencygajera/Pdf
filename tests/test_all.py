@@ -30,7 +30,7 @@ def client():
     """FastAPI test client."""
     from app.main import app
 
-    return TestClient(app)
+    return TestClient(app, headers={"X-API-Key": "test-api-key"})
 
 
 @pytest.fixture
@@ -651,3 +651,15 @@ startxref
         result = remove_noise_lines(lines)
         # All three should survive (they have alphanumeric characters)
         assert len(result) == 3
+
+
+class TestSecurityConfig:
+    def test_production_rejects_placeholder_secret_key(self):
+        from app.config.settings import Settings
+
+        with pytest.raises(ValueError, match="SECRET_KEY"):
+            Settings(
+                ENVIRONMENT="production",
+                SECRET_KEY="change-me-in-production",
+                API_KEY="test-api-key",
+            )

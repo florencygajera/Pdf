@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -149,6 +149,17 @@ class Settings(BaseSettings):
     # ── Rate Limiting ──────────────────────────────────────────────────────
     RATE_LIMIT_UPLOAD: str = Field(default="10/minute")
     RATE_LIMIT_EXTRACT: str = Field(default="30/minute")
+
+    @model_validator(mode="after")
+    def validate_security_config(self):
+        if self.ENVIRONMENT.lower() == "production":
+            if self.SECRET_KEY == "change-me-in-production":
+                raise ValueError(
+                    "SECRET_KEY must be set to a unique value in production."
+                )
+            if not self.API_KEY:
+                raise ValueError("API_KEY must be set in production.")
+        return self
 
     @field_validator("DEBUG", "TESTING", "OCR_USE_GPU", "OCR_ENABLE_MKLDNN", mode="before")
     @classmethod
