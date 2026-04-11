@@ -18,7 +18,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
@@ -86,6 +86,11 @@ def _run_with_progress_lock(
         progress_callback(step, total, stage)
 
 
+def _should_extract_tables_for_page(page_info: Dict[str, Any]) -> bool:
+    """Skip blank, near-empty, and image-only pages before table extraction."""
+    return len((page_info.get("text") or "").strip()) >= 20
+
+
 def _process_digital_pages(
     pdf_path: Path,
     doc_classification: DocumentClassification,
@@ -115,7 +120,7 @@ def _process_digital_pages(
     table_targets = [
         page_info
         for page_info in page_data
-        if len(page_info.get("text", "").strip()) >= 20
+        if _should_extract_tables_for_page(page_info)
     ]
     if table_targets:
         page_numbers = [page_info["page_number"] for page_info in table_targets]
@@ -214,8 +219,13 @@ def run_extraction_pipeline(
             progress_callback,
             pdf_bytes,
         )
-        digital_results = digital_future.result()
-        scanned_results = scanned_future.result()
+        digital_results: List[Dict[str, Any]] = []
+        scanned_results: List[Dict[str, Any]] = []
+        for future in as_completed([digital_future, scanned_future]):
+            if future is digital_future:
+                digital_results = future.result()
+            else:
+                scanned_results = future.result()
 
     all_page_results: List[Dict] = sorted(
         digital_results + scanned_results,

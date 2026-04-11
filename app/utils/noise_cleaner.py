@@ -15,8 +15,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
+from collections import deque
 from difflib import SequenceMatcher
-from typing import List, Set
+from typing import Deque, List, Set, Tuple
 
 from app.config.constants import NOISE_PATTERNS
 from app.utils.logger import get_logger
@@ -88,12 +89,18 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _fuzzy_fingerprint(text: str) -> Tuple[int, str, str]:
+    """Cheap pre-filter for near-duplicate candidates."""
+    return (len(text), text[:12], text[-12:])
+
+
 def remove_duplicate_lines(
     lines: List[str],
     similarity_threshold: float = 0.92,
 ) -> List[str]:
     seen_exact: Set[str] = set()
-    seen_fuzzy: List[str] = []
+    seen_fuzzy: Deque[str] = deque(maxlen=10)
+    seen_fingerprints: Set[Tuple[int, str, str]] = set()
     result: List[str] = []
     for line in lines:
         normalized = clean_line(line)
@@ -105,14 +112,21 @@ def remove_duplicate_lines(
             continue
 
         if len(key) > 40:
-            recent_window = seen_fuzzy[-10:]
-            if any(_similarity(key, prev) >= similarity_threshold for prev in recent_window):
+            fingerprint = _fuzzy_fingerprint(key)
+            if fingerprint in seen_fingerprints:
+                logger.debug("Duplicate removed: %r", normalized[:80])
+                continue
+
+            if any(
+                abs(len(key) - len(prev)) <= 12
+                and _similarity(key, prev) >= similarity_threshold
+                for prev in seen_fuzzy
+            ):
                 logger.debug("Duplicate removed: %r", normalized[:80])
                 continue
 
             seen_fuzzy.append(key)
-            if len(seen_fuzzy) > 10:
-                seen_fuzzy = seen_fuzzy[-10:]
+            seen_fingerprints.add(fingerprint)
 
         seen_exact.add(key)
         result.append(normalized)

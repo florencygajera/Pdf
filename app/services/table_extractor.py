@@ -8,6 +8,7 @@ in modern environments.
 """
 
 from io import BytesIO
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -76,6 +77,27 @@ def _pdfplumber_extract_many(
         return {page_num: [] for page_num in page_numbers}
 
 
+@lru_cache(maxsize=8)
+def _pdfplumber_extract_from_bytes_cached(pdf_bytes: bytes) -> Dict[int, List[Dict]]:
+    """Extract all tables from a PDF byte stream once and cache the results."""
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber not installed.")
+        return {}
+
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            extracted_by_page: Dict[int, List[Dict]] = {}
+            for index, page in enumerate(pdf.pages, start=1):
+                raw_tables = page.extract_tables() or []
+                extracted_by_page[index] = _build_table_records(index, raw_tables)
+            return extracted_by_page
+    except Exception as exc:
+        logger.error("pdfplumber(bytes) failed: %s", exc)
+        return {}
+
+
 def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
     """
     Digital PDF fallback using pdfplumber only.
@@ -89,7 +111,7 @@ def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
 
 def _pdfplumber_extract_from_bytes(pdf_bytes: bytes, page_num: int) -> List[Dict]:
     """Byte-based pdfplumber extraction to avoid repeated disk reads."""
-    extracted = _pdfplumber_extract_many(BytesIO(pdf_bytes), [page_num])
+    extracted = _pdfplumber_extract_from_bytes_cached(pdf_bytes)
     return extracted.get(page_num, [])
 
 
@@ -100,7 +122,8 @@ def extract_tables_digital_batch(
 ) -> Dict[int, List[Dict[str, Any]]]:
     """Extract tables for multiple pages using a single pdfplumber open call."""
     if pdf_bytes is not None:
-        return _pdfplumber_extract_many(BytesIO(pdf_bytes), page_numbers)
+        extracted = _pdfplumber_extract_from_bytes_cached(pdf_bytes)
+        return {page_num: extracted.get(page_num, []) for page_num in page_numbers}
     return _pdfplumber_extract_many(str(pdf_path), page_numbers)
 
 

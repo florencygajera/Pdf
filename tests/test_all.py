@@ -120,6 +120,13 @@ class TestSorting:
         assert [r[1][0] for r in sorted_low_dpi] == ["Upper", "Lower"]
         assert [r[1][0] for r in sorted_high_dpi] == ["Lower", "Upper"]
 
+    def test_default_ocr_line_tolerance_matches_150_dpi(self):
+        from app.config.constants import DEFAULT_OCR_RENDER_DPI, LINE_Y_TOLERANCE_OCR, line_y_tolerance_ocr
+
+        assert DEFAULT_OCR_RENDER_DPI == 150
+        assert LINE_Y_TOLERANCE_OCR == line_y_tolerance_ocr(150)
+        assert LINE_Y_TOLERANCE_OCR == 4
+
     def test_merge_hyphenated_lines(self):
         from app.utils.sorting import merge_hyphenated_lines
 
@@ -289,6 +296,38 @@ class TestValidator:
         assert "sentence continuation" in stitched[0]["text"]
         assert stitched[1]["text"] == ""
 
+    def test_language_detection_uses_truncated_sample(self, monkeypatch):
+        from app.services.validator import validate_extraction_result
+
+        captured = {"text": None}
+
+        def fake_detect(text):
+            captured["text"] = text
+            return "en"
+
+        monkeypatch.setitem(sys.modules, "langdetect", types.SimpleNamespace(detect=fake_detect))
+
+        pages = [
+            {
+                "page_number": 1,
+                "text": "A" * 2000,
+                "warnings": [],
+                "confidence": None,
+            },
+            {
+                "page_number": 2,
+                "text": "B" * 2000,
+                "warnings": [],
+                "confidence": None,
+            },
+        ]
+
+        report = validate_extraction_result(pages, [])
+
+        assert report["languages"] == ["en"]
+        assert captured["text"] is not None
+        assert len(captured["text"]) <= 500
+
     def test_table_validation_missing_headers(self):
         from app.services.validator import validate_table
 
@@ -367,6 +406,38 @@ class TestDigitalExtractor:
 
 
 class TestPerformanceFixes:
+    def test_pdfplumber_bytes_path_caches_open(self, monkeypatch):
+        from app.services.table_extractor import _pdfplumber_extract_from_bytes
+
+        open_calls = {"count": 0}
+
+        class FakePage:
+            def extract_tables(self):
+                return [[["H1", "H2"], ["a", "b"]]]
+
+        class FakePDF:
+            def __init__(self):
+                self.pages = [FakePage(), FakePage()]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_open(_source):
+            open_calls["count"] += 1
+            return FakePDF()
+
+        monkeypatch.setitem(sys.modules, "pdfplumber", types.SimpleNamespace(open=fake_open))
+
+        first = _pdfplumber_extract_from_bytes(b"%PDF-1.4 fake")
+        second = _pdfplumber_extract_from_bytes(b"%PDF-1.4 fake")
+
+        assert open_calls["count"] == 1
+        assert first == second
+        assert first[0]["headers"] == ["H1", "H2"]
+
     def test_pdfplumber_batch_opens_once(self, temp_pdf, monkeypatch):
         from app.services.table_extractor import extract_tables_digital_batch
 
@@ -452,6 +523,118 @@ class TestPerformanceFixes:
         assert result["edge_ratio"] == 0.0
         assert result["needs_full_preprocess"] is True
 
+    def test_pipeline_runs_branches_concurrently(self, monkeypatch, tmp_path):
+        import time
+        from types import SimpleNamespace
+        from app.pipelines import extraction_pipeline
+
+        def fake_detect_pdf_type_from_bytes(*args, **kwargs):
+            return SimpleNamespace(
+                total_pages=2,
+                overall_type="mixed",
+                scanned_page_count=1,
+                pages=[
+                    SimpleNamespace(page_number=1, pdf_type="digital"),
+                    SimpleNamespace(page_number=2, pdf_type="scanned"),
+                ],
+            )
+
+        def fake_digital(*args, **kwargs):
+            time.sleep(0.5)
+            return [{"page_number": 1, "text": "digital", "tables": [], "confidence": 0.9, "warnings": []}]
+
+        def fake_scanned(*args, **kwargs):
+            time.sleep(0.5)
+            return [{"page_number": 2, "text": "scanned", "tables": [], "confidence": 0.8, "warnings": []}]
+
+        monkeypatch.setattr(extraction_pipeline, "detect_pdf_type_from_bytes", fake_detect_pdf_type_from_bytes)
+        monkeypatch.setattr(extraction_pipeline, "_process_digital_pages", fake_digital)
+        monkeypatch.setattr(extraction_pipeline, "_process_scanned_pages", fake_scanned)
+        monkeypatch.setattr(extraction_pipeline, "clean_pages", lambda pages: pages)
+        monkeypatch.setattr(extraction_pipeline, "clean_text_block", lambda text: text)
+        monkeypatch.setattr(
+            extraction_pipeline,
+            "validate_extraction_result",
+            lambda pages, tables: {
+                "overall_confidence": 0.85,
+                "languages": ["en"],
+                "table_issues": [],
+                "page_warnings": {},
+                "quality": "high",
+                "page_results": pages,
+            },
+        )
+
+        pdf_path = tmp_path / "dummy.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4")
+
+        start = time.perf_counter()
+        extraction_pipeline.run_extraction_pipeline(pdf_path, "job-1", pdf_bytes=b"%PDF-1.4")
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.9
+
+    def test_digital_table_extraction_skips_blank_pages(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        from app.pipelines import extraction_pipeline
+
+        captured = {"pages": None}
+
+        def fake_extract_digital_pdf(*args, **kwargs):
+            return [
+                {"page_number": 1, "text": "", "tables": [], "confidence": 0.95, "warnings": []},
+                {"page_number": 2, "text": "   ", "tables": [], "confidence": 0.95, "warnings": []},
+                {"page_number": 3, "text": "This page has enough text to qualify.", "tables": [], "confidence": 0.95, "warnings": []},
+            ]
+
+        def fake_extract_tables_digital_batch(pdf_path, page_numbers, pdf_bytes=None):
+            captured["pages"] = page_numbers
+            return {page_num: [] for page_num in page_numbers}
+
+        monkeypatch.setattr(
+            extraction_pipeline,
+            "extract_digital_pdf",
+            fake_extract_digital_pdf,
+        )
+        monkeypatch.setattr(
+            extraction_pipeline,
+            "extract_tables_digital_batch",
+            fake_extract_tables_digital_batch,
+        )
+
+        page_data = extraction_pipeline._process_digital_pages(
+            tmp_path / "dummy.pdf",
+            SimpleNamespace(
+                pages=[
+                    SimpleNamespace(page_number=1, pdf_type="digital"),
+                    SimpleNamespace(page_number=2, pdf_type="digital"),
+                    SimpleNamespace(page_number=3, pdf_type="digital"),
+                ]
+            ),
+            pdf_bytes=b"%PDF-1.4",
+        )
+
+        assert captured["pages"] == [3]
+        assert page_data[2]["tables"] == []
+
+    def test_ocr_multiprocessing_uses_fork_on_linux(self, monkeypatch):
+        from app.services import ocr_extractor
+
+        captured = {"method": None}
+
+        def fake_get_context(method):
+            captured["method"] = method
+            return SimpleNamespace(method=method)
+
+        monkeypatch.setattr(ocr_extractor.os, "name", "posix", raising=False)
+        monkeypatch.setattr(ocr_extractor.sys, "platform", "linux", raising=False)
+        monkeypatch.setattr(ocr_extractor.mp, "get_context", fake_get_context)
+
+        ctx = ocr_extractor._get_multiprocessing_context()
+
+        assert captured["method"] == "fork"
+        assert ctx.method == "fork"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Layout Engine Tests
@@ -504,6 +687,13 @@ class TestAPIRoutes:
         resp = client.get("/healthz")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
+
+    def test_health_requires_api_key(self):
+        from app.main import app
+
+        unauth_client = TestClient(app)
+        resp = unauth_client.get("/healthz")
+        assert resp.status_code == 401
 
     def test_upload_invalid_file_type(self, client):
         resp = client.post(

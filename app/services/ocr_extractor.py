@@ -153,6 +153,13 @@ def _get_ocr_pool() -> _PaddleOCRPool:
         return _ocr_pool
 
 
+def _get_multiprocessing_context():
+    """Prefer fork on POSIX systems to avoid spawn re-import overhead."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return mp.get_context("spawn")
+    return mp.get_context("fork")
+
+
 def _ocr_worker_initializer() -> None:
     """Initialize Paddle runtime and preload the shared OCR pool inside each worker."""
     _configure_paddle_runtime()
@@ -174,13 +181,9 @@ def _get_ocr_executor():
         if _ocr_executor is not None:
             return _ocr_executor
 
-        if os.name == "nt" or sys.platform == "darwin":
-            ctx = mp.get_context("spawn")
-        else:
-            ctx = mp.get_context("fork")
         _ocr_executor = ProcessPoolExecutor(
             max_workers=max(1, settings.effective_ocr_chunk_workers),
-            mp_context=ctx,
+            mp_context=_get_multiprocessing_context(),
             initializer=_ocr_worker_initializer,
         )
         return _ocr_executor

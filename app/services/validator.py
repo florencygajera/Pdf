@@ -66,7 +66,7 @@ def stitch_page_boundaries(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     If page N ends without a sentence terminator and page N+1 starts with lowercase,
     merge the tail of page N with the head of page N+1.
     """
-    pages = [dict(page) for page in pages]
+    pages = [page.copy() for page in pages]
     if len(pages) <= 1:
         return pages
 
@@ -193,17 +193,16 @@ def validate_extraction_result(
 
     overall_conf = compute_confidence_score(page_results)
 
-    sample_parts: List[str] = []
-    sampled_chars = 0
+    sample_text = ""
     for page in page_results:
         chunk = (page.get("text") or "").strip()
         if not chunk:
             continue
-        sample_parts.append(chunk)
-        sampled_chars += len(chunk)
-        if sampled_chars >= 500:
+        if len(sample_text) >= 500:
             break
-    language = _detect_language(" ".join(sample_parts))
+        remaining = 500 - len(sample_text)
+        sample_text += (" " if sample_text else "") + chunk[:remaining]
+    language = _detect_language(sample_text[:500])
 
     table_issues = []
     for tbl in tables:
