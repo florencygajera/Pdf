@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -157,19 +157,19 @@ class Settings(BaseSettings):
     RATE_LIMIT_UPLOAD: str = Field(default="10/minute")
     RATE_LIMIT_EXTRACT: str = Field(default="30/minute")
 
-    @field_validator("SECRET_KEY", mode="after")
-    @classmethod
-    def warn_insecure_secret(cls, v):
+    @model_validator(mode="after")
+    def warn_insecure_secret(self):
         import os
 
+        env = os.environ.get("ENVIRONMENT", self.ENVIRONMENT)
         if (
-            v == "change-me-in-production"
-            and os.environ.get("ENVIRONMENT", "development") == "production"
+            self.SECRET_KEY == "change-me-in-production"
+            and (env == "production" or self.ENVIRONMENT.lower() == "production")
         ):
             raise ValueError(
                 "SECRET_KEY must be changed from the default before running in production."
             )
-        return v
+        return self
 
     @field_validator(
         "DEBUG", "TESTING", "OCR_USE_GPU", "OCR_ENABLE_MKLDNN", mode="before"

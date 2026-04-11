@@ -37,7 +37,7 @@ from app.models.response_model import (
 )
 from app.services.digital_extractor import extract_digital_pdf
 from app.services.noise_cleaner import clean_pages, clean_text_block
-from app.services.ocr_extractor import extract_ocr_pdf
+from app.services.ocr_extractor import extract_ocr_pdf, extract_ocr_pdf_from_bytes
 from app.services.pdf_detector import DocumentClassification, detect_pdf_type_from_bytes
 
 # FIX: import the new batch function instead of per-page extract_tables_digital
@@ -169,11 +169,18 @@ def _process_scanned_pages(
         len(scanned_page_nums),
     )
 
-    results = extract_ocr_pdf(
-        pdf_path,
-        page_numbers=scanned_page_nums,
-        dpi=settings.effective_ocr_dpi(len(scanned_page_nums)),
-    )
+    if pdf_bytes:
+        results = extract_ocr_pdf_from_bytes(
+            pdf_bytes,
+            page_numbers=scanned_page_nums,
+            dpi=settings.effective_ocr_dpi(len(scanned_page_nums)),
+        )
+    else:
+        results = extract_ocr_pdf(
+            pdf_path,
+            page_numbers=scanned_page_nums,
+            dpi=settings.effective_ocr_dpi(len(scanned_page_nums)),
+        )
 
     _run_with_progress_lock(progress_callback, progress_lock, 1, 1, "ocr")
     return sorted(results, key=lambda p: p.get("page_number", 0))

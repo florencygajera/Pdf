@@ -130,7 +130,9 @@ def flag_low_quality_pages(
     Add warning flags to pages with poor extraction quality.
     """
     for page in page_results:
-        conf = page.get("confidence", 1.0)
+        conf = page.get("confidence")
+        if conf is None:
+            conf = 1.0
         text = page.get("text", "")
         warnings = page.setdefault("warnings", [])
 
