@@ -9,7 +9,7 @@ in modern environments.
 
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -23,6 +23,59 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _build_table_records(page_num: int, raw_tables: List[List[List[Any]]]) -> List[Dict]:
+    extracted: List[Dict] = []
+    for i, tbl in enumerate(raw_tables):
+        if not tbl or len(tbl) < MIN_TABLE_ROWS:
+            continue
+        if not tbl[0] or len(tbl[0]) < MIN_TABLE_COLS:
+            continue
+
+        headers = [str(c) if c else "" for c in tbl[0]]
+        rows = [[str(c) if c else "" for c in row] for row in tbl[1:]]
+
+        extracted.append(
+            {
+                "page": page_num,
+                "table_index": i,
+                "headers": headers,
+                "rows": rows,
+                "extraction_method": "pdfplumber",
+                "accuracy": None,
+            }
+        )
+
+    return extracted
+
+
+def _pdfplumber_extract_many(
+    pdf_source: Union[Path, BytesIO, str],
+    page_numbers: List[int],
+) -> Dict[int, List[Dict]]:
+    """Open pdfplumber once and extract tables for the requested pages."""
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber not installed.")
+        return {}
+
+    try:
+        with pdfplumber.open(pdf_source) as pdf:
+            extracted_by_page: Dict[int, List[Dict]] = {}
+            total_pages = len(pdf.pages)
+            for page_num in page_numbers:
+                if page_num < 1 or page_num > total_pages:
+                    extracted_by_page[page_num] = []
+                    continue
+                page = pdf.pages[page_num - 1]
+                raw_tables = page.extract_tables() or []
+                extracted_by_page[page_num] = _build_table_records(page_num, raw_tables)
+            return extracted_by_page
+    except Exception as exc:
+        logger.error("pdfplumber failed for pages %s: %s", page_numbers, exc)
+        return {page_num: [] for page_num in page_numbers}
+
+
 def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
     """
     Digital PDF fallback using pdfplumber only.
@@ -30,86 +83,25 @@ def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
     This keeps the extraction path stable and avoids the legacy dependency
     chain that was emitting deprecation warnings.
     """
-    try:
-        import pdfplumber
-    except ImportError:
-        logger.warning("pdfplumber not installed.")
-        return []
-
-    try:
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            if page_num > len(pdf.pages):
-                return []
-            page = pdf.pages[page_num - 1]
-            raw_tables = page.extract_tables() or []
-    except Exception as exc:
-        logger.error("pdfplumber failed on page %s: %s", page_num, exc)
-        return []
-
-    extracted: List[Dict] = []
-    for i, tbl in enumerate(raw_tables):
-        if not tbl or len(tbl) < MIN_TABLE_ROWS:
-            continue
-        if not tbl[0] or len(tbl[0]) < MIN_TABLE_COLS:
-            continue
-
-        headers = [str(c) if c else "" for c in tbl[0]]
-        rows = [[str(c) if c else "" for c in row] for row in tbl[1:]]
-
-        extracted.append(
-            {
-                "page": page_num,
-                "table_index": i,
-                "headers": headers,
-                "rows": rows,
-                "extraction_method": "pdfplumber",
-                "accuracy": None,
-            }
-        )
-
-    return extracted
+    extracted = _pdfplumber_extract_many(str(pdf_path), [page_num])
+    return extracted.get(page_num, [])
 
 
 def _pdfplumber_extract_from_bytes(pdf_bytes: bytes, page_num: int) -> List[Dict]:
     """Byte-based pdfplumber extraction to avoid repeated disk reads."""
-    try:
-        import pdfplumber
-    except ImportError:
-        logger.warning("pdfplumber not installed.")
-        return []
+    extracted = _pdfplumber_extract_many(BytesIO(pdf_bytes), [page_num])
+    return extracted.get(page_num, [])
 
-    try:
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            if page_num > len(pdf.pages):
-                return []
-            page = pdf.pages[page_num - 1]
-            raw_tables = page.extract_tables() or []
-    except Exception as exc:
-        logger.error("pdfplumber(bytes) failed on page %s: %s", page_num, exc)
-        return []
 
-    extracted: List[Dict] = []
-    for i, tbl in enumerate(raw_tables):
-        if not tbl or len(tbl) < MIN_TABLE_ROWS:
-            continue
-        if not tbl[0] or len(tbl[0]) < MIN_TABLE_COLS:
-            continue
-
-        headers = [str(c) if c else "" for c in tbl[0]]
-        rows = [[str(c) if c else "" for c in row] for row in tbl[1:]]
-
-        extracted.append(
-            {
-                "page": page_num,
-                "table_index": i,
-                "headers": headers,
-                "rows": rows,
-                "extraction_method": "pdfplumber",
-                "accuracy": None,
-            }
-        )
-
-    return extracted
+def extract_tables_digital_batch(
+    pdf_path: Path,
+    page_numbers: List[int],
+    pdf_bytes: Optional[bytes] = None,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Extract tables for multiple pages using a single pdfplumber open call."""
+    if pdf_bytes is not None:
+        return _pdfplumber_extract_many(BytesIO(pdf_bytes), page_numbers)
+    return _pdfplumber_extract_many(str(pdf_path), page_numbers)
 
 
 def extract_tables_digital(

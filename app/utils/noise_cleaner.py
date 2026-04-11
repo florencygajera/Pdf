@@ -104,13 +104,17 @@ def remove_duplicate_lines(
         if key in seen_exact:
             continue
 
-        recent_window = seen_fuzzy[-50:]
-        if any(_similarity(key, prev) >= similarity_threshold for prev in recent_window):
-            logger.debug("Duplicate removed: %r", normalized[:80])
-            continue
+        if len(key) > 40:
+            recent_window = seen_fuzzy[-10:]
+            if any(_similarity(key, prev) >= similarity_threshold for prev in recent_window):
+                logger.debug("Duplicate removed: %r", normalized[:80])
+                continue
+
+            seen_fuzzy.append(key)
+            if len(seen_fuzzy) > 10:
+                seen_fuzzy = seen_fuzzy[-10:]
 
         seen_exact.add(key)
-        seen_fuzzy.append(key)
         result.append(normalized)
     return result
 

@@ -11,7 +11,9 @@ Optimized for Windows + Celery thread pools:
 from __future__ import annotations
 
 import gc
+import os
 import multiprocessing as mp
+import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -172,7 +174,10 @@ def _get_ocr_executor():
         if _ocr_executor is not None:
             return _ocr_executor
 
-        ctx = mp.get_context("spawn")
+        if os.name == "nt" or sys.platform == "darwin":
+            ctx = mp.get_context("spawn")
+        else:
+            ctx = mp.get_context("fork")
         _ocr_executor = ProcessPoolExecutor(
             max_workers=max(1, settings.effective_ocr_chunk_workers),
             mp_context=ctx,

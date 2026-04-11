@@ -9,7 +9,9 @@ Run: pytest tests/ -v --cov=app --cov-report=term-missing
 import io
 import json
 import os
+import sys
 import tempfile
+import types
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
@@ -323,6 +325,77 @@ class TestDigitalExtractor:
         bad.write_bytes(b"garbage")
         with pytest.raises(ValueError):
             extract_digital_pdf(bad)
+
+
+class TestPerformanceFixes:
+    def test_pdfplumber_batch_opens_once(self, temp_pdf, monkeypatch):
+        from app.services.table_extractor import extract_tables_digital_batch
+
+        open_calls = {"count": 0}
+
+        class FakePage:
+            def __init__(self, tables):
+                self._tables = tables
+
+            def extract_tables(self):
+                return self._tables
+
+        class FakePDF:
+            def __init__(self):
+                self.pages = [
+                    FakePage([[
+                        ["H1", "H2"],
+                        ["a", "b"],
+                    ]]),
+                    FakePage([[
+                        ["X", "Y"],
+                        ["1", "2"],
+                    ]]),
+                ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_open(_source):
+            open_calls["count"] += 1
+            return FakePDF()
+
+        fake_module = types.SimpleNamespace(open=fake_open)
+        monkeypatch.setitem(sys.modules, "pdfplumber", fake_module)
+
+        result = extract_tables_digital_batch(temp_pdf, [1, 2], pdf_bytes=b"unused")
+
+        assert open_calls["count"] == 1
+        assert 1 in result and 2 in result
+        assert result[1][0]["headers"] == ["H1", "H2"]
+        assert result[2][0]["headers"] == ["X", "Y"]
+
+    def test_stitch_page_boundaries_is_shallow_copy(self):
+        from app.services.validator import stitch_page_boundaries
+
+        pages = [
+            {
+                "page_number": 1,
+                "text": "The report starts with an intro",
+                "warnings": [],
+                "raw_results": [{"box": [1, 2, 3, 4]}],
+            },
+            {
+                "page_number": 2,
+                "text": "continues on the next page.",
+                "warnings": [],
+                "raw_results": [{"box": [5, 6, 7, 8]}],
+            },
+        ]
+
+        stitched = stitch_page_boundaries(pages)
+
+        assert pages[0]["text"] == "The report starts with an intro"
+        assert stitched[0]["raw_results"] is pages[0]["raw_results"]
+        assert stitched[0]["warnings"] is not pages[0]["warnings"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

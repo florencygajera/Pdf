@@ -18,7 +18,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
@@ -39,7 +39,7 @@ from app.services.digital_extractor import extract_digital_pdf
 from app.services.noise_cleaner import clean_pages, clean_text_block
 from app.services.ocr_extractor import extract_ocr_pdf
 from app.services.pdf_detector import DocumentClassification, detect_pdf_type_from_bytes
-from app.services.table_extractor import extract_tables_digital
+from app.services.table_extractor import extract_tables_digital_batch
 from app.services.validator import validate_extraction_result
 from app.utils.logger import get_logger
 
@@ -86,18 +86,6 @@ def _run_with_progress_lock(
         progress_callback(step, total, stage)
 
 
-def _extract_digital_tables_for_page(
-    pdf_path: Path,
-    pdf_bytes: bytes,
-    page_num: int,
-) -> List[Dict[str, Any]]:
-    try:
-        return extract_tables_digital(pdf_path, page_num, pdf_bytes=pdf_bytes)
-    except Exception as exc:
-        logger.warning("Table extraction failed for page %s: %s", page_num, exc)
-        return []
-
-
 def _process_digital_pages(
     pdf_path: Path,
     doc_classification: DocumentClassification,
@@ -124,30 +112,26 @@ def _process_digital_pages(
 
     page_data = extract_digital_pdf(pdf_path, page_numbers=digital_page_nums, pdf_bytes=pdf_bytes)
 
-    table_targets = [page_info for page_info in page_data if page_info.get("text", "").strip()]
+    table_targets = [
+        page_info
+        for page_info in page_data
+        if len(page_info.get("text", "").strip()) >= 20
+    ]
     if table_targets:
-        table_workers = min(4, len(table_targets)) if len(table_targets) > 1 else 1
-        if table_workers > 1:
-            with ThreadPoolExecutor(max_workers=table_workers) as table_pool:
-                table_futures = {
-                    table_pool.submit(
-                        _extract_digital_tables_for_page,
-                        pdf_path,
-                        pdf_bytes,
-                        page_info["page_number"],
-                    ): page_info
-                    for page_info in table_targets
-                }
-                for table_future in as_completed(table_futures):
-                    page_info = table_futures[table_future]
-                    page_info["tables"] = table_future.result()
-                    page_info["confidence"] = 0.95
-        else:
-            for page_info in table_targets:
-                page_info["tables"] = _extract_digital_tables_for_page(
-                    pdf_path, pdf_bytes, page_info["page_number"]
-                )
-                page_info["confidence"] = 0.95
+        page_numbers = [page_info["page_number"] for page_info in table_targets]
+        try:
+            tables_by_page = extract_tables_digital_batch(
+                pdf_path,
+                page_numbers,
+                pdf_bytes=pdf_bytes,
+            )
+        except Exception as exc:
+            logger.warning("Batch table extraction failed: %s", exc)
+            tables_by_page = {}
+
+        for page_info in table_targets:
+            page_info["tables"] = tables_by_page.get(page_info["page_number"], [])
+            page_info["confidence"] = 0.95
 
     for page_info in page_data:
         page_info.setdefault("tables", [])
@@ -215,18 +199,23 @@ def run_extraction_pipeline(
         raise ValueError(f"PDF validation failed: {exc}") from exc
 
     logger.info("[%s] Step 2: Extracting content", job_id)
-    digital_results = _process_digital_pages(
-        pdf_path,
-        doc_classification,
-        progress_callback,
-        pdf_bytes,
-    )
-    scanned_results = _process_scanned_pages(
-        pdf_path,
-        doc_classification,
-        progress_callback,
-        pdf_bytes,
-    )
+    with ThreadPoolExecutor(max_workers=2) as outer_pool:
+        digital_future = outer_pool.submit(
+            _process_digital_pages,
+            pdf_path,
+            doc_classification,
+            progress_callback,
+            pdf_bytes,
+        )
+        scanned_future = outer_pool.submit(
+            _process_scanned_pages,
+            pdf_path,
+            doc_classification,
+            progress_callback,
+            pdf_bytes,
+        )
+        digital_results = digital_future.result()
+        scanned_results = scanned_future.result()
 
     all_page_results: List[Dict] = sorted(
         digital_results + scanned_results,

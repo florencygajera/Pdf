@@ -12,16 +12,14 @@ Checks:
 """
 
 import re
-import copy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from app.config.constants import HIGH_CONFIDENCE, LOW_CONFIDENCE, MEDIUM_CONFIDENCE
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Sentence ending characters
-_SENTENCE_ENDERS = re.compile(r"[.!?।॥]$")  # includes Hindi/Devanagari punctuation
+_SENTENCE_ENDERS = re.compile(r"[.!?\u0964\u0965]$")
 
 
 def _detect_language(text: str) -> str:
@@ -36,7 +34,10 @@ def _detect_language(text: str) -> str:
         from langdetect import detect, DetectorFactory
 
         DetectorFactory.seed = 42
-        return detect(text)
+        sample = text.strip()[:500]
+        if len(sample) < 20:
+            return "unknown"
+        return detect(sample)
     except ImportError:
         logger.debug("langdetect not installed. Skipping language detection.")
         return "unknown"
@@ -50,7 +51,7 @@ def _sentence_ends_properly(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return True
-    return bool(_SENTENCE_ENDERS.search(stripped[-1]))
+    return bool(_SENTENCE_ENDERS.search(stripped))
 
 
 def stitch_page_boundaries(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -59,7 +60,7 @@ def stitch_page_boundaries(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     If page N ends without a sentence terminator and page N+1 starts with lowercase,
     merge the tail of page N with the head of page N+1.
     """
-    pages = copy.deepcopy(pages)
+    pages = [dict(page) for page in pages]
     if len(pages) <= 1:
         return pages
 
@@ -71,16 +72,16 @@ def stitch_page_boundaries(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         last_char = curr_text[-1] if curr_text else ""
-        first_word = next_text.split()[0] if next_text.split() else ""
+        next_words = next_text.split()
+        first_word = next_words[0] if next_words else ""
 
-        # If current page doesn't end with punctuation and next starts lowercase
-        if last_char not in ".!?।॥\n" and first_word and first_word[0].islower():
+        if last_char not in ".!?\u0964\u0965\n" and first_word and first_word[0].islower():
             pages[i]["text"] = curr_text + " " + next_text
             pages[i + 1]["text"] = ""
-            pages[i].setdefault("warnings", []).append(
-                f"Page boundary stitch: merged with page {i + 2}"
-            )
-            logger.debug(f"Stitched page boundary {i + 1} → {i + 2}")
+            warnings = list(pages[i].get("warnings", []))
+            warnings.append(f"Page boundary stitch: merged with page {i + 2}")
+            pages[i]["warnings"] = warnings
+            logger.debug("Stitched page boundary %s -> %s", i + 1, i + 2)
 
     return pages
 
@@ -102,7 +103,6 @@ def compute_confidence_score(
         if conf is not None:
             scores.append(float(conf))
         elif page.get("text"):
-            # Digital page — high confidence if text present
             scores.append(0.95)
         else:
             scores.append(0.0)
@@ -181,20 +181,23 @@ def validate_extraction_result(
         "quality": "high" | "medium" | "low"
       }
     """
-    # Stitch cross-page broken sentences
     page_results = stitch_page_boundaries(page_results)
-
-    # Flag low-quality pages
     page_results = flag_low_quality_pages(page_results)
 
-    # Overall confidence
     overall_conf = compute_confidence_score(page_results)
 
-    # Language detection on combined text
-    all_text = " ".join(p.get("text", "") for p in page_results)
-    language = _detect_language(all_text)
+    sample_parts: List[str] = []
+    sampled_chars = 0
+    for page in page_results:
+        chunk = (page.get("text") or "").strip()
+        if not chunk:
+            continue
+        sample_parts.append(chunk)
+        sampled_chars += len(chunk)
+        if sampled_chars >= 500:
+            break
+    language = _detect_language(" ".join(sample_parts))
 
-    # Table validation
     table_issues = []
     for tbl in tables:
         valid, issues = validate_table(tbl)
@@ -207,7 +210,6 @@ def validate_extraction_result(
                 }
             )
 
-    # Quality label
     if overall_conf >= HIGH_CONFIDENCE:
         quality = "high"
     elif overall_conf >= MEDIUM_CONFIDENCE:
@@ -215,7 +217,6 @@ def validate_extraction_result(
     else:
         quality = "low"
 
-    # Collect all page warnings
     page_warnings = {
         p.get("page_number", i + 1): p.get("warnings", [])
         for i, p in enumerate(page_results)
