@@ -6,6 +6,10 @@ Classifies each page (and the overall document) as:
   - mixed    : document contains both kinds of pages
 
 Uses PyMuPDF for fast text coverage analysis.
+
+Fixes applied:
+  M5 — _page_fallback_text_from_bytes() now opens fitz once and iterates
+        pages inside that single document, instead of reopening on every call.
 """
 
 from dataclasses import dataclass
@@ -21,6 +25,7 @@ from app.config.constants import (
 )
 from app.config.settings import settings
 from app.utils.logger import get_logger
+from app.utils.pdf_text_fallback import extract_text_from_pdf_bytes
 
 logger = get_logger(__name__)
 
@@ -48,52 +53,59 @@ class DocumentClassification:
     total_pages: int
 
 
-def _page_fallback_text_from_doc(doc: fitz.Document, page_number: int) -> str:
+def _build_fallback_text_map(pdf_bytes: bytes) -> Dict[int, str]:
     """
-    Best-effort per-page fallback text extraction.
-
-    This avoids using one whole-document fallback string for every page, which
-    can leak text from page 1 into later pages and skew classification.
+    M5 fix: open the document ONCE and extract per-page fallback text into a
+    dict keyed by 1-indexed page number. Avoids the original pattern of calling
+    fitz.open() inside a per-page loop (100 pages = 100 opens).
     """
-    if page_number < 1:
-        return ""
+    if not pdf_bytes:
+        return {}
 
-    if page_number > len(doc):
-        return ""
-
-    page = doc[page_number - 1]
+    result: Dict[int, str] = {}
     try:
-        text = page.get_text("text").strip()
-        if text:
-            return text
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception:
-        pass
+        return {}
 
     try:
-        blocks = page.get_text("blocks", sort=True)
-        parts = [
-            str(block[4]).strip()
-            for block in blocks
-            if len(block) >= 5 and str(block[4]).strip()
-        ]
-        if parts:
-            return "\n".join(parts).strip()
-    except Exception:
-        pass
+        for i, page in enumerate(doc):
+            page_number = i + 1
+            text = ""
+            try:
+                text = page.get_text("text").strip()
+            except Exception:
+                pass
 
-    try:
-        words = page.get_text("words")
-        parts = [
-            str(word[4]).strip()
-            for word in words
-            if len(word) >= 5 and str(word[4]).strip()
-        ]
-        if parts:
-            return " ".join(parts).strip()
-    except Exception:
-        pass
+            if not text:
+                try:
+                    blocks = page.get_text("blocks", sort=True)
+                    parts = [
+                        str(block[4]).strip()
+                        for block in blocks
+                        if len(block) >= 5 and str(block[4]).strip()
+                    ]
+                    text = "\n".join(parts).strip()
+                except Exception:
+                    pass
 
-    return ""
+            if not text:
+                try:
+                    words = page.get_text("words")
+                    parts = [
+                        str(word[4]).strip()
+                        for word in words
+                        if len(word) >= 5 and str(word[4]).strip()
+                    ]
+                    text = " ".join(parts).strip()
+                except Exception:
+                    pass
+
+            result[page_number] = text
+    finally:
+        doc.close()
+
+    return result
 
 
 def _compute_text_coverage(page: fitz.Page) -> float:
@@ -108,9 +120,7 @@ def _compute_text_coverage(page: fitz.Page) -> float:
 
     union_rect = None
     try:
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)[
-            "blocks"
-        ]
+        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
     except Exception:
         return 0.0
     for block in blocks:
@@ -140,7 +150,6 @@ def classify_page(
         raw_text = ""
     char_count = len(raw_text.strip())
 
-    # Check for embedded images
     image_list = page.get_images(full=False)
     has_images = len(image_list) > 0
 
@@ -175,11 +184,8 @@ def classify_page(
     if char_count < 5 and fallback_text.strip():
         char_count = max(char_count, len(fallback_text.strip()))
 
-    # Require meaningful text density. Tiny overlays, page numbers, and
-    # watermarks should not flip a scanned page to "digital".
-    is_digital = (
-        (char_count >= 20 and text_coverage > 0.005)
-        or (text_coverage > settings.DIGITAL_TEXT_THRESHOLD)
+    is_digital = (char_count >= 20 and text_coverage > 0.005) or (
+        text_coverage > settings.DIGITAL_TEXT_THRESHOLD
     )
 
     pdf_type = PDF_TYPE_DIGITAL if is_digital else PDF_TYPE_SCANNED
@@ -201,10 +207,6 @@ def classify_page(
 def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
     """
     Analyze all pages in a PDF and return the document classification.
-
-    Raises:
-        ValueError: If the file is encrypted or corrupt.
-        FileNotFoundError: If the file doesn't exist.
     """
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
@@ -217,7 +219,6 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
         raise ValueError(f"Failed to open PDF: {exc}") from exc
 
     if doc.is_encrypted:
-        # Attempt empty-password decrypt (some PDFs are protected but readable)
         ok = doc.authenticate("")
         if not ok:
             raise ValueError("PDF is password-encrypted. Provide decryption password.")
@@ -226,23 +227,24 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
     if total_pages == 0:
         raise ValueError("PDF has zero pages.")
 
-    fallback_text = ""
+    # M5 fix: build fallback map once for all pages
+    fallback_map: Dict[int, str] = {}
     if total_pages == 1:
         try:
-            with fitz.open(str(pdf_path)) as fallback_doc:
-                fallback_text = _page_fallback_text_from_doc(fallback_doc, 1)
+            fallback_map = _build_fallback_text_map(pdf_path.read_bytes())
         except Exception:
-            fallback_text = ""
+            pass
 
     try:
         page_classifications: List[PageClassification] = []
         for i, page in enumerate(doc):
-            pc = classify_page(page, page_number=i + 1, fallback_text=fallback_text)
+            fallback = fallback_map.get(i + 1, "")
+            pc = classify_page(page, page_number=i + 1, fallback_text=fallback)
             page_classifications.append(pc)
 
         if total_pages == 1 and page_classifications:
             pc = page_classifications[0]
-            rescue_text = fallback_text.strip()
+            rescue_text = fallback_map.get(1, "").strip()
             page_classifications[0] = PageClassification(
                 page_number=pc.page_number,
                 pdf_type=PDF_TYPE_DIGITAL
@@ -281,7 +283,9 @@ def detect_pdf_type(pdf_path: Path) -> DocumentClassification:
         doc.close()
 
 
-def detect_pdf_type_from_bytes(pdf_bytes: bytes, file_name: str = "pdf") -> DocumentClassification:
+def detect_pdf_type_from_bytes(
+    pdf_bytes: bytes, file_name: str = "pdf"
+) -> DocumentClassification:
     """Detect PDF type from in-memory bytes to avoid repeated disk reads."""
     if not pdf_bytes:
         raise ValueError("PDF content is empty.")
@@ -301,27 +305,25 @@ def detect_pdf_type_from_bytes(pdf_bytes: bytes, file_name: str = "pdf") -> Docu
     if total_pages == 0:
         raise ValueError("PDF has zero pages.")
 
-    fallback_text = ""
+    # M5 fix: build fallback map once for all pages (single fitz open)
+    fallback_map: Dict[int, str] = {}
     if total_pages == 1:
         try:
-            fallback_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            try:
-                fallback_text = _page_fallback_text_from_doc(fallback_doc, 1)
-            finally:
-                fallback_doc.close()
+            fallback_map = _build_fallback_text_map(pdf_bytes)
         except Exception:
-            fallback_text = ""
+            pass
 
     try:
         page_classifications: List[PageClassification] = []
         for i, page in enumerate(doc):
+            fallback = fallback_map.get(i + 1, "")
             page_classifications.append(
-                classify_page(page, page_number=i + 1, fallback_text=fallback_text)
+                classify_page(page, page_number=i + 1, fallback_text=fallback)
             )
 
         if total_pages == 1 and page_classifications:
             pc = page_classifications[0]
-            rescue_text = fallback_text.strip()
+            rescue_text = fallback_map.get(1, "").strip()
             page_classifications[0] = PageClassification(
                 page_number=pc.page_number,
                 pdf_type=PDF_TYPE_DIGITAL

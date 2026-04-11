@@ -29,6 +29,17 @@ let currentJobId = "";
 let currentResult = null;
 let currentText = "";
 let activePoll = null;
+let pollDelay = 1200;  // I8 fix: mutable delay for exponential backoff
+
+// I6, I7 fix: escape HTML to prevent XSS from PDF content injected into innerHTML
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function setBadge(el, label, state) {
   el.className = `pill ${state}`;
@@ -64,6 +75,7 @@ function resetResult() {
   currentResult = null;
   currentText = "";
   currentJobId = "";
+  pollDelay = 1200;  // I8 fix: reset backoff on clear
   jobIdEl.textContent = "No job yet";
   jobStatusEl.textContent = "Idle";
   setProgress(0);
@@ -91,8 +103,9 @@ function renderMetadata(metadata = {}) {
     ["OCR engine", metadata.ocr_engine ?? "-"],
   ];
 
+  // I7 fix: escape all values before injecting into innerHTML
   metadataEl.innerHTML = entries
-    .map(([label, value]) => `<dt>${label}</dt><dd>${value}</dd>`)
+    .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`)
     .join("");
 }
 
@@ -107,15 +120,18 @@ function renderTables(tables = []) {
       const headers = table.headers ?? [];
       const rows = table.rows ?? [];
       const title = `Table ${index + 1}`;
-      const method = table.extraction_method || "unknown";
+      const method = escapeHtml(table.extraction_method || "unknown");
+
+      // I6 fix: escape every header and cell value before injecting into innerHTML
       const head = headers.length
-        ? `<tr>${headers.map((header) => `<th>${header || "&nbsp;"}</th>`).join("")}</tr>`
+        ? `<tr>${headers.map((h) => `<th>${escapeHtml(h) || "&nbsp;"}</th>`).join("")}</tr>`
         : "<tr><th>Data</th></tr>";
+
       const body = rows.length
         ? rows
             .map(
               (row) =>
-                `<tr>${row.map((cell) => `<td>${cell || "&nbsp;"}</td>`).join("")}</tr>`
+                `<tr>${row.map((cell) => `<td>${escapeHtml(cell) || "&nbsp;"}</td>`).join("")}</tr>`
             )
             .join("")
         : '<tr><td class="empty-state">No rows available.</td></tr>';
@@ -123,7 +139,7 @@ function renderTables(tables = []) {
       return `
         <article class="table">
           <div class="table-head">
-            <strong>${title}</strong>
+            <strong>${escapeHtml(title)}</strong>
             <span class="meta">${method}</span>
           </div>
           <table class="table-grid">
@@ -217,14 +233,18 @@ function startPolling(jobId) {
   if (activePoll) {
     clearTimeout(activePoll);
   }
+  pollDelay = 1200;  // I8 fix: reset backoff for new job
 
   const tick = async () => {
     try {
       const outcome = await loadFinalResult(jobId);
       if (!outcome.done) {
-        activePoll = setTimeout(tick, 1200);
+        // I8 fix: exponential backoff — doubles every poll, capped at 10s
+        pollDelay = Math.min(pollDelay * 1.5, 10000);
+        activePoll = setTimeout(tick, pollDelay);
       } else {
         activePoll = null;
+        pollDelay = 1200;
       }
     } catch (error) {
       jobStatusEl.textContent = "failed";
@@ -284,6 +304,14 @@ dropZone.addEventListener("drop", (event) => {
   dropZone.classList.remove("dragover");
   const file = event.dataTransfer?.files?.[0];
   if (!file) return;
+
+  // I9 fix: validate file type on drop before accepting
+  if (!file.name.toLowerCase().endsWith(".pdf") && file.type !== "application/pdf") {
+    fileMeta.textContent = "Only PDF files are accepted.";
+    statusText.textContent = "Please drop a .pdf file.";
+    return;
+  }
+
   fileInput.files = event.dataTransfer.files;
   fileMeta.textContent = `${file.name} · ${prettyBytes(file.size)}`;
 });
@@ -322,11 +350,15 @@ downloadBtn.addEventListener("click", () => {
     type: "application/json",
   });
   const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `extraction-${currentJobId || "result"}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
+  // S7 fix: always revoke the object URL, even if click throws
+  try {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `extraction-${currentJobId || "result"}.json`;
+    link.click();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 });
 
 tabButtons.forEach((button) => {
@@ -340,6 +372,13 @@ form.addEventListener("submit", async (event) => {
   if (!file) {
     statusText.textContent = "Choose a PDF before uploading.";
     setBadge(apiHealth, "Missing file", "pill-warm");
+    return;
+  }
+
+  // I9 fix: validate file type on form submit too
+  if (!file.name.toLowerCase().endsWith(".pdf") && file.type !== "application/pdf") {
+    statusText.textContent = "Only PDF files are accepted.";
+    setBadge(apiHealth, "Invalid file", "pill-danger");
     return;
   }
 

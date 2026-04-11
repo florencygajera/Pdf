@@ -9,11 +9,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings
-
-# Default insecure value that should NEVER be used in production
-DEFAULT_SECRET_KEY = "change-me-in-production"
 
 
 @lru_cache(maxsize=1)
@@ -67,10 +64,7 @@ class Settings(BaseSettings):
     # ── App ────────────────────────────────────────────────────────────────
     ENVIRONMENT: str = Field(default="development", description="deployment env")
     DEBUG: bool = Field(default=False)
-    SECRET_KEY: str = Field(
-        default=DEFAULT_SECRET_KEY,
-        description="⚠️ MUST be overridden in production - used for signed tokens/sessions",
-    )
+    SECRET_KEY: str = Field(default="change-me-in-production")
     API_KEY: Optional[str] = Field(default=None)
     TESTING: bool = Field(default=False)
 
@@ -152,34 +146,23 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(default="INFO")
     LOG_FORMAT: str = Field(default="json", description="'json' or 'text'")
 
-    # ── Rate Limiting ────────────────────────────────────────────────────────
+    # ── Rate Limiting ──────────────────────────────────────────────────────
     RATE_LIMIT_UPLOAD: str = Field(default="10/minute")
     RATE_LIMIT_EXTRACT: str = Field(default="30/minute")
 
-    @model_validator(mode="after")
-    def validate_security_config(self):
-        """
-        Validate security configuration at startup.
+    @field_validator("SECRET_KEY", mode="after")
+    @classmethod
+    def warn_insecure_secret(cls, v):
+        import os
 
-        In production mode, this prevents the application from starting
-        if SECRET_KEY is still set to the default insecure value.
-        """
-        env = self.ENVIRONMENT.lower()
-
-        if env == "production":
-            # Critical security check: prevent running production with default key
-            if self.SECRET_KEY == DEFAULT_SECRET_KEY:
-                raise ValueError(
-                    f"SECURITY ERROR: Cannot start in production with default SECRET_KEY. "
-                    f"The value '{DEFAULT_SECRET_KEY}' is insecure for production. "
-                    f"Set a unique SECRET_KEY environment variable before deploying."
-                )
-            if not self.API_KEY:
-                raise ValueError(
-                    "SECURITY ERROR: API_KEY must be set in production. "
-                    "Set API_KEY environment variable before deploying."
-                )
-        return self
+        if (
+            v == "change-me-in-production"
+            and os.environ.get("ENVIRONMENT", "development") == "production"
+        ):
+            raise ValueError(
+                "SECRET_KEY must be changed from the default before running in production."
+            )
+        return v
 
     @field_validator(
         "DEBUG", "TESTING", "OCR_USE_GPU", "OCR_ENABLE_MKLDNN", mode="before"

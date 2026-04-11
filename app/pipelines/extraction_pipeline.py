@@ -39,7 +39,7 @@ from app.services.digital_extractor import extract_digital_pdf
 from app.services.noise_cleaner import clean_pages, clean_text_block
 from app.services.ocr_extractor import extract_ocr_pdf
 from app.services.pdf_detector import DocumentClassification, detect_pdf_type_from_bytes
-from app.services.table_extractor import extract_tables_digital_batch
+from app.services.table_extractor import extract_tables_digital
 from app.services.validator import validate_extraction_result
 from app.utils.logger import get_logger
 
@@ -86,9 +86,16 @@ def _run_with_progress_lock(
         progress_callback(step, total, stage)
 
 
-def _should_extract_tables_for_page(page_info: Dict[str, Any]) -> bool:
-    """Skip blank, near-empty, and image-only pages before table extraction."""
-    return len((page_info.get("text") or "").strip()) >= 20
+def _extract_digital_tables_for_page(
+    pdf_path: Path,
+    pdf_bytes: bytes,
+    page_num: int,
+) -> List[Dict[str, Any]]:
+    try:
+        return extract_tables_digital(pdf_path, page_num, pdf_bytes=pdf_bytes)
+    except Exception as exc:
+        logger.warning("Table extraction failed for page %s: %s", page_num, exc)
+        return []
 
 
 def _process_digital_pages(
@@ -115,28 +122,36 @@ def _process_digital_pages(
         len(digital_page_nums),
     )
 
-    page_data = extract_digital_pdf(pdf_path, page_numbers=digital_page_nums, pdf_bytes=pdf_bytes)
+    page_data = extract_digital_pdf(
+        pdf_path, page_numbers=digital_page_nums, pdf_bytes=pdf_bytes
+    )
 
     table_targets = [
-        page_info
-        for page_info in page_data
-        if _should_extract_tables_for_page(page_info)
+        page_info for page_info in page_data if page_info.get("text", "").strip()
     ]
     if table_targets:
-        page_numbers = [page_info["page_number"] for page_info in table_targets]
-        try:
-            tables_by_page = extract_tables_digital_batch(
-                pdf_path,
-                page_numbers,
-                pdf_bytes=pdf_bytes,
-            )
-        except Exception as exc:
-            logger.warning("Batch table extraction failed: %s", exc)
-            tables_by_page = {}
-
-        for page_info in table_targets:
-            page_info["tables"] = tables_by_page.get(page_info["page_number"], [])
-            page_info["confidence"] = 0.95
+        table_workers = min(4, len(table_targets)) if len(table_targets) > 1 else 1
+        if table_workers > 1:
+            with ThreadPoolExecutor(max_workers=table_workers) as table_pool:
+                table_futures = {
+                    table_pool.submit(
+                        _extract_digital_tables_for_page,
+                        pdf_path,
+                        pdf_bytes,
+                        page_info["page_number"],
+                    ): page_info
+                    for page_info in table_targets
+                }
+                for table_future in as_completed(table_futures):
+                    page_info = table_futures[table_future]
+                    page_info["tables"] = table_future.result()
+                    page_info["confidence"] = 0.95
+        else:
+            for page_info in table_targets:
+                page_info["tables"] = _extract_digital_tables_for_page(
+                    pdf_path, pdf_bytes, page_info["page_number"]
+                )
+                page_info["confidence"] = 0.95
 
     for page_info in page_data:
         page_info.setdefault("tables", [])
@@ -199,33 +214,56 @@ def run_extraction_pipeline(
 
     logger.info("[%s] Step 1: PDF type detection", job_id)
     try:
-        doc_classification = detect_pdf_type_from_bytes(pdf_bytes, file_name=pdf_path.name)
+        doc_classification = detect_pdf_type_from_bytes(
+            pdf_bytes, file_name=pdf_path.name
+        )
     except ValueError as exc:
         raise ValueError(f"PDF validation failed: {exc}") from exc
 
-    logger.info("[%s] Step 2: Extracting content", job_id)
-    with ThreadPoolExecutor(max_workers=2) as outer_pool:
-        digital_future = outer_pool.submit(
-            _process_digital_pages,
-            pdf_path,
-            doc_classification,
-            progress_callback,
-            pdf_bytes,
+    logger.info("[%s] Step 2: Extracting content (digital + OCR concurrently)", job_id)
+
+    # M2 fix: run digital and scanned branches concurrently
+    digital_results: List[Dict] = []
+    scanned_results: List[Dict] = []
+
+    has_digital = any(p.pdf_type == PDF_TYPE_DIGITAL for p in doc_classification.pages)
+    has_scanned = any(p.pdf_type == PDF_TYPE_SCANNED for p in doc_classification.pages)
+
+    if has_digital and has_scanned:
+        with ThreadPoolExecutor(max_workers=2) as branch_pool:
+            digital_future = branch_pool.submit(
+                _process_digital_pages,
+                pdf_path,
+                doc_classification,
+                None,
+                pdf_bytes,
+            )
+            scanned_future = branch_pool.submit(
+                _process_scanned_pages,
+                pdf_path,
+                doc_classification,
+                None,
+                pdf_bytes,
+            )
+            # M10 fix: report progress as each branch completes
+            done_count = 0
+            for fut in (digital_future, scanned_future):
+                result = fut.result()
+                done_count += 1
+                if progress_callback:
+                    progress_callback(done_count, 2, "extraction")
+                if fut is digital_future:
+                    digital_results = result
+                else:
+                    scanned_results = result
+    elif has_digital:
+        digital_results = _process_digital_pages(
+            pdf_path, doc_classification, progress_callback, pdf_bytes
         )
-        scanned_future = outer_pool.submit(
-            _process_scanned_pages,
-            pdf_path,
-            doc_classification,
-            progress_callback,
-            pdf_bytes,
+    else:
+        scanned_results = _process_scanned_pages(
+            pdf_path, doc_classification, progress_callback, pdf_bytes
         )
-        digital_results: List[Dict[str, Any]] = []
-        scanned_results: List[Dict[str, Any]] = []
-        for future in as_completed([digital_future, scanned_future]):
-            if future is digital_future:
-                digital_results = future.result()
-            else:
-                scanned_results = future.result()
 
     all_page_results: List[Dict] = sorted(
         digital_results + scanned_results,
@@ -244,7 +282,18 @@ def run_extraction_pipeline(
 
     logger.info("[%s] Step 4: Validation pass", job_id)
     validation_report = validate_extraction_result(all_page_results, all_tables)
-    all_page_results = validation_report.get("page_results", all_page_results)
+
+    # C6 fix: apply the stitched page texts back from the validation report
+    stitched_pages = validation_report.get("stitched_pages")
+    if stitched_pages:
+        for idx, page in enumerate(stitched_pages):
+            if idx < len(all_page_results):
+                all_page_results[idx]["text"] = page.get(
+                    "text", all_page_results[idx].get("text", "")
+                )
+                all_page_results[idx]["warnings"] = page.get(
+                    "warnings", all_page_results[idx].get("warnings", [])
+                )
     warnings.extend(
         f"Page {pn}: {w}"
         for pn, ws in validation_report.get("page_warnings", {}).items()
@@ -324,8 +373,7 @@ def save_result_to_disk(result: ExtractionResult, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = result.model_dump()
     payload["expires_at"] = (
-        datetime.now(timezone.utc)
-        + timedelta(seconds=settings.RESULT_EXPIRES_SECONDS)
+        datetime.now(timezone.utc) + timedelta(seconds=settings.RESULT_EXPIRES_SECONDS)
     ).isoformat()
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:

@@ -16,16 +16,15 @@ STATE_FAILED = "failed"
 # ── Layout / Sorting ───────────────────────────────────────────────────────
 # Y-axis tolerance: two bounding boxes within this many pts are on the same line
 LINE_Y_TOLERANCE = 5  # points  (digital)
-DEFAULT_OCR_RENDER_DPI = 150
 
 
 def line_y_tolerance_ocr(dpi: int = 150) -> int:
     """Scale OCR line-merge tolerance proportionally to render DPI."""
-    return max(4, int(8 * dpi / 300))
+    return max(2, round(8 * dpi / 300))
 
 
-# Backwards-compatible alias for older call sites at the default OCR DPI.
-LINE_Y_TOLERANCE_OCR = line_y_tolerance_ocr(DEFAULT_OCR_RENDER_DPI)
+# Backwards-compatible alias for older call sites.
+LINE_Y_TOLERANCE_OCR = line_y_tolerance_ocr()
 
 # Minimum character count for a text block to be kept (filters noise)
 MIN_BLOCK_CHAR_COUNT = 3
@@ -52,9 +51,6 @@ NOISE_PATTERNS = [
 
 # Minimum word count per extracted paragraph to survive validation
 MIN_PARA_WORD_COUNT = 2
-
-# ── Chunked Processing ────────────────────────────────────────────────────
-CHUNK_SIZE_PAGES = 10  # Pages per processing chunk for large files
 
 # ── Confidence ────────────────────────────────────────────────────────────
 HIGH_CONFIDENCE = 0.85

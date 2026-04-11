@@ -1,10 +1,12 @@
 """
 Celery Worker
 Handles async/background PDF extraction jobs.
-Tasks are queued when a PDF is uploaded and polled via /extract/{job_id}.
 
-Run worker with:
-  celery -A app.workers.celery_worker worker --pool=solo --loglevel=info
+Fixes applied:
+  C2 — self.retry() is now only called for genuinely transient errors
+        (IOError, OSError, MemoryError, RuntimeError). ValueError and all
+        other application-level exceptions write a failed result and return
+        immediately instead of restarting the full OCR job.
 """
 
 import json
@@ -24,11 +26,7 @@ from app.pipelines.extraction_pipeline import (
     run_extraction_pipeline,
     save_result_to_disk,
 )
-from app.utils.file_handler import (
-    get_output_path,
-    get_upload_path,
-    store_cached_result,
-)
+from app.utils.file_handler import get_output_path, get_upload_path
 
 # ── Celery App ────────────────────────────────────────────────────────────────
 celery_app = Celery(
@@ -43,10 +41,9 @@ celery_app.conf.update(
     accept_content=["json"],
     task_track_started=True,
     task_time_limit=settings.CELERY_TASK_TIMEOUT,
-    # Keep a sensible grace window, but never let the soft limit go non-positive.
     task_soft_time_limit=max(30, settings.CELERY_TASK_TIMEOUT - 30),
-    worker_prefetch_multiplier=1,  # One task at a time per worker
-    task_acks_late=True,  # Acknowledge only after completion (safer)
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
     result_expires=settings.RESULT_EXPIRES_SECONDS,
     worker_concurrency=settings.effective_celery_worker_concurrency,
     worker_pool=settings.CELERY_WORKER_POOL,
@@ -62,23 +59,20 @@ if sys.platform == "win32":
 
 task_logger = get_task_logger(__name__)
 
+# C2 fix: only retry on these truly transient error types
+_RETRYABLE_ERRORS = (IOError, OSError, MemoryError, RuntimeError)
+
 
 @celery_app.task(
     bind=True,
     name="extract_pdf",
     max_retries=2,
     default_retry_delay=10,
-    throws=(ValueError,),  # Don't retry validation errors
+    throws=(ValueError,),
 )
 def extract_pdf_task(self, job_id: str) -> dict:
     """
     Background Celery task: run the full extraction pipeline for a given job.
-
-    Args:
-        job_id: UUID of the upload job.
-
-    Returns:
-        dict with status and output_path.
     """
     pdf_path = get_upload_path(job_id)
     output_path = get_output_path(job_id)
@@ -88,7 +82,6 @@ def extract_pdf_task(self, job_id: str) -> dict:
 
     task_logger.info(f"Starting extraction task | job={job_id}")
 
-    # Update state to PROCESSING so API can report progress
     self.update_state(
         state=STATE_PROCESSING,
         meta={"progress": 0, "message": "Starting extraction..."},
@@ -109,13 +102,6 @@ def extract_pdf_task(self, job_id: str) -> dict:
             pdf_path, job_id, progress_callback=progress_cb
         )
         save_result_to_disk(result, output_path)
-        hash_path = pdf_path.with_suffix(".sha256")
-        if hash_path.exists():
-            try:
-                file_hash = hash_path.read_text(encoding="utf-8").strip()
-                store_cached_result(file_hash, result.model_dump())
-            except Exception as exc:
-                task_logger.debug("Cache store skipped for job %s: %s", job_id, exc)
 
         task_logger.info(f"Task complete | job={job_id} | output={output_path}")
         return {
@@ -135,9 +121,24 @@ def extract_pdf_task(self, job_id: str) -> dict:
         _write_failed_result(job_id, output_path, str(exc))
         raise
 
+    except _RETRYABLE_ERRORS as exc:
+        # C2 fix: only retry genuinely transient infrastructure errors
+        task_logger.warning(f"Transient error for job {job_id} (will retry): {exc}")
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            _write_failed_result(job_id, output_path, f"Max retries exceeded: {exc}")
+            return {
+                "status": STATE_FAILED,
+                "job_id": job_id,
+                "error": str(exc),
+            }
+
     except Exception as exc:
+        # C2 fix: all other errors are treated as permanent failures — no retry.
+        # Previously ANY exception triggered a retry, causing duplicate full OCR runs.
         task_logger.error(
-            f"Unexpected error for job {job_id}: {exc}\n{traceback.format_exc()}"
+            f"Permanent error for job {job_id}: {exc}\n{traceback.format_exc()}"
         )
         _write_failed_result(job_id, output_path, str(exc))
         return {

@@ -8,6 +8,9 @@ Key capabilities:
 - Hyphenation merging
 - Empty-page detection
 - Font metadata preservation (for heading detection)
+
+Fixes applied:
+  M9 — doc.close() is now always called in a try/finally block.
 """
 
 from pathlib import Path
@@ -50,10 +53,6 @@ def _build_synthetic_block(text: str) -> Dict[str, Any]:
 def _extract_page_blocks(page: fitz.Page) -> List[Dict[str, Any]]:
     """
     Extract text blocks from a page with coordinate data.
-
-    `page.get_text("blocks", sort=True)` is lighter than parsing the full
-    span dictionary and still preserves enough geometry for reading-order
-    reconstruction.
     """
     try:
         raw_blocks = page.get_text("blocks", sort=True)
@@ -200,10 +199,7 @@ def _looks_reasonable(text: str) -> bool:
     words = _WORD_RE.findall(stripped)
     alnum = sum(1 for ch in stripped if ch.isalnum())
 
-    # Good enough if it has some real text content. Keep the fast path broad
-    # for simple pages so weak-but-readable pages do not fall through every
-    # slower fallback.
-    return alnum >= 5 or len(words) >= 2 or len(stripped) >= 20
+    return alnum >= 10 or len(words) >= 3 or len(stripped) >= 20
 
 
 def _should_fast_accept_raw_text(text: str) -> bool:
@@ -215,8 +211,6 @@ def _should_fast_accept_raw_text(text: str) -> bool:
     lines = [line.strip() for line in stripped.splitlines() if line.strip()]
     words = _WORD_RE.findall(stripped)
 
-    # Simple pages are where PyMuPDF already gives excellent order and layout.
-    # Skip block/word reconstruction for those pages to save work.
     if len(lines) <= 6 and len(words) >= 5:
         return True
 
@@ -307,16 +301,9 @@ def extract_digital_page(
 ) -> Dict[str, Any]:
     """
     Extract and sort text from a single digital PDF page.
-
-    Returns dict with:
-      text: clean extracted text
-      blocks: sorted raw blocks (for downstream use)
-      warnings: list of warning strings
     """
     warnings: List[str] = []
 
-    # Fast path: PyMuPDF's plain text extraction is usually the cleanest and
-    # cheapest representation when the PDF already contains searchable text.
     try:
         raw_text = page.get_text("text").strip()
     except Exception:
@@ -357,8 +344,7 @@ def extract_digital_page(
             paragraph_texts.append(" ".join(current_para))
 
         block_text = "\n\n".join(paragraph_texts).strip()
-        block_text = merge_hyphenated_lines(block_text.splitlines())
-        block_text = "\n".join(block_text).strip()
+        block_text = "\n".join(merge_hyphenated_lines(block_text.splitlines())).strip()
     else:
         block_text = ""
 
@@ -421,13 +407,6 @@ def extract_digital_pdf(
     """
     Extract text from all (or specified) pages of a digital PDF.
 
-    Args:
-        pdf_path: Path to PDF file.
-        page_numbers: 1-indexed list of pages to extract. None = all.
-
-    Returns:
-        List of per-page result dicts (keys: page_number, text, blocks, warnings).
-
     Raises:
         ValueError: If PDF is corrupt or unreadable.
     """
@@ -439,46 +418,52 @@ def extract_digital_pdf(
     except Exception as exc:
         raise ValueError(f"Failed to open PDF: {exc}") from exc
 
-    if doc.is_encrypted:
-        if not doc.authenticate(""):
-            raise ValueError("PDF is password protected.")
+    # M9 fix: always close the fitz document via try/finally
+    try:
+        if doc.is_encrypted:
+            if not doc.authenticate(""):
+                raise ValueError("PDF is password protected.")
 
-    total = len(doc)
-    targets = page_numbers or list(range(1, total + 1))
-    results: List[Dict[str, Any]] = []
+        total = len(doc)
+        targets = page_numbers or list(range(1, total + 1))
+        results: List[Dict[str, Any]] = []
 
-    if pdf_bytes is None:
-        try:
-            pdf_bytes = pdf_path.read_bytes()
-        except Exception:
-            pdf_bytes = None
+        if pdf_bytes is None:
+            try:
+                pdf_bytes = pdf_path.read_bytes()
+            except Exception:
+                pdf_bytes = None
 
-    for page_num in targets:
-        if page_num < 1 or page_num > total:
-            logger.warning(f"Page {page_num} out of range (1..{total}), skipping.")
-            continue
+        for page_num in targets:
+            if page_num < 1 or page_num > total:
+                logger.warning(f"Page {page_num} out of range (1..{total}), skipping.")
+                continue
 
-        page = doc[page_num - 1]
-        try:
-            result = extract_digital_page(
-                page,
-                page_num,
-                pdf_bytes=pdf_bytes,
-                pdf_path=pdf_path,
+            page = doc[page_num - 1]
+            try:
+                result = extract_digital_page(
+                    page,
+                    page_num,
+                    pdf_bytes=pdf_bytes,
+                    pdf_path=pdf_path,
+                )
+            except Exception as exc:
+                logger.error(f"Error extracting page {page_num}: {exc}", exc_info=True)
+                result = {
+                    "text": "",
+                    "blocks": [],
+                    "warnings": [f"Extraction failed: {exc}"],
+                }
+
+            result["page_number"] = page_num
+            results.append(result)
+            logger.debug(
+                f"Extracted page {page_num}/{total} | chars={len(result['text'])}"
             )
-        except Exception as exc:
-            logger.error(f"Error extracting page {page_num}: {exc}", exc_info=True)
-            result = {
-                "text": "",
-                "blocks": [],
-                "warnings": [f"Extraction failed: {exc}"],
-            }
 
-        result["page_number"] = page_num
-        results.append(result)
-        logger.debug(f"Extracted page {page_num}/{total} | chars={len(result['text'])}")
+    finally:
+        doc.close()
 
-    doc.close()
     logger.info(
         f"Digital extraction complete | pages={len(results)} | file={pdf_path.name}"
     )

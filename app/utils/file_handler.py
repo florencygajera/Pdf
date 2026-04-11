@@ -23,70 +23,6 @@ logger = get_logger(__name__)
 CHUNK_SIZE = 1024 * 1024  # 1 MB streaming chunk
 
 
-def hash_file_sha256(path: Path) -> str:
-    """Compute a SHA-256 hash for a file on disk."""
-    sha256 = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
-            sha256.update(chunk)
-    return sha256.hexdigest()
-
-
-def get_cache_dir() -> Path:
-    """Directory used for cached extraction payloads keyed by file hash."""
-    cache_dir = settings.OUTPUT_DIR / "_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
-
-def get_cache_path(file_hash: str) -> Path:
-    return get_cache_dir() / f"{file_hash}.json"
-
-
-def load_cached_result(file_hash: str) -> Optional[dict]:
-    """Load a cached extraction result if present and not expired."""
-    cache_path = get_cache_path(file_hash)
-    if not cache_path.exists():
-        return None
-
-    try:
-        import json
-
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return None
-
-    expires_at = data.get("expires_at")
-    if expires_at:
-        try:
-            from datetime import datetime, timezone
-
-            expiry_dt = datetime.fromisoformat(expires_at)
-            if expiry_dt.tzinfo is None:
-                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
-            if expiry_dt <= datetime.now(timezone.utc):
-                cache_path.unlink(missing_ok=True)
-                return None
-        except Exception:
-            return None
-
-    return data
-
-
-def store_cached_result(file_hash: str, payload: dict) -> None:
-    """Persist a cached extraction result keyed by file hash."""
-    import json
-
-    cache_path = get_cache_path(file_hash)
-    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, cache_path)
-
-
 async def save_upload_streaming(
     file: UploadFile,
     job_id: Optional[str] = None,
@@ -155,6 +91,8 @@ async def save_upload_streaming(
         )
 
     file_hash = sha256.hexdigest()
+    hash_path = dest_path.with_suffix(".sha256")
+    hash_path.write_text(file_hash, encoding="utf-8")
     logger.info(
         f"Upload saved | job={job_id} | bytes={total_bytes} | sha256={file_hash}"
     )
@@ -166,20 +104,42 @@ def get_upload_path(job_id: str) -> Path:
     return settings.UPLOAD_DIR / f"{job_id}.pdf"
 
 
+def get_upload_hash_path(job_id: str) -> Path:
+    """Return the path of the SHA-256 file for a given upload."""
+    return settings.UPLOAD_DIR / f"{job_id}.sha256"
+
+
 def get_output_path(job_id: str) -> Path:
     """Return the output JSON path for a given job_id."""
     return settings.OUTPUT_DIR / f"{job_id}.json"
 
 
+def find_job_id_by_hash(file_hash: str) -> Optional[str]:
+    """
+    Scan existing .sha256 sidecar files to find a completed job for this hash.
+    Returns the job_id string if a matching completed result exists, else None.
+    """
+    for hash_file in settings.UPLOAD_DIR.glob("*.sha256"):
+        try:
+            if hash_file.read_text(encoding="utf-8").strip() == file_hash:
+                job_id = hash_file.stem
+                output = get_output_path(job_id)
+                if output.exists():
+                    return job_id
+        except Exception:
+            continue
+    return None
+
+
 def cleanup_job_files(job_id: str) -> None:
     """Delete temp upload and output files for a job."""
-    for p in [get_upload_path(job_id), get_output_path(job_id)]:
+    for p in [
+        get_upload_path(job_id),
+        get_upload_hash_path(job_id),
+        get_output_path(job_id),
+    ]:
         p.unlink(missing_ok=True)
         logger.debug(f"Cleaned up: {p}")
-
-    hash_path = settings.UPLOAD_DIR / f"{job_id}.sha256"
-    hash_path.unlink(missing_ok=True)
-    logger.debug(f"Cleaned up: {hash_path}")
 
 
 def purge_stale_uploads() -> int:
@@ -196,6 +156,7 @@ def purge_stale_uploads() -> int:
         age = now - f.stat().st_mtime
         if age > TEMP_FILE_TTL_SECONDS:
             f.unlink(missing_ok=True)
+            f.with_suffix(".sha256").unlink(missing_ok=True)
             deleted += 1
     logger.info(f"Purged {deleted} stale upload files.")
     return deleted

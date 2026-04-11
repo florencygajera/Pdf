@@ -33,6 +33,13 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 PDF Extraction Service starting up...")
     logger.info(f"Environment: {settings.ENVIRONMENT}")
     logger.info(f"Max file size: {settings.MAX_FILE_SIZE_MB} MB")
+    # Purge any stale uploads left from a previous run
+    try:
+        from app.utils.file_handler import purge_stale_uploads
+
+        purge_stale_uploads()
+    except Exception as exc:
+        logger.warning(f"Startup purge failed (non-fatal): {exc}")
     yield
     logger.info("🛑 PDF Extraction Service shutting down...")
 

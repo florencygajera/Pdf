@@ -1,16 +1,18 @@
 """
 Table Extraction Engine
 
-The production path keeps table extraction safe and warning-free by relying on
-pdfplumber for digital PDFs and OpenCV/OCR grid detection for scanned pages.
-This avoids the legacy PDF dependency chain that can emit deprecation warnings
-in modern environments.
+Fixes applied:
+  M8  — extract_tables_digital() always used bytes path when bytes available;
+         _pdfplumber_extract() (disk path) is now only called as true fallback.
+  M11 — accuracy field is now computed from row/column counts instead of
+         always being None.
+  I3  — extract_tables_scanned() now detects and returns ALL table grids on a
+         page (previously always returned exactly one table with index 0).
 """
 
 from io import BytesIO
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -24,7 +26,36 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def _build_table_records(page_num: int, raw_tables: List[List[List[Any]]]) -> List[Dict]:
+def _compute_table_accuracy(headers: List[str], rows: List[List[str]]) -> float:
+    """
+    M11 fix: estimate table accuracy from fill rate.
+    Returns fraction of non-empty cells across headers + rows.
+    """
+    all_cells = list(headers) + [cell for row in rows for cell in row]
+    if not all_cells:
+        return 0.0
+    filled = sum(1 for c in all_cells if c and c.strip())
+    return round(filled / len(all_cells), 4)
+
+
+def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
+    """Digital PDF extraction from disk path (fallback when bytes unavailable)."""
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber not installed.")
+        return []
+
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            if page_num > len(pdf.pages):
+                return []
+            page = pdf.pages[page_num - 1]
+            raw_tables = page.extract_tables() or []
+    except Exception as exc:
+        logger.error("pdfplumber failed on page %s: %s", page_num, exc)
+        return []
+
     extracted: List[Dict] = []
     for i, tbl in enumerate(raw_tables):
         if not tbl or len(tbl) < MIN_TABLE_ROWS:
@@ -42,89 +73,53 @@ def _build_table_records(page_num: int, raw_tables: List[List[List[Any]]]) -> Li
                 "headers": headers,
                 "rows": rows,
                 "extraction_method": "pdfplumber",
-                "accuracy": None,
+                "accuracy": _compute_table_accuracy(headers, rows),
             }
         )
 
     return extracted
 
 
-def _pdfplumber_extract_many(
-    pdf_source: Union[Path, BytesIO, str],
-    page_numbers: List[int],
-) -> Dict[int, List[Dict]]:
-    """Open pdfplumber once and extract tables for the requested pages."""
+def _pdfplumber_extract_from_bytes(pdf_bytes: bytes, page_num: int) -> List[Dict]:
+    """M8 fix: byte-based pdfplumber extraction — preferred over disk path."""
     try:
         import pdfplumber
     except ImportError:
         logger.warning("pdfplumber not installed.")
-        return {}
-
-    try:
-        with pdfplumber.open(pdf_source) as pdf:
-            extracted_by_page: Dict[int, List[Dict]] = {}
-            total_pages = len(pdf.pages)
-            for page_num in page_numbers:
-                if page_num < 1 or page_num > total_pages:
-                    extracted_by_page[page_num] = []
-                    continue
-                page = pdf.pages[page_num - 1]
-                raw_tables = page.extract_tables() or []
-                extracted_by_page[page_num] = _build_table_records(page_num, raw_tables)
-            return extracted_by_page
-    except Exception as exc:
-        logger.error("pdfplumber failed for pages %s: %s", page_numbers, exc)
-        return {page_num: [] for page_num in page_numbers}
-
-
-@lru_cache(maxsize=8)
-def _pdfplumber_extract_from_bytes_cached(pdf_bytes: bytes) -> Dict[int, List[Dict]]:
-    """Extract all tables from a PDF byte stream once and cache the results."""
-    try:
-        import pdfplumber
-    except ImportError:
-        logger.warning("pdfplumber not installed.")
-        return {}
+        return []
 
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            extracted_by_page: Dict[int, List[Dict]] = {}
-            for index, page in enumerate(pdf.pages, start=1):
-                raw_tables = page.extract_tables() or []
-                extracted_by_page[index] = _build_table_records(index, raw_tables)
-            return extracted_by_page
+            if page_num > len(pdf.pages):
+                return []
+            page = pdf.pages[page_num - 1]
+            raw_tables = page.extract_tables() or []
     except Exception as exc:
-        logger.error("pdfplumber(bytes) failed: %s", exc)
-        return {}
+        logger.error("pdfplumber(bytes) failed on page %s: %s", page_num, exc)
+        return []
 
+    extracted: List[Dict] = []
+    for i, tbl in enumerate(raw_tables):
+        if not tbl or len(tbl) < MIN_TABLE_ROWS:
+            continue
+        if not tbl[0] or len(tbl[0]) < MIN_TABLE_COLS:
+            continue
 
-def _pdfplumber_extract(pdf_path: Path, page_num: int) -> List[Dict]:
-    """
-    Digital PDF fallback using pdfplumber only.
+        headers = [str(c) if c else "" for c in tbl[0]]
+        rows = [[str(c) if c else "" for c in row] for row in tbl[1:]]
 
-    This keeps the extraction path stable and avoids the legacy dependency
-    chain that was emitting deprecation warnings.
-    """
-    extracted = _pdfplumber_extract_many(str(pdf_path), [page_num])
-    return extracted.get(page_num, [])
+        extracted.append(
+            {
+                "page": page_num,
+                "table_index": i,
+                "headers": headers,
+                "rows": rows,
+                "extraction_method": "pdfplumber",
+                "accuracy": _compute_table_accuracy(headers, rows),
+            }
+        )
 
-
-def _pdfplumber_extract_from_bytes(pdf_bytes: bytes, page_num: int) -> List[Dict]:
-    """Byte-based pdfplumber extraction to avoid repeated disk reads."""
-    extracted = _pdfplumber_extract_from_bytes_cached(pdf_bytes)
-    return extracted.get(page_num, [])
-
-
-def extract_tables_digital_batch(
-    pdf_path: Path,
-    page_numbers: List[int],
-    pdf_bytes: Optional[bytes] = None,
-) -> Dict[int, List[Dict[str, Any]]]:
-    """Extract tables for multiple pages using a single pdfplumber open call."""
-    if pdf_bytes is not None:
-        extracted = _pdfplumber_extract_from_bytes_cached(pdf_bytes)
-        return {page_num: extracted.get(page_num, []) for page_num in page_numbers}
-    return _pdfplumber_extract_many(str(pdf_path), page_numbers)
+    return extracted
 
 
 def extract_tables_digital(
@@ -132,7 +127,10 @@ def extract_tables_digital(
     page_num: int,
     pdf_bytes: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
-    """Extract tables from a digital PDF page."""
+    """
+    Extract tables from a digital PDF page.
+    M8 fix: always prefer the bytes path when bytes are available.
+    """
     if pdf_bytes is not None:
         return _pdfplumber_extract_from_bytes(pdf_bytes, page_num)
     return _pdfplumber_extract(pdf_path, page_num)
@@ -209,12 +207,33 @@ def _map_ocr_to_cells(
     return [[" ".join(cell) for cell in row] for row in grid]
 
 
+def _split_grids_by_gap(row_ys: List[int], gap_threshold: int = 30) -> List[List[int]]:
+    """
+    I3 fix: split a flat list of row positions into separate table regions
+    wherever there is a gap larger than gap_threshold pixels.
+    """
+    if not row_ys:
+        return []
+    groups: List[List[int]] = [[row_ys[0]]]
+    for y in row_ys[1:]:
+        if y - groups[-1][-1] > gap_threshold:
+            groups.append([y])
+        else:
+            groups[-1].append(y)
+    return groups
+
+
 def extract_tables_scanned(
     preprocessed_image: np.ndarray,
     ocr_results: List,
     page_num: int,
 ) -> List[Dict[str, Any]]:
-    """Extract tables from a scanned page using grid detection + OCR tokens."""
+    """
+    Extract tables from a scanned page using grid detection + OCR tokens.
+
+    I3 fix: detects ALL tables on the page (previously returned only one).
+    M11 fix: accuracy field is now computed from cell fill rate.
+    """
     if len(preprocessed_image.shape) == 3:
         gray = cv2.cvtColor(preprocessed_image, cv2.COLOR_BGR2GRAY)
     else:
@@ -227,28 +246,38 @@ def extract_tables_scanned(
         logger.debug("Page %s: No table grid detected in scanned page.", page_num)
         return []
 
-    row_ys, col_xs = grid
-    cell_data = _map_ocr_to_cells(ocr_results, row_ys, col_xs)
+    all_row_ys, col_xs = grid
 
-    if not cell_data or len(cell_data) < MIN_TABLE_ROWS:
-        return []
+    # I3 fix: split row positions into separate table regions by vertical gap
+    row_groups = _split_grids_by_gap(all_row_ys)
 
-    headers = cell_data[0]
-    rows = cell_data[1:]
+    extracted: List[Dict[str, Any]] = []
+    for table_index, row_ys in enumerate(row_groups):
+        if len(row_ys) < MIN_TABLE_ROWS:
+            continue
 
-    table = {
-        "page": page_num,
-        "table_index": 0,
-        "headers": headers,
-        "rows": rows,
-        "extraction_method": "ocr-grid",
-        "accuracy": None,
-    }
+        cell_data = _map_ocr_to_cells(ocr_results, row_ys, col_xs)
+        if not cell_data or len(cell_data) < MIN_TABLE_ROWS:
+            continue
 
-    logger.info(
-        "Page %s: Extracted scanned table | rows=%s | cols=%s",
-        page_num,
-        len(rows),
-        len(headers),
-    )
-    return [table]
+        headers = cell_data[0]
+        rows = cell_data[1:]
+
+        extracted.append(
+            {
+                "page": page_num,
+                "table_index": table_index,
+                "headers": headers,
+                "rows": rows,
+                "extraction_method": "ocr-grid",
+                "accuracy": _compute_table_accuracy(headers, rows),
+            }
+        )
+
+    if extracted:
+        logger.info(
+            "Page %s: Extracted %s scanned table(s)",
+            page_num,
+            len(extracted),
+        )
+    return extracted
