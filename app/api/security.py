@@ -23,6 +23,7 @@ def require_api_key(request: Request) -> None:
     expected = getattr(settings, "API_KEY", None)
 
     # FIX: empty string means auth is disabled (dev convenience)
+
     if expected == "":
         return
 

@@ -117,7 +117,7 @@ def extract_pdf_task(self, job_id: str) -> dict:
 
     except ValueError as exc:
         # Non-retryable: bad PDF, invalid content
-        task_logger.error(f"Validation error for job {job_id}: {exc}")
+        task_logger.error(f"Validation error for job {job_id}: {exc}\n{traceback.format_exc()}")
         _write_failed_result(job_id, output_path, str(exc))
         raise
 
