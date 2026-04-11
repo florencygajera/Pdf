@@ -234,6 +234,7 @@ def run_extraction_pipeline(
 
     logger.info("[%s] Step 4: Validation pass", job_id)
     validation_report = validate_extraction_result(all_page_results, all_tables)
+    all_page_results = validation_report.get("page_results", all_page_results)
     warnings.extend(
         f"Page {pn}: {w}"
         for pn, ws in validation_report.get("page_warnings", {}).items()

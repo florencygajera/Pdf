@@ -52,6 +52,7 @@ def sort_digital_blocks(
 def sort_ocr_results(
     ocr_results: List[Tuple],
     y_tolerance: Optional[int] = None,
+    dpi: Optional[int] = None,
 ) -> List[Tuple]:
     """
     Sort PaddleOCR results in reading order.
@@ -65,7 +66,7 @@ def sort_ocr_results(
         return []
 
     if y_tolerance is None:
-        y_tolerance = line_y_tolerance_ocr()
+        y_tolerance = line_y_tolerance_ocr(dpi or 150)
 
     def top_y(result):
         box = result[0]  # 4-point bounding box

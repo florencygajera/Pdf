@@ -7,6 +7,7 @@ Run: pytest tests/ -v --cov=app --cov-report=term-missing
 """
 
 import io
+import asyncio
 import json
 import os
 import sys
@@ -104,6 +105,20 @@ class TestSorting:
         sorted_r = sort_ocr_results(results)
         assert sorted_r[0][1][0] == "First"
         assert sorted_r[1][1][0] == "Second"
+
+    def test_sort_ocr_results_scales_with_dpi(self):
+        from app.utils.sorting import sort_ocr_results
+
+        results = [
+            ([[50, 100], [80, 100], [80, 108], [50, 108]], ("Upper", 0.95)),
+            ([[10, 106], [40, 106], [40, 114], [10, 114]], ("Lower", 0.95)),
+        ]
+
+        sorted_low_dpi = sort_ocr_results(results, dpi=120)
+        sorted_high_dpi = sort_ocr_results(results, dpi=300)
+
+        assert [r[1][0] for r in sorted_low_dpi] == ["Upper", "Lower"]
+        assert [r[1][0] for r in sorted_high_dpi] == ["Lower", "Upper"]
 
     def test_merge_hyphenated_lines(self):
         from app.utils.sorting import merge_hyphenated_lines
@@ -249,6 +264,30 @@ class TestValidator:
         result = stitch_page_boundaries(pages)
         # Page 1 should now contain both parts
         assert "duce" in result[0]["text"] or "intro" in result[0]["text"]
+
+    def test_validation_returns_stitched_pages(self):
+        from app.services.validator import validate_extraction_result
+
+        pages = [
+            {
+                "page_number": 1,
+                "text": "The intro ends mid",
+                "warnings": [],
+                "confidence": None,
+            },
+            {
+                "page_number": 2,
+                "text": "sentence continuation.",
+                "warnings": [],
+                "confidence": None,
+            },
+        ]
+
+        report = validate_extraction_result(pages, [])
+        stitched = report["page_results"]
+
+        assert "sentence continuation" in stitched[0]["text"]
+        assert stitched[1]["text"] == ""
 
     def test_table_validation_missing_headers(self):
         from app.services.validator import validate_table
@@ -517,6 +556,27 @@ class TestAPIRoutes:
         job_id = resp.json()["job_id"]
         del_resp = client.delete(f"/api/v1/extract/{job_id}")
         assert del_resp.status_code == 200
+
+    def test_delete_job_schedules_revoke(self, monkeypatch):
+        from app.api.routes.extract import delete_job
+
+        scheduled = {"count": 0}
+
+        def fake_create_task(coro):
+            scheduled["count"] += 1
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+        monkeypatch.setattr(
+            "app.api.routes.extract.cleanup_job_files",
+            lambda job_id: None,
+        )
+
+        result = asyncio.run(delete_job("job-123"))
+
+        assert result["job_id"] == "job-123"
+        assert scheduled["count"] == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

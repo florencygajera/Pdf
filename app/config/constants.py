@@ -20,11 +20,11 @@ LINE_Y_TOLERANCE = 5  # points  (digital)
 
 def line_y_tolerance_ocr(dpi: int = 150) -> int:
     """Scale OCR line-merge tolerance proportionally to render DPI."""
-    return max(2, round(8 * dpi / 300))
+    return max(4, int(8 * dpi / 300))
 
 
 # Backwards-compatible alias for older call sites.
-LINE_Y_TOLERANCE_OCR = line_y_tolerance_ocr()
+LINE_Y_TOLERANCE_OCR = line_y_tolerance_ocr(150)
 
 # Minimum character count for a text block to be kept (filters noise)
 MIN_BLOCK_CHAR_COUNT = 3

@@ -40,6 +40,17 @@ RESULT_NOT_FOUND = "not_found"
 RESULT_EXPIRED = "expired"
 
 
+async def _revoke_celery_job(job_id: str) -> None:
+    """Best-effort revoke that does not block the request handler."""
+    try:
+        from app.workers.celery_worker import celery_app
+
+        celery_app.control.revoke(job_id, terminate=True, signal="SIGTERM")
+        logger.info(f"Celery task {job_id} revoked.")
+    except Exception as exc:
+        logger.debug(f"Celery revoke skipped for {job_id}: {exc}")
+
+
 def _get_celery_job_state(job_id: str):
     """
     Query Celery backend for task state.
@@ -292,15 +303,7 @@ async def delete_job(job_id: str):
     """
     Cancel a running job (best-effort) and delete all associated files.
     """
-    # Best-effort Celery revoke
-    try:
-        from app.workers.celery_worker import celery_app
-
-        celery_app.control.revoke(job_id, terminate=True, signal="SIGTERM")
-        await asyncio.sleep(2)
-        logger.info(f"Celery task {job_id} revoked.")
-    except Exception:
-        pass
+    asyncio.create_task(_revoke_celery_job(job_id))
 
     cleanup_job_files(job_id)
     return {"job_id": job_id, "message": "Job cancelled and files cleaned up."}

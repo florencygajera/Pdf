@@ -393,7 +393,11 @@ def _ocr_results_to_text(ocr_results: List, dpi: int) -> str:
         return ""
 
     y_tolerance = line_y_tolerance_ocr(dpi)
-    sorted_results = sort_ocr_results(ocr_results, y_tolerance=y_tolerance)
+    sorted_results = sort_ocr_results(
+        ocr_results,
+        y_tolerance=y_tolerance,
+        dpi=dpi,
+    )
 
     def top_y(r):
         return min(pt[1] for pt in r[0])

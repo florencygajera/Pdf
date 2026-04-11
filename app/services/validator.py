@@ -21,6 +21,13 @@ logger = get_logger(__name__)
 
 _SENTENCE_ENDERS = re.compile(r"[.!?\u0964\u0965]$")
 
+try:
+    from langdetect import DetectorFactory
+
+    DetectorFactory.seed = 42
+except Exception:
+    DetectorFactory = None
+
 
 def _detect_language(text: str) -> str:
     """
@@ -31,9 +38,8 @@ def _detect_language(text: str) -> str:
         return "unknown"
 
     try:
-        from langdetect import detect, DetectorFactory
+        from langdetect import detect
 
-        DetectorFactory.seed = 42
         sample = text.strip()[:500]
         if len(sample) < 20:
             return "unknown"
@@ -117,7 +123,8 @@ def flag_low_quality_pages(
     Add warning flags to pages with poor extraction quality.
     """
     for page in page_results:
-        conf = page.get("confidence", 1.0)
+        conf_value = page.get("confidence", 1.0)
+        conf = float(conf_value) if conf_value is not None else 1.0
         text = page.get("text", "")
         warnings = page.setdefault("warnings", [])
 
@@ -229,6 +236,7 @@ def validate_extraction_result(
         "table_issues": table_issues,
         "page_warnings": page_warnings,
         "quality": quality,
+        "page_results": page_results,
     }
 
     logger.info(
