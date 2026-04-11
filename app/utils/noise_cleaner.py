@@ -141,14 +141,18 @@ def clean_pages(page_texts: List[str]) -> List[str]:
         return [clean_text_block(text) for text in page_texts]
 
     line_counts: Counter[str] = Counter()
+    page_lines: List[List[str]] = []
     for page_text in page_texts:
         seen_in_page = set()
+        normalized_lines: List[str] = []
         for line in page_text.splitlines():
             normalized = clean_line(line)
             if not normalized or normalized in seen_in_page:
                 continue
             seen_in_page.add(normalized)
             line_counts[normalized] += 1
+            normalized_lines.append(normalized)
+        page_lines.append(normalized_lines)
 
     total_pages = len(page_texts)
     repeated: Set[str] = {
@@ -161,13 +165,14 @@ def clean_pages(page_texts: List[str]) -> List[str]:
         logger.debug("Header/footer candidates removed: %s", list(repeated)[:5])
 
     cleaned_pages: List[str] = []
-    for page_text in page_texts:
-        lines = [
-            line
-            for line in page_text.splitlines()
-            if clean_line(line) not in repeated
-        ]
-        cleaned_pages.append(clean_text_block("\n".join(lines)))
+    for lines in page_lines:
+        filtered = [line for line in lines if line not in repeated]
+        if not filtered:
+            cleaned_pages.append("")
+            continue
+        filtered = remove_noise_lines(filtered)
+        filtered = remove_duplicate_lines(filtered)
+        cleaned_pages.append(_normalize_whitespace("\n".join(filtered)))
 
     return cleaned_pages
 

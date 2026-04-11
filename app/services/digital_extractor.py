@@ -200,9 +200,10 @@ def _looks_reasonable(text: str) -> bool:
     words = _WORD_RE.findall(stripped)
     alnum = sum(1 for ch in stripped if ch.isalnum())
 
-    # Good enough if it has some real text content. This keeps the fast path
-    # fast for the common case while still letting weak pages fall back.
-    return alnum >= 10 or len(words) >= 3 or len(stripped) >= 20
+    # Good enough if it has some real text content. Keep the fast path broad
+    # for simple pages so weak-but-readable pages do not fall through every
+    # slower fallback.
+    return alnum >= 5 or len(words) >= 2 or len(stripped) >= 20
 
 
 def _should_fast_accept_raw_text(text: str) -> bool:

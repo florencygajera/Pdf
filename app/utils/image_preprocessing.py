@@ -36,9 +36,12 @@ def estimate_page_complexity(image: np.ndarray) -> dict:
 
     std = float(np.std(sample))
     dark_ratio = float(np.mean(sample < 180))
-    edge_ratio = float(
-        np.mean(cv2.Canny(sample, 50, 150) > 0) if sample.size else 0.0
-    )
+    if std < 28.0:
+        edge_ratio = 0.0
+    else:
+        edge_ratio = float(
+            np.mean(cv2.Canny(sample, 50, 150) > 0) if sample.size else 0.0
+        )
     needs_full_preprocess = std < 28.0 or dark_ratio > 0.28 or edge_ratio > 0.10
 
     return {

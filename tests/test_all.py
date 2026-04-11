@@ -436,6 +436,22 @@ class TestPerformanceFixes:
         assert stitched[0]["raw_results"] is pages[0]["raw_results"]
         assert stitched[0]["warnings"] is not pages[0]["warnings"]
 
+    def test_estimate_page_complexity_skips_canny_for_low_std(self, monkeypatch):
+        import numpy as np
+        from app.utils import image_preprocessing
+
+        def fail_canny(*args, **kwargs):
+            raise AssertionError("Canny should not be called for low-std pages")
+
+        monkeypatch.setattr(image_preprocessing.cv2, "Canny", fail_canny)
+
+        image = np.full((200, 200, 3), 255, dtype=np.uint8)
+        result = image_preprocessing.estimate_page_complexity(image)
+
+        assert result["std"] < 28.0
+        assert result["edge_ratio"] == 0.0
+        assert result["needs_full_preprocess"] is True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Layout Engine Tests
