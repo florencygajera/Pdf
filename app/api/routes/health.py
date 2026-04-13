@@ -1,12 +1,12 @@
 """
 Health Check Routes
-/healthz   — liveness probe (always returns 200 if app is running)
+/ping      — unauthenticated liveness stub for Docker / Kubernetes probes
+/healthz   — liveness probe (requires API key when one is configured)
 /readyz    — readiness probe (checks Redis/Celery connectivity)
 
-FIX: /healthz now enforces API key when one is configured, matching the test
-     expectation (test_health_requires_api_key expects 401 from unauthed client).
-     In production Kubernetes, the liveness probe should be called from within
-     the cluster (no external auth needed), so configure your probe accordingly.
+FIX: Added /ping — a zero-auth, zero-dependency endpoint so Docker HEALTHCHECK
+     and k8s liveness probes work without embedding the API key in the manifest.
+     /healthz still enforces API key authentication as before.
 """
 
 import time
@@ -24,6 +24,16 @@ logger = get_logger(__name__)
 _START_TIME = time.time()
 
 
+# ── Unauthenticated liveness stub ────────────────────────────────────────────
+# FIX: Docker HEALTHCHECK and k8s liveness probes cannot supply an API key.
+# /ping is intentionally minimal — it only checks that the process is alive
+# and the event loop is running. No auth, no Redis, no heavy logic.
+@router.get("/ping", include_in_schema=False)
+async def ping():
+    """Unauthenticated liveness stub for infrastructure probes."""
+    return {"pong": True}
+
+
 @router.get(
     "/healthz",
     summary="Liveness probe",
@@ -32,10 +42,9 @@ _START_TIME = time.time()
 async def health_live():
     """
     Kubernetes liveness probe — returns 200 if process is alive.
-
-    FIX: Now requires API key when one is configured. This matches the test
-    assertion that an unauthenticated client gets a 401 from /healthz.
-    For internal cluster probes, configure your probe to include X-API-Key header.
+    Requires API key when one is configured.
+    For internal cluster probes, configure your probe to include X-API-Key header,
+    or use /ping which requires no authentication.
     """
     return {"status": "ok", "uptime_seconds": round(time.time() - _START_TIME, 1)}
 

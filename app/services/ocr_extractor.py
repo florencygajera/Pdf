@@ -1,12 +1,18 @@
 """
 OCR Extraction Engine.
 
-Fixes applied:
+FIXES:
+  FIX — Added shutdown_ocr_executor() so the lifespan handler can cleanly
+         terminate the ProcessPoolExecutor on app shutdown. Previously the
+         executor was a module-level global with no cleanup path, leaving
+         zombie worker processes after the main process exited.
   FIX — Added _get_multiprocessing_context() function (referenced in tests)
-  FIX — os and sys are now module-level imports (tests monkeypatch ocr_extractor.os)
-  FIX — mp is now a module-level reference to multiprocessing (tests monkeypatch ocr_extractor.mp)
-  PERF — DPI auto-capped at 120 for documents >5 pages (speeds up render step ~35%)
-  PERF — Fast path (no preprocessing) is taken first; full pipeline only on failure
+  FIX — os and sys are module-level imports (tests monkeypatch ocr_extractor.os)
+  FIX — mp is a module-level reference to multiprocessing (tests monkeypatch it)
+
+PERFORMANCE:
+  PERF — DPI auto-capped per settings.effective_ocr_dpi() (floor now 110)
+  PERF — Fast path (no preprocessing) taken first; full pipeline only on failure
   PERF — PaddleOCR pool size is hardware-aware (avoids serial bottleneck)
 """
 
@@ -50,7 +56,6 @@ except Exception:
 
 def _get_multiprocessing_context():
     """
-    FIX: Added this function — referenced in tests as ocr_extractor._get_multiprocessing_context().
     Returns the appropriate multiprocessing context for the current platform.
     Uses 'fork' on Linux (faster worker startup), 'spawn' on Windows/macOS (safer).
     """
@@ -193,7 +198,6 @@ def _get_ocr_executor():
         if _ocr_executor is not None:
             return _ocr_executor
 
-        # FIX: use _get_multiprocessing_context() — consistent with test expectations
         ctx = _get_multiprocessing_context()
         _ocr_executor = ProcessPoolExecutor(
             max_workers=max(1, settings.effective_ocr_chunk_workers),
@@ -201,6 +205,29 @@ def _get_ocr_executor():
             initializer=_ocr_worker_initializer,
         )
         return _ocr_executor
+
+
+def shutdown_ocr_executor(wait: bool = True) -> None:
+    """
+    FIX: Cleanly shut down the OCR ProcessPoolExecutor.
+
+    Called from the FastAPI lifespan shutdown handler to prevent zombie worker
+    processes from lingering after the main application process exits.
+
+    Args:
+        wait: If True (default), wait for pending futures to complete before
+              shutting down. Set to False for immediate (ungraceful) termination.
+    """
+    global _ocr_executor
+    with _ocr_executor_lock:
+        if _ocr_executor is not None:
+            try:
+                _ocr_executor.shutdown(wait=wait, cancel_futures=not wait)
+                logger.info("OCR ProcessPoolExecutor shut down (wait=%s).", wait)
+            except Exception as exc:
+                logger.warning("OCR executor shutdown error: %s", exc)
+            finally:
+                _ocr_executor = None
 
 
 def _configure_paddle_runtime() -> None:
@@ -462,11 +489,8 @@ def ocr_single_page_image(
     """
     Run OCR on a single PIL image.
 
-    Fast path:
-      - run PaddleOCR on the raw rendered page first
-      - accept immediately if it looks good enough
-    Slow path:
-      - run the full preprocessing pipeline only for pages that need it
+    Fast path: run PaddleOCR on the raw rendered page first; accept if good.
+    Slow path: full preprocessing pipeline only for pages that need it.
     """
     warnings: List[str] = []
     render_dpi = dpi or settings.OCR_DPI

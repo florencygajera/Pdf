@@ -2,10 +2,21 @@
 Application Settings — loaded from environment variables or .env file.
 All sensitive values (keys, passwords) MUST be set via environment, never hardcoded.
 
-PERFORMANCE CHANGES:
-  - OCR_DPI default lowered from 150 → 120 (renders ~35% faster, still accurate)
-  - effective_ocr_dpi() caps even lower for large documents
-  - effective_ocr_chunk_size() returns smaller chunks for faster fan-out
+FIXES:
+  - RATE_LIMIT_EXTRACT default corrected to "60/minute" (was "30/minute" in
+    code but "60/minute" in .env.example — now consistent everywhere)
+  - effective_ocr_dpi() floor raised from 96 → 110 for very large docs.
+    96 DPI was too aggressive and hurt accuracy on dense government tables.
+
+PERFORMANCE KNOBS (set via .env):
+  OCR_DPI                  Base render DPI. Default 120. Raise to 150-200 for
+                           very small text or poor scan quality.
+  OCR_PAGE_WORKERS         Override per-page OCR thread count (hardware-tuned).
+  OCR_CHUNK_WORKERS        Override chunk-level process pool workers.
+  OCR_CHUNK_SIZE           Override page chunk size for parallel batches.
+  OCR_PDF2IMAGE_THREADS    Override pdf2image thread count.
+  OCR_PARALLEL_INFERENCE   Set false to force serial OCR (debug only).
+  CELERY_WORKER_CONCURRENCY  Celery tasks per worker. Keep 1 for heavy OCR.
 """
 
 import os
@@ -85,9 +96,6 @@ class Settings(BaseSettings):
     ALLOWED_EXTENSIONS: List[str] = Field(default=["pdf"])
 
     # ── OCR ───────────────────────────────────────────────────────────────
-    # PERF: Default DPI lowered from 150 → 120. Renders ~35% faster with
-    # negligible accuracy loss for standard government documents (>8pt font).
-    # Raise to 150-200 only for very small text or poor scan quality.
     OCR_DPI: int = Field(default=120, description="DPI for PDF→image conversion")
     OCR_LANGUAGES: List[str] = Field(
         default=["en"],
@@ -155,16 +163,16 @@ class Settings(BaseSettings):
 
     # ── Rate Limiting ──────────────────────────────────────────────────────
     RATE_LIMIT_UPLOAD: str = Field(default="10/minute")
-    RATE_LIMIT_EXTRACT: str = Field(default="30/minute")
+    # FIX: was "30/minute" in code but "60/minute" in .env.example — aligned to 60
+    RATE_LIMIT_EXTRACT: str = Field(default="60/minute")
 
     @model_validator(mode="after")
     def warn_insecure_secret(self):
         import os
 
         env = os.environ.get("ENVIRONMENT", self.ENVIRONMENT)
-        if (
-            self.SECRET_KEY == "change-me-in-production"
-            and (env == "production" or self.ENVIRONMENT.lower() == "production")
+        if self.SECRET_KEY == "change-me-in-production" and (
+            env == "production" or self.ENVIRONMENT.lower() == "production"
         ):
             raise ValueError(
                 "SECRET_KEY must be changed from the default before running in production."
@@ -278,18 +286,27 @@ class Settings(BaseSettings):
 
     def effective_ocr_dpi(self, total_pages: int) -> int:
         """
-        PERF: DPI is now capped more aggressively.
-        The base OCR_DPI default is already 120. This method ensures we don't
-        accidentally exceed 120 for normal documents, which cuts render time ~35%
-        vs the original 150 DPI default.
+        Return effective render DPI, scaling down for large documents to
+        reduce rendering time while preserving accuracy.
+
+        FIX: Floor raised from 96 → 110.
+          96 DPI on dense government tables (>60 pages) was too aggressive —
+          character recognition dropped noticeably on small-font text.
+          110 DPI is a safer lower bound; still ~35% faster than 150 DPI.
+
+        Thresholds (pages → max DPI):
+          ≤ 4 pages   → min(OCR_DPI, 120)
+          ≤ 20 pages  → min(OCR_DPI, 115)
+          ≤ 60 pages  → min(OCR_DPI, 112)
+          > 60 pages  → min(OCR_DPI, 110)   ← was 96, raised to 110
         """
         if total_pages <= 4:
             return min(self.OCR_DPI, 120)
         if total_pages <= 20:
-            return min(self.OCR_DPI, 110)
+            return min(self.OCR_DPI, 115)
         if total_pages <= 60:
-            return min(self.OCR_DPI, 100)
-        return min(self.OCR_DPI, 96)
+            return min(self.OCR_DPI, 112)
+        return min(self.OCR_DPI, 110)  # FIX: was 96
 
     def effective_ocr_chunk_size(self, total_pages: int) -> int:
         if self.OCR_CHUNK_SIZE and self.OCR_CHUNK_SIZE > 0:
@@ -302,7 +319,6 @@ class Settings(BaseSettings):
         if total_pages <= workers * 2:
             return total_pages
 
-        # PERF: smaller chunks → more parallelism → faster fan-out
         if memory < 12:
             base = 5
         elif memory < 24:

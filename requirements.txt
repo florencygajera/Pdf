@@ -33,8 +33,10 @@ structlog==24.4.0
 # Validation / NLP
 langdetect==1.0.9
 
-# Optional Layout Parser
-# Install only if you need ML-based layout analysis.
+# System / Hardware detection
+# FIX: psutil was used in app/config/settings.py (_detect_memory_gb) but missing
+# from requirements. Without it, memory-aware worker tuning silently falls back to 8 GB.
+psutil>=5.9.0
 
 # Dev / Testing
 pytest==8.3.3

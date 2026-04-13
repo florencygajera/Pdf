@@ -2,11 +2,18 @@
 Celery Worker
 Handles async/background PDF extraction jobs.
 
-Fixes applied:
-  C2 — self.retry() is now only called for genuinely transient errors
-        (IOError, OSError, MemoryError, RuntimeError). ValueError and all
-        other application-level exceptions write a failed result and return
-        immediately instead of restarting the full OCR job.
+FIXES:
+  C2 — self.retry() is only called for genuinely transient errors.
+  C3 — RuntimeError removed from _RETRYABLE_ERRORS (too broad — many
+        application-level errors raise RuntimeError, e.g. PaddleOCR import
+        failures, shape mismatches, config errors; these should be permanent
+        failures, not retried).
+  C4 — IOError removed from _RETRYABLE_ERRORS; IOError is an alias for OSError
+        since Python 3.3, so listing both was redundant.
+
+After fixes:  _RETRYABLE_ERRORS = (OSError, MemoryError)
+  - OSError covers all filesystem/network transient failures
+  - MemoryError covers OOM scenarios worth retrying once
 """
 
 import json
@@ -59,8 +66,11 @@ if sys.platform == "win32":
 
 task_logger = get_task_logger(__name__)
 
-# C2 fix: only retry on these truly transient error types
-_RETRYABLE_ERRORS = (IOError, OSError, MemoryError, RuntimeError)
+# FIX C3+C4: Only retry on filesystem / memory errors.
+#   - Removed RuntimeError: too broad; catches application-level failures that
+#     should be permanent (OCR import errors, config errors, shape mismatches).
+#   - Removed IOError: it is an alias for OSError since Python 3.3, redundant.
+_RETRYABLE_ERRORS = (OSError, MemoryError)
 
 
 @celery_app.task(
@@ -116,13 +126,15 @@ def extract_pdf_task(self, job_id: str) -> dict:
         raise
 
     except ValueError as exc:
-        # Non-retryable: bad PDF, invalid content
-        task_logger.error(f"Validation error for job {job_id}: {exc}\n{traceback.format_exc()}")
+        # Non-retryable: bad PDF, invalid content, validation failure
+        task_logger.error(
+            f"Validation error for job {job_id}: {exc}\n{traceback.format_exc()}"
+        )
         _write_failed_result(job_id, output_path, str(exc))
         raise
 
     except _RETRYABLE_ERRORS as exc:
-        # C2 fix: only retry genuinely transient infrastructure errors
+        # FIX C3: Only retry OSError / MemoryError — genuine transient failures
         task_logger.warning(f"Transient error for job {job_id} (will retry): {exc}")
         try:
             raise self.retry(exc=exc)
@@ -135,8 +147,7 @@ def extract_pdf_task(self, job_id: str) -> dict:
             }
 
     except Exception as exc:
-        # C2 fix: all other errors are treated as permanent failures — no retry.
-        # Previously ANY exception triggered a retry, causing duplicate full OCR runs.
+        # All other errors (including RuntimeError) are permanent failures — no retry.
         task_logger.error(
             f"Permanent error for job {job_id}: {exc}\n{traceback.format_exc()}"
         )

@@ -6,6 +6,10 @@ POST /api/v1/upload
   - Returns job_id for polling
 
 Rate-limited to prevent abuse.
+
+FIX: Now imports the shared Limiter instance from app.api.limiter instead of
+creating its own. Previously each route module had its own Limiter(), which
+meant rate-limit counters were NOT shared between upload and extract buckets.
 """
 
 from fastapi import (
@@ -17,9 +21,8 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 
+from app.api.limiter import limiter  # FIX: shared limiter
 from app.config.settings import settings
 from app.api.security import require_api_key
 from app.models.response_model import ErrorResponse, UploadResponse
@@ -28,7 +31,6 @@ from app.utils.logger import get_logger
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
 logger = get_logger(__name__)
-limiter = Limiter(key_func=get_remote_address)
 
 
 def _enqueue_or_run(job_id: str, background_tasks: BackgroundTasks) -> None:
@@ -126,7 +128,7 @@ async def upload_pdf(
     """
     job_id, saved_path, size_bytes = await save_upload_streaming(file)
 
-    # ── C1 fix: dedup by SHA-256 — reuse existing completed result ─────────
+    # ── Dedup by SHA-256 — reuse existing completed result ─────────────────
     from app.utils.file_handler import get_upload_hash_path
 
     hash_path = get_upload_hash_path(job_id)
@@ -134,7 +136,6 @@ async def upload_pdf(
         file_hash = hash_path.read_text(encoding="utf-8").strip()
         existing_job_id = find_job_id_by_hash(file_hash)
         if existing_job_id and existing_job_id != job_id:
-            # Clean up the duplicate upload and reuse the cached result
             from app.utils.file_handler import cleanup_job_files
 
             cleanup_job_files(job_id)

@@ -1,9 +1,16 @@
 """
 Extract Routes
 GET  /api/v1/extract/{job_id}         — poll status / get final result
+GET  /api/v1/extract/{job_id}/status  — lightweight progress check
 GET  /api/v1/extract/{job_id}/text    — get only the clean text
 GET  /api/v1/extract/{job_id}/tables  — get only tables as JSON
 DELETE /api/v1/extract/{job_id}       — cancel and clean up job files
+
+FIX: Imports the shared Limiter from app.api.limiter (was creating a new
+     instance locally — rate-limit buckets were NOT shared with upload.py).
+FIX: get_job_status, get_text_only, get_tables_only, and delete_job now
+     accept `request: Request` and carry @limiter.limit() decorators — these
+     sub-endpoints were previously completely unthrottled.
 """
 
 import json
@@ -12,9 +19,8 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 
+from app.api.limiter import limiter  # FIX: shared limiter
 from app.config.constants import (
     STATE_DONE,
     STATE_FAILED,
@@ -34,7 +40,7 @@ from app.utils.logger import get_logger
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
 logger = get_logger(__name__)
-limiter = Limiter(key_func=get_remote_address)
+
 RESULT_NOT_FOUND = "not_found"
 RESULT_EXPIRED = "expired"
 
@@ -107,9 +113,9 @@ def _load_output(job_id: str) -> dict:
 def _resolve_job_status(job_id: str):
     """
     Determine job status from multiple sources:
-    1. Celery backend (if available)
-    2. Output file on disk (fastest check)
-    3. Upload file existence (pending)
+    1. Output file on disk (fastest — avoids Celery round-trip for done jobs)
+    2. Celery backend (for in-flight jobs)
+    3. Upload file existence (fallback pending signal)
 
     Returns (status, progress, message, result_data_or_None)
     """
@@ -138,11 +144,8 @@ def _resolve_job_status(job_id: str):
     if celery_status:
         return celery_status, pct, msg, None
 
-    # Upload exists but no output → still processing
-    if upload_path.exists():
-        return STATE_PROCESSING, 5.0, "Processing started.", None
-
-    return None, 0.0, "", None
+    # Upload exists but no output and no Celery state → still processing
+    return STATE_PROCESSING, 5.0, "Processing started.", None
 
 
 @router.get(
@@ -214,7 +217,8 @@ async def get_extraction_result(request: Request, job_id: str):
     response_model=JobStatus,
     summary="Lightweight status check",
 )
-async def get_job_status(job_id: str):
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)  # FIX: was unthrottled
+async def get_job_status(request: Request, job_id: str):  # FIX: added request: Request
     """
     Lightweight status check (no full result body).
     Returns just status + progress percentage.
@@ -235,7 +239,8 @@ async def get_job_status(job_id: str):
     "/extract/{job_id}/text",
     summary="Get only extracted text",
 )
-async def get_text_only(job_id: str):
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)  # FIX: was unthrottled
+async def get_text_only(request: Request, job_id: str):  # FIX: added request: Request
     """Return only the clean extracted text for a completed job."""
     status, _, _, data = _resolve_job_status(job_id)
     if status is None:
@@ -262,7 +267,8 @@ async def get_text_only(job_id: str):
     response_model=List[TableData],
     summary="Get only extracted tables",
 )
-async def get_tables_only(job_id: str):
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)  # FIX: was unthrottled
+async def get_tables_only(request: Request, job_id: str):  # FIX: added request: Request
     """Return only extracted tables for a completed job."""
     status, _, _, data = _resolve_job_status(job_id)
     if status is None:
@@ -289,7 +295,8 @@ async def get_tables_only(job_id: str):
     "/extract/{job_id}",
     summary="Cancel and clean up job",
 )
-async def delete_job(job_id: str):
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)  # FIX: was unthrottled
+async def delete_job(request: Request, job_id: str):  # FIX: added request: Request
     """
     Cancel a running job (best-effort) and delete all associated files.
     """
