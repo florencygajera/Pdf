@@ -119,3 +119,6 @@ create_init_files.sh            ← NEW (creates missing __init__.py files)
 The file at `app/api/routes/limiter.py` can remain — it won't cause errors.
 But nothing imports from it. The actual used limiter is now at `app/api/limiter.py`.
 You can delete `app/api/routes/limiter.py` to avoid confusion, or leave it.
+
+#celery -A app.workers.celery_worker worker --pool=solo --loglevel=info
+#uvicorn app.main:app --reload --port 8000
