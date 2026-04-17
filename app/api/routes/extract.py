@@ -11,6 +11,9 @@ FIX: Imports the shared Limiter from app.api.limiter (was creating a new
 FIX: get_job_status, get_text_only, get_tables_only, and delete_job now
      accept `request: Request` and carry @limiter.limit() decorators — these
      sub-endpoints were previously completely unthrottled.
+FIX: delete_job no longer blocks for asyncio.sleep(2) after revoking Celery task.
+     The sleep was pointless (revoke is fire-and-forget) and added 2s to every
+     DELETE request, stalling the event loop for all concurrent clients.
 """
 
 import json
@@ -20,7 +23,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from app.api.limiter import limiter  # FIX: shared limiter
+from app.api.limiter import limiter  # shared limiter instance
 from app.config.constants import (
     STATE_DONE,
     STATE_FAILED,
@@ -217,8 +220,8 @@ async def get_extraction_result(request: Request, job_id: str):
     response_model=JobStatus,
     summary="Lightweight status check",
 )
-@limiter.limit(settings.RATE_LIMIT_EXTRACT)  # FIX: was unthrottled
-async def get_job_status(request: Request, job_id: str):  # FIX: added request: Request
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)
+async def get_job_status(request: Request, job_id: str):
     """
     Lightweight status check (no full result body).
     Returns just status + progress percentage.
@@ -239,8 +242,8 @@ async def get_job_status(request: Request, job_id: str):  # FIX: added request: 
     "/extract/{job_id}/text",
     summary="Get only extracted text",
 )
-@limiter.limit(settings.RATE_LIMIT_EXTRACT)  # FIX: was unthrottled
-async def get_text_only(request: Request, job_id: str):  # FIX: added request: Request
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)
+async def get_text_only(request: Request, job_id: str):
     """Return only the clean extracted text for a completed job."""
     status, _, _, data = _resolve_job_status(job_id)
     if status is None:
@@ -267,8 +270,8 @@ async def get_text_only(request: Request, job_id: str):  # FIX: added request: R
     response_model=List[TableData],
     summary="Get only extracted tables",
 )
-@limiter.limit(settings.RATE_LIMIT_EXTRACT)  # FIX: was unthrottled
-async def get_tables_only(request: Request, job_id: str):  # FIX: added request: Request
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)
+async def get_tables_only(request: Request, job_id: str):
     """Return only extracted tables for a completed job."""
     status, _, _, data = _resolve_job_status(job_id)
     if status is None:
@@ -295,20 +298,21 @@ async def get_tables_only(request: Request, job_id: str):  # FIX: added request:
     "/extract/{job_id}",
     summary="Cancel and clean up job",
 )
-@limiter.limit(settings.RATE_LIMIT_EXTRACT)  # FIX: was unthrottled
-async def delete_job(request: Request, job_id: str):  # FIX: added request: Request
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)
+async def delete_job(request: Request, job_id: str):
     """
     Cancel a running job (best-effort) and delete all associated files.
+
+    FIX: Removed asyncio.sleep(2) that was blocking the event loop for 2 full
+    seconds on every delete request. Celery revoke() is fire-and-forget — there
+    is no reason to wait; the worker will handle the signal asynchronously.
     """
-    # Best-effort Celery revoke
+    # Best-effort Celery revoke — fire and forget, no wait needed
     try:
         from app.workers.celery_worker import celery_app
 
         celery_app.control.revoke(job_id, terminate=True, signal="SIGTERM")
-        import asyncio
-
-        await asyncio.sleep(2)
-        logger.info(f"Celery task {job_id} revoked.")
+        logger.info(f"Celery task {job_id} revoke signal sent.")
     except Exception:
         pass
 
