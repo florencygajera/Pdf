@@ -16,6 +16,8 @@ ENV/
 htmlcov/
 .tox/
 .pytest_cache/
+.pytest-tmp/
+_tmp/
 tmp_*.pdf
 uploads/
 *.pdf

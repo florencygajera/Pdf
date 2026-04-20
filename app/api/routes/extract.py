@@ -294,18 +294,12 @@ async def get_tables_only(request: Request, job_id: str):
     return [TableData(**t) for t in tables]
 
 
-@router.delete(
-    "/extract/{job_id}",
-    summary="Cancel and clean up job",
-)
-@limiter.limit(settings.RATE_LIMIT_EXTRACT)
-async def delete_job(request: Request, job_id: str):
+async def delete_job(job_id: str):
     """
     Cancel a running job (best-effort) and delete all associated files.
 
-    FIX: Removed asyncio.sleep(2) that was blocking the event loop for 2 full
-    seconds on every delete request. Celery revoke() is fire-and-forget — there
-    is no reason to wait; the worker will handle the signal asynchronously.
+    This helper stays undecorated so tests and internal callers can invoke it
+    directly. The API route below wraps it with request/rate-limit handling.
     """
     # Best-effort Celery revoke — fire and forget, no wait needed
     try:
@@ -318,3 +312,12 @@ async def delete_job(request: Request, job_id: str):
 
     cleanup_job_files(job_id)
     return {"job_id": job_id, "message": "Job cancelled and files cleaned up."}
+
+
+@router.delete(
+    "/extract/{job_id}",
+    summary="Cancel and clean up job",
+)
+@limiter.limit(settings.RATE_LIMIT_EXTRACT)
+async def delete_job_route(request: Request, job_id: str):
+    return await delete_job(job_id)
