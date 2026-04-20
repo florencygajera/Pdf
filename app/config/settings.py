@@ -150,7 +150,7 @@ class Settings(BaseSettings):
     # ── Redis / Celery ─────────────────────────────────────────────────────
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
     CELERY_TASK_TIMEOUT: int = Field(
-        default=1800, description="Seconds before task killed"
+        default=30, description="Seconds before task killed"
     )
     CELERY_WORKER_CONCURRENCY: Optional[int] = Field(
         default=1,

@@ -48,7 +48,7 @@ celery_app.conf.update(
     accept_content=["json"],
     task_track_started=True,
     task_time_limit=settings.CELERY_TASK_TIMEOUT,
-    task_soft_time_limit=max(30, settings.CELERY_TASK_TIMEOUT - 30),
+    task_soft_time_limit=max(5, settings.CELERY_TASK_TIMEOUT - 5),
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     result_expires=settings.RESULT_EXPIRES_SECONDS,
