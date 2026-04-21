@@ -54,7 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PaddlePaddle
-RUN pip install --no-cache-dir paddlepaddle==2.6.1
+RUN pip install --no-cache-dir paddlepaddle==2.6.2
 
 # Install Python dependencies from wheels
 COPY --from=builder /wheels /wheels
