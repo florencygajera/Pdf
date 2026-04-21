@@ -29,6 +29,7 @@ redis==5.0.8
 
 # Logging
 structlog==24.4.0
+setuptools<82
 
 # Validation / NLP
 langdetect==1.0.9
