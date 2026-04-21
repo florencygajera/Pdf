@@ -49,10 +49,9 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Startup purge failed (non-fatal): {exc}")
 
-    # FIX: Pre-warm PaddleOCR pool in background so the first real request
-    # doesn't pay the 5-10s model-load penalty. Skipped in test environments
-    # where PaddleOCR is not installed/needed.
-    if not settings.is_testing:
+    # Pre-warm PaddleOCR only when explicitly enabled. On constrained deploys,
+    # importing Paddle during startup can trigger crashes or excessive memory use.
+    if not settings.is_testing and settings.OCR_PREWARM_ON_STARTUP:
         try:
             import asyncio
             import concurrent.futures

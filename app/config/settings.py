@@ -134,6 +134,10 @@ class Settings(BaseSettings):
         default=True,
         description="Allow OCR inference to run concurrently across a bounded pool",
     )
+    OCR_PREWARM_ON_STARTUP: bool = Field(
+        default=False,
+        description="Warm up PaddleOCR during app startup. Keep false on constrained deploys.",
+    )
     # PERF: Skip expensive scanned table detection for documents <5 pages.
     # Table detection on scanned pages adds 1-3s per page via grid detection.
     OCR_SKIP_SCANNED_TABLES_UNDER_PAGES: int = Field(

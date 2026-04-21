@@ -44,6 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     ghostscript \
     libglib2.0-0 \
+    libgomp1 \
     libsm6 \
     libxext6 \
     libxrender1 \
@@ -87,9 +88,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/healthz || exit 1
 
 # Start server
+# Keep a single web worker: Paddle OCR and PDF parsing are memory-heavy, and
+# Render already provisions WEB_CONCURRENCY=1 by default for this service.
 CMD ["uvicorn", "app.main:app", \
     "--host", "0.0.0.0", \
     "--port", "8000", \
-    "--workers", "2", \
+    "--workers", "1", \
     "--log-level", "info", \
     "--access-log"]
