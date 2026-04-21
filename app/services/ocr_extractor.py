@@ -23,8 +23,8 @@ PERFORMANCE FIXES:
           as each page is submitted (avoids holding all rendered pages in RAM).
   PERF — ocr_single_page_image: fast-path acceptance threshold relaxed; full
           preprocessing only triggered when fast OCR returns 0 results or very
-          low confidence (< 0.4), not just "not looks good".
-  PERF — DPI auto-capped per settings.effective_ocr_dpi() (speed-optimized thresholds)
+          low confidence (< 0.3), not just "not looks good".
+  PERF — OCR DPI is floored to 150 for scanned Gujarati PDFs.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from __future__ import annotations
 import gc
 import os
 import sys
+import time
 import threading
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -97,21 +98,30 @@ class _PaddleOCRPool:
             self._init_error = exc
             raise
 
-        lang = settings.ocr_language
-        instance = PaddleOCR(
-            use_angle_cls=True,
-            lang=lang,
-            use_gpu=settings.OCR_USE_GPU,
-            show_log=False,
-        )
-        logger.info(
-            "PaddleOCR instance initialized | lang=%s | gpu=%s | slot=%s/%s",
-            lang,
-            settings.OCR_USE_GPU,
-            self._created + 1,
-            self.max_instances,
-        )
-        return instance
+        last_exc = None
+        for lang in settings.ocr_language_candidates:
+            try:
+                instance = PaddleOCR(
+                    use_angle_cls=True,
+                    lang=lang,
+                    use_gpu=settings.OCR_USE_GPU,
+                    show_log=False,
+                )
+                logger.info(
+                    "PaddleOCR instance initialized | lang=%s | gpu=%s | slot=%s/%s",
+                    lang,
+                    settings.OCR_USE_GPU,
+                    self._created + 1,
+                    self.max_instances,
+                )
+                return instance
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("PaddleOCR init failed for lang=%s: %s", lang, exc)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("PaddleOCR initialization failed without an exception.")
 
     @contextmanager
     def borrow(self):
@@ -467,7 +477,7 @@ def _ocr_result_looks_good(page_result: Dict[str, Any]) -> bool:
     """
     PERF FIX: Relaxed acceptance criteria on the fast path.
     Was: confidence >= OCR_CONFIDENCE_THRESHOLD (0.6) AND len >= 20 OR words >= 3
-    Now: confidence >= 0.4 AND (len >= 15 OR words >= 2)
+    Now: confidence >= 0.3 AND (len >= 15 OR words >= 2)
     This reduces expensive full-preprocessing fallback by ~40% on clean docs.
     """
     text = (page_result.get("text") or "").strip()
@@ -475,7 +485,7 @@ def _ocr_result_looks_good(page_result: Dict[str, Any]) -> bool:
         return False
     confidence = float(page_result.get("confidence") or 0.0)
     # PERF: Accept if confidence is reasonable, not just above threshold
-    if confidence < 0.4:
+    if confidence < 0.3:
         return False
     return len(text) >= 15 or len(text.split()) >= 2
 
@@ -501,15 +511,22 @@ def ocr_single_page_image(
 
     PERF FIXES:
       Fast path: run PaddleOCR on raw rendered page; accept immediately if
-      result looks reasonable (confidence >= 0.4, not 0.6).
+      result looks reasonable (confidence >= 0.3, not 0.6).
       Slow path: full preprocessing only when fast path returns 0 results
-      OR confidence < 0.4. This skips expensive preprocessing for ~70% of pages.
+      OR confidence < 0.3. This skips expensive preprocessing for ~70% of pages.
     """
     warnings: List[str] = []
-    render_dpi = dpi or settings.OCR_DPI
+    started = time.perf_counter()
+    render_dpi = max(150, dpi or settings.OCR_DPI)
     raw_image = _page_array_from_image(image)
     rendered_image = raw_image if include_rendered_image else None
     profile = estimate_page_complexity(raw_image)
+    logger.info(
+        "OCR page start | page=%s | lang=%s | dpi=%s",
+        page_number,
+        settings.ocr_language,
+        render_dpi,
+    )
 
     # Always attempt fast path first
     try:
@@ -526,6 +543,11 @@ def ocr_single_page_image(
             )
             # PERF FIX: Accept fast result eagerly; only fall through if very bad
             if _ocr_result_looks_good(fast_page):
+                logger.info(
+                    "OCR page end | page=%s | mode=fast | duration_seconds=%.2f",
+                    page_number,
+                    time.perf_counter() - started,
+                )
                 return fast_page
     except Exception as exc:
         fast_page = None
@@ -605,8 +627,18 @@ def ocr_single_page_image(
     )
 
     if fast_score >= heavy_score and fast_page and _ocr_result_looks_good(fast_page):
+        logger.info(
+            "OCR page end | page=%s | mode=fast-accepted | duration_seconds=%.2f",
+            page_number,
+            time.perf_counter() - started,
+        )
         return fast_page
 
+    logger.info(
+        "OCR page end | page=%s | mode=heavy | duration_seconds=%.2f",
+        page_number,
+        time.perf_counter() - started,
+    )
     return heavy_page
 
 
@@ -675,7 +707,8 @@ def extract_ocr_pdf(
     dpi: int = None,
 ) -> List[Dict[str, Any]]:
     """Full OCR extraction pipeline using the PDF on disk."""
-    dpi = dpi or settings.OCR_DPI
+    started = time.perf_counter()
+    dpi = max(150, dpi or settings.OCR_DPI)
     try:
         with fitz.open(str(pdf_path)) as doc:
             total_pages = len(doc)
@@ -700,11 +733,12 @@ def extract_ocr_pdf(
 
     if use_process_pool:
         logger.info(
-            "OCR using shared process pool | pages=%s | chunks=%s | workers=%s | dpi=%s",
+            "OCR using shared process pool | pages=%s | chunks=%s | workers=%s | dpi=%s | lang=%s",
             len(normalized_pages),
             len(chunks),
             settings.effective_ocr_chunk_workers,
             dpi,
+            settings.ocr_language,
         )
         try:
             stat = pdf_path.stat()
@@ -753,7 +787,10 @@ def extract_ocr_pdf(
 
     results.sort(key=lambda item: item.get("page_number", 0))
     logger.info(
-        "OCR extraction complete | pages=%s | file=%s", len(results), pdf_path.name
+        "OCR extraction complete | pages=%s | file=%s | duration_seconds=%.2f",
+        len(results),
+        pdf_path.name,
+        time.perf_counter() - started,
     )
     return results
 
@@ -764,7 +801,8 @@ def extract_ocr_pdf_from_bytes(
     dpi: int = None,
 ) -> List[Dict[str, Any]]:
     """Bytes-based OCR pipeline to avoid repeated disk reads."""
-    dpi = dpi or settings.OCR_DPI
+    started = time.perf_counter()
+    dpi = max(150, dpi or settings.OCR_DPI)
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
@@ -793,7 +831,11 @@ def extract_ocr_pdf_from_bytes(
         parallel=len(all_images) > 1,
     )
 
-    logger.info("OCR extraction complete | pages=%s | bytes input", len(results))
+    logger.info(
+        "OCR extraction complete | pages=%s | bytes input | duration_seconds=%.2f",
+        len(results),
+        time.perf_counter() - started,
+    )
     return results
 
 
@@ -806,7 +848,15 @@ def extract_ocr_pdf_local(
     Local OCR path intended for process-pool chunk workers.
     Performs rendering + OCR sequentially to avoid nested process pools.
     """
-    dpi = dpi or settings.OCR_DPI
+    started = time.perf_counter()
+    dpi = max(150, dpi or settings.OCR_DPI)
+    logger.info(
+        "OCR local batch start | pdf=%s | pages=%s | lang=%s | dpi=%s",
+        pdf_path.name,
+        len(page_numbers or []),
+        settings.ocr_language,
+        dpi,
+    )
     all_images = _render_pages_for_ocr(
         pdf_path=pdf_path,
         page_numbers=page_numbers,
@@ -838,4 +888,10 @@ def extract_ocr_pdf_local(
         results.append(page_info)
 
     results.sort(key=lambda item: item["page_number"])
+    logger.info(
+        "OCR local batch end | pdf=%s | pages=%s | duration_seconds=%.2f",
+        pdf_path.name,
+        len(results),
+        time.perf_counter() - started,
+    )
     return results

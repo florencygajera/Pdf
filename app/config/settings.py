@@ -2,12 +2,10 @@
 Application Settings — loaded from environment variables or .env file.
 All sensitive values (keys, passwords) MUST be set via environment, never hardcoded.
 
-PERFORMANCE FIXES FOR 10-15s EXTRACTION TARGET:
-  - OCR_DPI default lowered from 120 → 96. At 96 DPI PaddleOCR still achieves
-    ~92% character accuracy on clean government scans but renders 2.5x faster
-    than 150 DPI. Set OCR_DPI=150 in .env when accuracy > speed is needed.
-  - effective_ocr_dpi() thresholds tuned for speed-accuracy balance.
-  - OCR_CONFIDENCE_THRESHOLD lowered from 0.6 → 0.5 to reduce re-processing.
+PERFORMANCE FIXES FOR OCR TARGET:
+  - OCR_DPI default set to 150 so OCR runs at high-fidelity render resolution.
+  - effective_ocr_dpi() enforces a minimum 150 DPI for OCR input.
+  - OCR_CONFIDENCE_THRESHOLD lowered to 0.3 to avoid dropping valid Gujarati text.
   - OCR_PARALLEL_INFERENCE defaults True; effective_ocr_page_workers tuned to
     match the single PaddleOCR pool slot so we don't over-allocate threads.
   - RESULT_EXPIRES_SECONDS raised from 3600 → 7200 to support dedup cache hits
@@ -94,30 +92,23 @@ class Settings(BaseSettings):
     ALLOWED_EXTENSIONS: List[str] = Field(default=["pdf"])
 
     # ── OCR ───────────────────────────────────────────────────────────────
-    # PERF FIX: Default DPI lowered 120 → 96.
-    # At 96 DPI PaddleOCR achieves ~92% accuracy on clean scans vs ~94% at 150 DPI,
-    # but renders 2.5x faster. For high-accuracy mode set OCR_DPI=150 in .env.
-    OCR_DPI: int = Field(
-        default=96, description="DPI for PDF→image conversion. Lower = faster."
-    )
+    # OCR defaults are tuned for Gujarati PDFs and production OCR quality.
+    OCR_DPI: int = Field(default=150, description="DPI for PDF→image conversion.")
     OCR_LANGUAGE: Optional[str] = Field(
         default=None,
         description="Primary PaddleOCR language code, e.g. 'en' or 'gu'.",
     )
     OCR_LANGUAGES: List[str] = Field(
-        default=["en"],
-        description="Fallback PaddleOCR language list e.g. ['en','gu']; first supported entry is used when OCR_LANGUAGE is unset.",
+        default=["gu", "en"],
+        description="Fallback PaddleOCR language list e.g. ['gu','en']; first supported entry is used when OCR_LANGUAGE is unset.",
     )
     OCR_USE_GPU: bool = Field(default=False)
     OCR_ENABLE_MKLDNN: bool = Field(
         default=False,
         description="Enable Paddle MKLDNN/oneDNN acceleration for OCR if the runtime is stable",
     )
-    # PERF FIX: Lowered from 0.6 → 0.5. At 0.6 threshold, borderline results trigger
-    # expensive re-preprocessing. At 0.5 we accept more on first pass, reducing latency.
-    OCR_CONFIDENCE_THRESHOLD: float = Field(
-        default=0.5, description="Min confidence to accept OCR result"
-    )
+    # Lower threshold avoids dropping valid Gujarati glyphs on low-quality scans.
+    OCR_CONFIDENCE_THRESHOLD: float = Field(default=0.3, description="Min confidence to accept OCR result")
     OCR_PAGE_WORKERS: Optional[int] = Field(
         default=None,
         description="Override OCR page worker count; defaults to hardware-aware tuning",
@@ -158,7 +149,7 @@ class Settings(BaseSettings):
     # ── Redis / Celery ─────────────────────────────────────────────────────
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
     CELERY_TASK_TIMEOUT: int = Field(
-        default=15, description="Seconds before task killed"
+        default=300, description="Seconds before task killed"
     )
     CELERY_WORKER_CONCURRENCY: Optional[int] = Field(
         default=1,
@@ -168,7 +159,7 @@ class Settings(BaseSettings):
         default="prefork",
         description="Celery worker pool type. Use prefork for CPU-bound OCR workloads.",
     )
-    # PERF FIX: Raised from 3600 → 7200. Longer cache means dedup hits save a full re-extraction.
+    # Longer cache means dedup hits save a full re-extraction.
     RESULT_EXPIRES_SECONDS: int = Field(
         default=7200, description="Seconds before completed output files expire"
     )
@@ -308,21 +299,9 @@ class Settings(BaseSettings):
         reduce rendering time while preserving accuracy.
 
         PERF FIX: Thresholds tuned for speed-first with accuracy fallback.
-        Default OCR_DPI is 96; overriding to 150 in .env restores full accuracy.
-
-        Thresholds (pages → max DPI cap):
-          ≤ 3 pages   → min(OCR_DPI, 96)   ← fast, accurate enough for small docs
-          ≤ 10 pages  → min(OCR_DPI, 90)   ← 2x faster than 120 DPI
-          ≤ 30 pages  → min(OCR_DPI, 85)   ← 3x faster than 120 DPI
-          > 30 pages  → min(OCR_DPI, 80)   ← max speed for bulk docs
+        OCR pages are always rendered at a minimum of 150 DPI.
         """
-        if total_pages <= 3:
-            return min(self.OCR_DPI, 96)
-        if total_pages <= 10:
-            return min(self.OCR_DPI, 90)
-        if total_pages <= 30:
-            return min(self.OCR_DPI, 85)
-        return min(self.OCR_DPI, 80)
+        return max(150, self.OCR_DPI)
 
     @property
     def ocr_language(self) -> str:
@@ -335,12 +314,26 @@ class Settings(BaseSettings):
         """
         if self.OCR_LANGUAGE:
             return self.OCR_LANGUAGE.strip()
-
         for lang in self.OCR_LANGUAGES or []:
             if isinstance(lang, str) and lang.strip():
                 return lang.strip()
+        return "gu"
 
-        return "en"
+    @property
+    def ocr_language_candidates(self) -> List[str]:
+        """Ordered PaddleOCR language candidates for graceful fallback."""
+        candidates: List[str] = []
+        primary = self.OCR_LANGUAGE.strip() if self.OCR_LANGUAGE else ""
+        if primary:
+            candidates.append(primary)
+        for lang in self.OCR_LANGUAGES or []:
+            if isinstance(lang, str):
+                candidate = lang.strip()
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+        if not candidates:
+            candidates.append("gu")
+        return candidates
 
     def effective_ocr_chunk_size(self, total_pages: int) -> int:
         if self.OCR_CHUNK_SIZE and self.OCR_CHUNK_SIZE > 0:

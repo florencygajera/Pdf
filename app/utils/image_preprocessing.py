@@ -281,7 +281,7 @@ def preprocess_page_image(
       - Light path: deskew skipped entirely when edge_ratio < 0.03 (saves ~30ms/page)
       - Light path: stamp removal never runs (only full path)
       - Full path: INTER_LINEAR warp instead of INTER_CUBIC (saves ~15ms/page)
-      - enhance_contrast skipped on full path when std > 60 (already high contrast)
+      - enhance_contrast is applied on the full path when std < 50 (low contrast)
 
     Args:
         image: PIL Image from pdf2image or fitz
@@ -322,7 +322,7 @@ def preprocess_page_image(
     else:
         # Full path for dirty / blurry / noisy scans.
         # Only enhance contrast if the page is genuinely low contrast
-        if quality["std"] < 40.0:
+        if quality["std"] < 50.0:
             gray = enhance_contrast(gray)
 
         if quality["std"] < 20.0 or quality["dark_ratio"] > 0.35:
