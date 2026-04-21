@@ -537,7 +537,7 @@ def ocr_single_page_image(
     """
     warnings: List[str] = []
     started = time.perf_counter()
-    render_dpi = max(150, dpi or settings.OCR_DPI)
+    render_dpi = max(250, dpi or settings.OCR_DPI)
     raw_image = _page_array_from_image(image)
     rendered_image = raw_image if include_rendered_image else None
     profile = estimate_page_complexity(raw_image)
@@ -742,7 +742,7 @@ def extract_ocr_pdf(
     PaddleOCR (which has no Gujarati model and returns empty/garbage text).
     """
     started = time.perf_counter()
-    dpi = max(150, dpi or settings.OCR_DPI)
+    dpi = max(250, dpi or settings.OCR_DPI)
 
     # ── Gujarati → Tesseract ─────────────────────────────────────────────
     if _is_gujarati_language():
@@ -750,12 +750,12 @@ def extract_ocr_pdf(
             logger.info(
                 "Routing Gujarati PDF to Tesseract | file=%s | dpi=%s",
                 pdf_path.name,
-                max(200, dpi),
+                max(250, dpi),
             )
             return extract_gujarati_pdf(
                 pdf_path,
                 page_numbers=page_numbers,
-                dpi=max(200, dpi),  # Gujarati needs higher DPI for matra accuracy
+                dpi=max(250, dpi),  # Gujarati needs higher DPI for matra accuracy
             )
         else:
             logger.warning(
@@ -863,13 +863,13 @@ def extract_ocr_pdf_from_bytes(
     (then deleted immediately after rendering).
     """
     started = time.perf_counter()
-    dpi = max(150, dpi or settings.OCR_DPI)
+    dpi = max(250, dpi or settings.OCR_DPI)
 
     # ── Gujarati → Tesseract ─────────────────────────────────────────────
     if _is_gujarati_language():
         if _gujarati_tesseract_ready():
             logger.info(
-                "Routing Gujarati bytes PDF to Tesseract | dpi=%s", max(200, dpi)
+                "Routing Gujarati bytes PDF to Tesseract | dpi=%s", max(250, dpi)
             )
             import tempfile
 
@@ -880,7 +880,7 @@ def extract_ocr_pdf_from_bytes(
                 return extract_gujarati_pdf(
                     tmp_path,
                     page_numbers=page_numbers,
-                    dpi=max(200, dpi),
+                    dpi=max(250, dpi),
                     pdf_bytes=pdf_bytes,  # passed so gujarati_ocr skips re-reading disk
                 )
             finally:
@@ -939,7 +939,7 @@ def extract_ocr_pdf_local(
     Performs rendering + OCR sequentially to avoid nested process pools.
     """
     started = time.perf_counter()
-    dpi = max(150, dpi or settings.OCR_DPI)
+    dpi = max(250, dpi or settings.OCR_DPI)
     logger.info(
         "OCR local batch start | pdf=%s | pages=%s | lang=%s | dpi=%s",
         pdf_path.name,

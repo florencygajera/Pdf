@@ -46,6 +46,8 @@ ENV PIP_NO_CACHE_DIR=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     ghostscript \
+    tesseract-ocr \
+    tesseract-ocr-guj \
     libglib2.0-0 \
     libgomp1 \
     libsm6 \

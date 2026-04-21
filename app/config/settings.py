@@ -3,8 +3,8 @@ Application Settings — loaded from environment variables or .env file.
 All sensitive values (keys, passwords) MUST be set via environment, never hardcoded.
 
 PERFORMANCE FIXES FOR OCR TARGET:
-  - OCR_DPI default set to 150 so OCR runs at high-fidelity render resolution.
-  - effective_ocr_dpi() enforces a minimum 150 DPI for OCR input.
+  - OCR_DPI default set to 250 so OCR runs at high-fidelity render resolution.
+  - effective_ocr_dpi() enforces a minimum 250 DPI for OCR input.
   - OCR_CONFIDENCE_THRESHOLD lowered to 0.3 to avoid dropping valid Gujarati text.
   - OCR_PARALLEL_INFERENCE defaults True; effective_ocr_page_workers tuned to
     match the single PaddleOCR pool slot so we don't over-allocate threads.
@@ -93,7 +93,7 @@ class Settings(BaseSettings):
 
     # ── OCR ───────────────────────────────────────────────────────────────
     # OCR defaults are tuned for Gujarati PDFs and production OCR quality.
-    OCR_DPI: int = Field(default=150, description="DPI for PDF→image conversion.")
+    OCR_DPI: int = Field(default=250, description="DPI for PDF→image conversion.")
     OCR_LANGUAGE: Optional[str] = Field(
         default=None,
         description="Primary PaddleOCR language code, e.g. 'en' or 'gu'.",
@@ -299,9 +299,9 @@ class Settings(BaseSettings):
         reduce rendering time while preserving accuracy.
 
         PERF FIX: Thresholds tuned for speed-first with accuracy fallback.
-        OCR pages are always rendered at a minimum of 150 DPI.
+        OCR pages are always rendered at a minimum of 250 DPI.
         """
-        return max(150, self.OCR_DPI)
+        return max(250, self.OCR_DPI)
 
     @property
     def ocr_language(self) -> str:
