@@ -33,6 +33,33 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+_SCRIPT_SENSITIVE_LANGUAGES = {
+    "gu",
+    "hi",
+    "mr",
+    "ne",
+    "bn",
+    "pa",
+    "sd",
+    "si",
+    "ta",
+    "te",
+    "kn",
+    "ml",
+    "or",
+    "sa",
+}
+
+
+def _normalize_language(lang: Optional[str]) -> str:
+    if not lang:
+        return ""
+    return lang.strip().lower().split("_", 1)[0]
+
+
+def _preserve_small_glyphs(lang: Optional[str]) -> bool:
+    return _normalize_language(lang) in _SCRIPT_SENSITIVE_LANGUAGES
+
 
 def estimate_page_complexity(image: np.ndarray) -> dict:
     """
@@ -194,11 +221,13 @@ def deskew(binary: np.ndarray) -> Tuple[np.ndarray, float]:
     return rotated, angle
 
 
-def morphological_cleanup(binary: np.ndarray) -> np.ndarray:
+def morphological_cleanup(binary: np.ndarray, preserve_small_glyphs: bool = False) -> np.ndarray:
     """
     Morphological opening removes tiny noise dots.
     Closing fills small gaps within characters.
     """
+    if preserve_small_glyphs:
+        return binary
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_KERNEL_SIZE)
     return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
@@ -242,6 +271,7 @@ def preprocess_page_image(
     apply_stamp_removal: bool = True,
     apply_deskew: bool = True,
     prefer_light: bool = False,
+    ocr_language: Optional[str] = None,
     quality_profile: Optional[dict] = None,
 ) -> Tuple[np.ndarray, dict]:
     """
@@ -265,6 +295,7 @@ def preprocess_page_image(
     """
     meta: dict = {}
     img_cv = pil_to_cv2(image)
+    preserve_small_glyphs = _preserve_small_glyphs(ocr_language)
 
     # 1. Grayscale
     gray = to_grayscale(img_cv)
@@ -285,7 +316,9 @@ def preprocess_page_image(
         if apply_deskew and quality["edge_ratio"] > 0.03:
             binary, angle = deskew(binary)
         meta["deskew_angle"] = angle
-        binary = morphological_cleanup(binary)
+        binary = morphological_cleanup(
+            binary, preserve_small_glyphs=preserve_small_glyphs
+        )
     else:
         # Full path for dirty / blurry / noisy scans.
         # Only enhance contrast if the page is genuinely low contrast
@@ -304,7 +337,7 @@ def preprocess_page_image(
         if apply_deskew:
             binary, angle = deskew(binary)
         meta["deskew_angle"] = angle
-        binary = morphological_cleanup(binary)
+        binary = morphological_cleanup(binary, preserve_small_glyphs=False)
 
     # Convert back to 3-channel for PaddleOCR (expects BGR)
     output = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)

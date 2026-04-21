@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import fitz  # PyMuPDF
+import re
 
 from app.config.constants import (
     PDF_TYPE_DIGITAL,
@@ -28,6 +29,8 @@ from app.utils.logger import get_logger
 from app.utils.pdf_text_fallback import extract_text_from_pdf_bytes
 
 logger = get_logger(__name__)
+
+_GUJARATI_RE = re.compile(r"[\u0A80-\u0AFF]")
 
 try:
     fitz.TOOLS.mupdf_display_errors(False)
@@ -135,6 +138,10 @@ def _compute_text_coverage(page: fitz.Page) -> float:
     return min(text_area / page_area, 1.0)
 
 
+def _contains_gujarati_script(text: str) -> bool:
+    return bool(text and _GUJARATI_RE.search(text))
+
+
 def classify_page(
     page: fitz.Page,
     page_number: int,
@@ -184,9 +191,14 @@ def classify_page(
     if char_count < 5 and fallback_text.strip():
         char_count = max(char_count, len(fallback_text.strip()))
 
+    gujarati_hint = _contains_gujarati_script(raw_text) or _contains_gujarati_script(
+        fallback_text
+    )
     is_digital = (char_count >= 20 and text_coverage > 0.005) or (
         text_coverage > settings.DIGITAL_TEXT_THRESHOLD
     )
+    if gujarati_hint and (char_count >= 5 or text_coverage > 0.002):
+        is_digital = True
 
     pdf_type = PDF_TYPE_DIGITAL if is_digital else PDF_TYPE_SCANNED
 

@@ -97,7 +97,7 @@ class _PaddleOCRPool:
             self._init_error = exc
             raise
 
-        lang = ",".join(settings.OCR_LANGUAGES) if settings.OCR_LANGUAGES else "en"
+        lang = settings.ocr_language
         instance = PaddleOCR(
             use_angle_cls=True,
             lang=lang,
@@ -540,6 +540,7 @@ def ocr_single_page_image(
             image,
             prefer_light=not profile["needs_full_preprocess"],
             apply_deskew=profile["edge_ratio"] > 0.03,  # PERF: tightened threshold
+            ocr_language=settings.ocr_language,
         )
     except Exception as exc:
         logger.error(

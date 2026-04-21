@@ -100,9 +100,13 @@ class Settings(BaseSettings):
     OCR_DPI: int = Field(
         default=96, description="DPI for PDF→image conversion. Lower = faster."
     )
+    OCR_LANGUAGE: Optional[str] = Field(
+        default=None,
+        description="Primary PaddleOCR language code, e.g. 'en' or 'gu'.",
+    )
     OCR_LANGUAGES: List[str] = Field(
         default=["en"],
-        description="PaddleOCR language codes e.g. ['en','hi','ch']",
+        description="Fallback PaddleOCR language list e.g. ['en','gu']; first supported entry is used when OCR_LANGUAGE is unset.",
     )
     OCR_USE_GPU: bool = Field(default=False)
     OCR_ENABLE_MKLDNN: bool = Field(
@@ -319,6 +323,24 @@ class Settings(BaseSettings):
         if total_pages <= 30:
             return min(self.OCR_DPI, 85)
         return min(self.OCR_DPI, 80)
+
+    @property
+    def ocr_language(self) -> str:
+        """
+        Return the single PaddleOCR language code to load.
+
+        PaddleOCR's `lang` parameter selects one model, so we prefer an
+        explicit OCR_LANGUAGE override and otherwise fall back to the first
+        configured language in OCR_LANGUAGES.
+        """
+        if self.OCR_LANGUAGE:
+            return self.OCR_LANGUAGE.strip()
+
+        for lang in self.OCR_LANGUAGES or []:
+            if isinstance(lang, str) and lang.strip():
+                return lang.strip()
+
+        return "en"
 
     def effective_ocr_chunk_size(self, total_pages: int) -> int:
         if self.OCR_CHUNK_SIZE and self.OCR_CHUNK_SIZE > 0:

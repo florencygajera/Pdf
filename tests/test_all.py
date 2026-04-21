@@ -891,6 +891,37 @@ startxref
         assert len(result) == 3
 
 
+class TestGujaratiOCR:
+    def test_ocr_language_prefers_explicit_override(self):
+        from app.config.settings import Settings
+
+        settings = Settings(
+            ENVIRONMENT="test",
+            API_KEY="test-api-key",
+            OCR_LANGUAGE="gu",
+            OCR_LANGUAGES=["en"],
+        )
+
+        assert settings.ocr_language == "gu"
+
+    def test_ocr_language_falls_back_to_first_configured_language(self):
+        from app.config.settings import Settings
+
+        settings = Settings(
+            ENVIRONMENT="test",
+            API_KEY="test-api-key",
+            OCR_LANGUAGES=["gu", "en"],
+        )
+
+        assert settings.ocr_language == "gu"
+
+    def test_pdf_detector_flags_gujarati_text_hint(self):
+        from app.services.pdf_detector import _contains_gujarati_script
+
+        assert _contains_gujarati_script("ગુજરાતી લખાણ")
+        assert not _contains_gujarati_script("plain English text")
+
+
 class TestSecurityConfig:
     def test_production_rejects_placeholder_secret_key(self):
         from app.config.settings import Settings
