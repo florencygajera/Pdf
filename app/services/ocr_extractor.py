@@ -25,6 +25,13 @@ PERFORMANCE FIXES:
           preprocessing only triggered when fast OCR returns 0 results or very
           low confidence (< 0.3), not just "not looks good".
   PERF — OCR DPI is floored to 150 for scanned Gujarati PDFs.
+
+GUJARATI FIX:
+  FIX — PaddleOCR has no Gujarati language model. When OCR_LANGUAGE is 'gu'/'guj',
+         both extract_ocr_pdf() and extract_ocr_pdf_from_bytes() now route through
+         Tesseract (app/services/gujarati_ocr.py) which has a dedicated guj lang pack.
+         Falls back gracefully to PaddleOCR with a warning if Tesseract is not installed.
+         Install: apt-get install tesseract-ocr tesseract-ocr-guj && pip install pytesseract
 """
 
 from __future__ import annotations
@@ -65,6 +72,19 @@ try:
     fitz.TOOLS.mupdf_display_errors(False)
 except Exception:
     pass
+
+# Gujarati Tesseract routing — graceful import, falls back if not installed
+try:
+    from app.services.gujarati_ocr import (
+        extract_gujarati_pdf,
+        tesseract_available,
+    )
+
+    _GUJARATI_TESSERACT = True
+except ImportError:
+    _GUJARATI_TESSERACT = False
+
+_GUJARATI_LANG_CODES = {"gu", "guj"}
 
 
 def _get_multiprocessing_context():
@@ -701,14 +721,50 @@ def _extract_scanned_tables_from_page(
         return []
 
 
+def _is_gujarati_language() -> bool:
+    """Return True when the configured OCR language is Gujarati."""
+    return settings.ocr_language in _GUJARATI_LANG_CODES
+
+
+def _gujarati_tesseract_ready() -> bool:
+    """Return True when the Gujarati Tesseract module loaded and guj lang pack is present."""
+    return _GUJARATI_TESSERACT and tesseract_available()
+
+
 def extract_ocr_pdf(
     pdf_path: Path,
     page_numbers: Optional[List[int]] = None,
     dpi: int = None,
 ) -> List[Dict[str, Any]]:
-    """Full OCR extraction pipeline using the PDF on disk."""
+    """Full OCR extraction pipeline using the PDF on disk.
+
+    Routes Gujarati PDFs to Tesseract (which has a guj lang pack) instead of
+    PaddleOCR (which has no Gujarati model and returns empty/garbage text).
+    """
     started = time.perf_counter()
     dpi = max(150, dpi or settings.OCR_DPI)
+
+    # ── Gujarati → Tesseract ─────────────────────────────────────────────
+    if _is_gujarati_language():
+        if _gujarati_tesseract_ready():
+            logger.info(
+                "Routing Gujarati PDF to Tesseract | file=%s | dpi=%s",
+                pdf_path.name,
+                max(200, dpi),
+            )
+            return extract_gujarati_pdf(
+                pdf_path,
+                page_numbers=page_numbers,
+                dpi=max(200, dpi),  # Gujarati needs higher DPI for matra accuracy
+            )
+        else:
+            logger.warning(
+                "Gujarati Tesseract unavailable — falling back to PaddleOCR (results "
+                "will likely be empty). Fix: apt-get install tesseract-ocr tesseract-ocr-guj "
+                "&& pip install pytesseract"
+            )
+
+    # ── PaddleOCR path ───────────────────────────────────────────────────
     try:
         with fitz.open(str(pdf_path)) as doc:
             total_pages = len(doc)
@@ -800,9 +856,43 @@ def extract_ocr_pdf_from_bytes(
     page_numbers: Optional[List[int]] = None,
     dpi: int = None,
 ) -> List[Dict[str, Any]]:
-    """Bytes-based OCR pipeline to avoid repeated disk reads."""
+    """Bytes-based OCR pipeline to avoid repeated disk reads.
+
+    Routes Gujarati PDFs to Tesseract instead of PaddleOCR.
+    Tesseract needs a file path, so bytes are written to a temp file
+    (then deleted immediately after rendering).
+    """
     started = time.perf_counter()
     dpi = max(150, dpi or settings.OCR_DPI)
+
+    # ── Gujarati → Tesseract ─────────────────────────────────────────────
+    if _is_gujarati_language():
+        if _gujarati_tesseract_ready():
+            logger.info(
+                "Routing Gujarati bytes PDF to Tesseract | dpi=%s", max(200, dpi)
+            )
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(pdf_bytes)
+                tmp_path = Path(tmp.name)
+            try:
+                return extract_gujarati_pdf(
+                    tmp_path,
+                    page_numbers=page_numbers,
+                    dpi=max(200, dpi),
+                    pdf_bytes=pdf_bytes,  # passed so gujarati_ocr skips re-reading disk
+                )
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        else:
+            logger.warning(
+                "Gujarati Tesseract unavailable — falling back to PaddleOCR (results "
+                "will likely be empty). Fix: apt-get install tesseract-ocr tesseract-ocr-guj "
+                "&& pip install pytesseract"
+            )
+
+    # ── PaddleOCR path ───────────────────────────────────────────────────
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)

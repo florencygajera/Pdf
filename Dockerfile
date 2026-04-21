@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     libssl-dev \
     libgomp1 \
+    tesseract-ocr \
+    tesseract-ocr-guj \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -27,6 +29,7 @@ COPY requirements.txt .
 # Build wheels
 RUN pip install --upgrade pip wheel && \
     pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
 
 
 # ── Stage 2: Runtime ────────────────────────────────────────

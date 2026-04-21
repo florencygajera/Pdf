@@ -5,6 +5,7 @@ pydantic==2.7.4
 pydantic-settings==2.4.0
 python-multipart==0.0.9
 aiofiles==24.1.0
+pytesseract==0.3.13
 
 # Rate Limiting
 slowapi==0.1.9
