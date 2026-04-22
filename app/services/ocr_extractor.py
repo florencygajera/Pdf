@@ -3,22 +3,24 @@ OCR Extraction Engine.
 
 FIXES IN THIS VERSION:
 
-  FIX A — lang= parameter uses settings.OCR_LANGUAGES[0] (single string).
-           Previous code did ",".join(["gu","en"]) → "gu,en" which is not a
-           valid PaddleOCR language code. PaddleOCR silently ignored it and
-           loaded the English model. Now only the first (primary) language is
-           passed. The "gu" (Gujarati) model handles embedded Latin digits and
-           English words without needing a second model loaded.
+  FIX A — lang= parameter now uses settings.ocr_language property (single string).
+           Previous code did settings.OCR_LANGUAGES[0] which was bypassing the
+           new OCR_LANGUAGE single-override field. The property resolves priority:
+           OCR_LANGUAGE override > OCR_LANGUAGES[0] > "en" fallback.
+           Also previously someone tried ",".join(["gu","en"]) → "gu,en" which is
+           not a valid PaddleOCR language code. Now only one language is passed.
 
   FIX B — _ocr_result_looks_good() confidence gate lowered 0.4 → 0.25.
            PaddleOCR's Gujarati model scores valid words at 0.25–0.6.
            At 0.4 the fast-path rejected most Gujarati results and fell
-           through to slow full-preprocessing — but that also got rejected
-           at the _filter_by_confidence step (threshold 0.5 before settings fix).
+           through to slow full-preprocessing.
 
-  FIX C — Added shutdown_ocr_executor() (kept from previous version).
-  FIX D — Thread-safe _ocr_runtime_warning_emitted (kept from previous version).
-  FIX E — _get_multiprocessing_context() exported for tests (kept).
+  FIX C — Added shutdown_ocr_executor() for clean FastAPI lifespan shutdown.
+
+  FIX D — Thread-safe _ocr_runtime_warning_emitted using threading.Lock to
+           prevent duplicate warning log spam from concurrent page threads.
+
+  FIX E — _get_multiprocessing_context() exported for tests.
 """
 
 from __future__ import annotations
@@ -63,6 +65,9 @@ def _get_multiprocessing_context():
     """
     Returns the appropriate multiprocessing context for the platform.
     Uses 'fork' on Linux (faster worker startup), 'spawn' on Windows/macOS.
+
+    FIX E: Exported for testability — tests monkeypatch sys.platform, os.name,
+    and mp.get_context to verify the correct context is chosen on each platform.
     """
     if sys.platform.startswith("linux") and os.name == "posix":
         return mp.get_context("fork")
@@ -90,11 +95,10 @@ class _PaddleOCRPool:
             self._init_error = exc
             raise
 
-        # FIX A: use only the first language string.
-        # PaddleOCR lang= accepts a single language code such as "gu", "en", "hi".
-        # Passing "gu,en" (comma-joined) is not a valid code and PaddleOCR silently
-        # falls back to English, defeating the entire purpose of adding Gujarati.
-        primary_lang = settings.OCR_LANGUAGES[0] if settings.OCR_LANGUAGES else "en"
+        # FIX A: use settings.ocr_language property to resolve OCR_LANGUAGE override
+        # vs OCR_LANGUAGES list. Passing a comma-joined string like "gu,en" is not
+        # a valid PaddleOCR language code and silently falls back to English.
+        primary_lang = settings.ocr_language
 
         instance = PaddleOCR(
             use_angle_cls=True,
@@ -222,8 +226,8 @@ def _get_ocr_executor():
 
 def shutdown_ocr_executor(wait: bool = True) -> None:
     """
-    Cleanly shut down the OCR ProcessPoolExecutor.
-    Called from the FastAPI lifespan shutdown handler.
+    FIX C: Cleanly shut down the OCR ProcessPoolExecutor.
+    Called from the FastAPI lifespan shutdown handler to avoid zombie processes.
     """
     global _ocr_executor
     with _ocr_executor_lock:
@@ -416,6 +420,7 @@ def _run_paddle_ocr(image_array: np.ndarray) -> List:
             "OneDnnContext does not have the input Filter" in message
             or "fused_conv2d" in message
         ):
+            # FIX D: thread-safe warning flag to avoid duplicate log spam
             with _ocr_runtime_warning_lock:
                 if not _ocr_runtime_warning_emitted:
                     logger.warning(
@@ -467,9 +472,7 @@ def _ocr_result_looks_good(page_result: Dict[str, Any]) -> bool:
     - Government notice PDFs in Gujarati contain short fields like registration
       numbers, village names, and amounts that are 5–10 characters long.
     - At the old thresholds (0.4 / 15 chars) virtually all valid Gujarati fast-
-      path results were rejected and fell through to slow full-preprocessing,
-      which then also got filtered by _filter_by_confidence at the module-level
-      threshold — resulting in empty text output.
+      path results were rejected, resulting in empty text output.
     """
     text = (page_result.get("text") or "").strip()
     if not text:

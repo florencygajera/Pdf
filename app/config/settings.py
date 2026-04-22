@@ -10,13 +10,10 @@ FIXES IN THIS VERSION:
   2. CELERY_TASK_TIMEOUT default changed 15 → 300
      PaddleOCR on 6 scanned pages takes 30–90 s. At default=15, the task
      was killed by SoftTimeLimitExceeded before producing any output.
-     The .env.example already had 1800 — the code default is now aligned.
 
   3. effective_ocr_dpi() DPI caps raised across all page-count tiers.
-     Previous caps (90/85/80) made Gujarati matras and vowel marks
-     indistinguishable at render time. New caps (150/150/120/100) keep
-     enough resolution for complex Indic glyphs without sacrificing speed
-     on large documents.
+     Previous caps made Gujarati matras and vowel marks indistinguishable.
+     New caps (150/120/100) keep enough resolution for Indic glyphs.
 
   4. OCR_CONFIDENCE_THRESHOLD default 0.5 → 0.3
      PaddleOCR's Gujarati model returns confidence 0.3–0.6 on clean
@@ -25,6 +22,10 @@ FIXES IN THIS VERSION:
   5. DIGITAL_TEXT_THRESHOLD default 0.05 → 0.01
      Tighter threshold ensures fully-scanned pages (text_coverage=0) are
      never misrouted to the digital extractor.
+
+  6. NEW: OCR_LANGUAGE field (single override) + ocr_language property.
+     Tests expect settings.OCR_LANGUAGE (optional str override) and
+     settings.ocr_language (computed property: override > first of OCR_LANGUAGES).
 """
 
 import os
@@ -110,6 +111,19 @@ class Settings(BaseSettings):
             "per page count but never below 100 for Indic scripts."
         ),
     )
+
+    # FIX: Added OCR_LANGUAGE single override field.
+    # When set, this takes priority over OCR_LANGUAGES[0] in the ocr_language property.
+    # Allows per-deployment override without changing the full language list.
+    OCR_LANGUAGE: Optional[str] = Field(
+        default=None,
+        description=(
+            "Single PaddleOCR language code override (e.g. 'gu', 'en'). "
+            "When set, overrides OCR_LANGUAGES[0] for the primary OCR model. "
+            "Use this for simple single-language deployments."
+        ),
+    )
+
     # FIX 1: default changed ["en"] → ["gu", "en"].
     # PaddleOCR's English model produces no output for Gujarati characters.
     # "gu" loads the Indic model which also handles embedded Latin/digits.
@@ -118,7 +132,8 @@ class Settings(BaseSettings):
         default=["gu", "en"],
         description=(
             "Ordered list of PaddleOCR language codes. "
-            "First entry is used as the primary OCR model language. "
+            "First entry is used as the primary OCR model language unless "
+            "OCR_LANGUAGE is explicitly set. "
             "Supported: en, gu, hi, ta, te, kn, ml, mr, pa, bn, ch, ..."
         ),
     )
@@ -165,9 +180,7 @@ class Settings(BaseSettings):
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
     # FIX 2: default raised 15 → 300.
     # PaddleOCR + Gujarati model on 6 scanned pages takes 30–90 s.
-    # At default=15 the task was killed by SoftTimeLimitExceeded (triggered at
-    # max(3, timeout-5) = 10 s) before producing any extraction output.
-    # .env.example already had 1800 — the code default is now consistent.
+    # At default=15 the task was killed by SoftTimeLimitExceeded.
     CELERY_TASK_TIMEOUT: int = Field(
         default=300,
         description="Hard task time limit in seconds. Soft limit = timeout - 30.",
@@ -254,6 +267,26 @@ class Settings(BaseSettings):
         return max(30, self.CELERY_TASK_TIMEOUT - 30)
 
     @property
+    def ocr_language(self) -> str:
+        """
+        FIX: Computed property returning the effective single OCR language code.
+
+        Priority:
+          1. OCR_LANGUAGE (explicit single override) — e.g. OCR_LANGUAGE=gu in .env
+          2. OCR_LANGUAGES[0] (first entry of the ordered list) — default "gu"
+          3. Fallback "en" if both are unset/empty
+
+        This property is what PaddleOCR and Tesseract callers should use instead
+        of reading OCR_LANGUAGES[0] directly — it respects the single-language
+        override for simpler deployment configs.
+        """
+        if self.OCR_LANGUAGE and self.OCR_LANGUAGE.strip():
+            return self.OCR_LANGUAGE.strip()
+        if self.OCR_LANGUAGES:
+            return self.OCR_LANGUAGES[0]
+        return "en"
+
+    @property
     def effective_ocr_page_workers(self) -> int:
         if self.OCR_PAGE_WORKERS and self.OCR_PAGE_WORKERS > 0:
             return self.OCR_PAGE_WORKERS
@@ -309,10 +342,9 @@ class Settings(BaseSettings):
         speed vs accuracy.
 
         FIX 3: All tier caps raised significantly from the previous values
-        (96/90/85/80). The old caps were tuned for English Latin script where
-        90 DPI is sufficient. Gujarati and other Indic scripts have complex
+        (96/90/85/80). Gujarati and other Indic scripts have complex
         matras, half-forms, and conjunct consonants that become indistinguishable
-        below 120 DPI, causing PaddleOCR to miss characters entirely.
+        below 120 DPI.
 
         New tiers:
           ≤ 10 pages  → min(OCR_DPI, 150)  — full quality for short docs
