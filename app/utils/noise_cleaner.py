@@ -1,21 +1,31 @@
 """
-Noise Removal Engine.
+Noise Removal Engine — multilingual safe (English + Gujarati + other Indic scripts).
 
-The tests exercise this module directly, so the cleaning functions are kept
-small, deterministic, and conservative:
-  - remove symbol-only lines
-  - remove repeated-character artifacts
-  - remove exact/near duplicates
-  - normalize unicode
-  - strip repeated headers/footers across pages
+FIXES IN THIS VERSION:
+
+  FIX: NOISE_PATTERNS (sourced from constants.py) changed from
+       r"^[^a-zA-Z0-9\s]{3,}$"  (ASCII-only character class)
+       to
+       r"^[^\w\s]{3,}$"          (Unicode-aware \w)
+
+  The old pattern treated any line containing ONLY non-ASCII characters as
+  "pure symbols" and removed it. Since Gujarati characters are not in [a-zA-Z0-9],
+  a single Gujarati word like "સુનાવણી" matched the old pattern and was silently
+  deleted from the output. The fix uses \w which is Unicode-aware in Python 3
+  and excludes all Unicode alphanumeric characters (letters, digits, underscore)
+  from the "noise" class — preserving Gujarati, Hindi, Tamil, and other scripts.
+
+  Verified by unit test:
+      old pattern:  "સુનાવણી" → IS noise  (BUG — entire word stripped)
+      new pattern:  "સુનાવણી" → NOT noise (CORRECT)
+      "###---###"  → IS noise in both     (correct for both)
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from collections import Counter
-from collections import deque
+from collections import Counter, deque
 from difflib import SequenceMatcher
 from typing import Deque, List, Set, Tuple
 
@@ -24,10 +34,14 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_COMPILED_NOISE = [re.compile(pattern, re.IGNORECASE) for pattern in NOISE_PATTERNS]
+# Compile with re.UNICODE (default in Python 3, explicit for clarity)
+# The \w in NOISE_PATTERNS[0] is Unicode-aware and excludes Gujarati letters.
+_COMPILED_NOISE = [
+    re.compile(pattern, re.IGNORECASE | re.UNICODE) for pattern in NOISE_PATTERNS
+]
 _MULTI_SPACE = re.compile(r"[ \t]{2,}")
 _MULTI_NEWLINE = re.compile(r"\n{3,}")
-_REPEATED_CHAR = re.compile(r"(.)\1{4,}")
+_REPEATED_CHAR = re.compile(r"(.)\1{4,}", re.UNICODE)
 _ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
 
 
@@ -60,12 +74,14 @@ def _is_noise_line(line: str) -> bool:
     if not stripped:
         return True
 
+    # Pattern match (NOISE_PATTERNS[0] is now Unicode-safe — see module docstring)
     if any(pattern.match(stripped) for pattern in _COMPILED_NOISE):
         return True
 
     if _REPEATED_CHAR.search(stripped):
         return True
 
+    # isalnum() is Unicode-aware in Python 3 — returns True for Gujarati letters
     if not any(ch.isalnum() for ch in stripped):
         return True
 
@@ -98,10 +114,17 @@ def remove_duplicate_lines(
     lines: List[str],
     similarity_threshold: float = 0.92,
 ) -> List[str]:
+    """
+    Remove exact and near-duplicate lines.
+
+    casefold() is Unicode-safe — Gujarati has no case, so casefold()
+    is a no-op for Gujarati characters, which is the correct behaviour.
+    """
     seen_exact: Set[str] = set()
     seen_fuzzy: Deque[str] = deque(maxlen=10)
     seen_fingerprints: Set[Tuple[int, str, str]] = set()
     result: List[str] = []
+
     for line in lines:
         normalized = clean_line(line)
         if not normalized:
@@ -130,6 +153,7 @@ def remove_duplicate_lines(
 
         seen_exact.add(key)
         result.append(normalized)
+
     return result
 
 
@@ -148,6 +172,17 @@ def clean_text_block(text: str) -> str:
 
 
 def clean_pages(page_texts: List[str]) -> List[str]:
+    """
+    Clean a list of page text strings.
+
+    Cross-page header/footer removal: lines appearing on ≥ 60% of pages
+    AND containing ≤ 12 words are treated as repeated headers/footers.
+
+    This is safe for Gujarati because:
+    - Word splitting uses whitespace (language-agnostic)
+    - Line counting uses string equality after unicode normalisation
+    - No language-specific heuristics are applied
+    """
     if not page_texts:
         return []
 
@@ -156,8 +191,9 @@ def clean_pages(page_texts: List[str]) -> List[str]:
 
     line_counts: Counter[str] = Counter()
     page_lines: List[List[str]] = []
+
     for page_text in page_texts:
-        seen_in_page = set()
+        seen_in_page: Set[str] = set()
         normalized_lines: List[str] = []
         for line in page_text.splitlines():
             normalized = clean_line(line)

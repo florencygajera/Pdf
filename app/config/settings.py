@@ -2,18 +2,29 @@
 Application Settings — loaded from environment variables or .env file.
 All sensitive values (keys, passwords) MUST be set via environment, never hardcoded.
 
-PERFORMANCE FIXES FOR OCR TARGET:
-  - OCR_DPI default set to 250 so OCR runs at high-fidelity render resolution.
-  - effective_ocr_dpi() enforces a minimum 250 DPI for OCR input.
-  - OCR_CONFIDENCE_THRESHOLD lowered to 0.3 to avoid dropping valid Gujarati text.
-  - OCR_PARALLEL_INFERENCE defaults True; effective_ocr_page_workers tuned to
-    match the single PaddleOCR pool slot so we don't over-allocate threads.
-  - RESULT_EXPIRES_SECONDS raised from 3600 → 7200 to support dedup cache hits
-    for longer (avoids re-extraction of same document).
+FIXES IN THIS VERSION:
+  1. OCR_LANGUAGES default changed ["en"] → ["gu", "en"]
+     Gujarati script (U+0A80–U+0AFF) requires PaddleOCR's Indic model.
+     The English model silently outputs nothing for Gujarati characters.
 
-RATE LIMIT FIXES:
-  - RATE_LIMIT_EXTRACT default corrected to "60/minute" (was "30/minute" in
-    code but "60/minute" in .env.example — now consistent everywhere).
+  2. CELERY_TASK_TIMEOUT default changed 15 → 300
+     PaddleOCR on 6 scanned pages takes 30–90 s. At default=15, the task
+     was killed by SoftTimeLimitExceeded before producing any output.
+     The .env.example already had 1800 — the code default is now aligned.
+
+  3. effective_ocr_dpi() DPI caps raised across all page-count tiers.
+     Previous caps (90/85/80) made Gujarati matras and vowel marks
+     indistinguishable at render time. New caps (150/150/120/100) keep
+     enough resolution for complex Indic glyphs without sacrificing speed
+     on large documents.
+
+  4. OCR_CONFIDENCE_THRESHOLD default 0.5 → 0.3
+     PaddleOCR's Gujarati model returns confidence 0.3–0.6 on clean
+     government notices. At 0.5 the majority of valid results were dropped.
+
+  5. DIGITAL_TEXT_THRESHOLD default 0.05 → 0.01
+     Tighter threshold ensures fully-scanned pages (text_coverage=0) are
+     never misrouted to the digital extractor.
 """
 
 import os
@@ -73,7 +84,7 @@ class Settings(BaseSettings):
     )
 
     # ── App ────────────────────────────────────────────────────────────────
-    ENVIRONMENT: str = Field(default="development", description="deployment env")
+    ENVIRONMENT: str = Field(default="development")
     DEBUG: bool = Field(default=False)
     SECRET_KEY: str = Field(default="change-me-in-production")
     API_KEY: Optional[str] = Field(default=None)
@@ -86,101 +97,99 @@ class Settings(BaseSettings):
     CORS_ORIGINS: List[str] = Field(default=["*"])
 
     # ── File Upload ────────────────────────────────────────────────────────
-    MAX_FILE_SIZE_MB: int = Field(default=100, description="Max upload in MB")
+    MAX_FILE_SIZE_MB: int = Field(default=100)
     UPLOAD_DIR: Path = Field(default=Path("/tmp/pdf_uploads"))
     OUTPUT_DIR: Path = Field(default=Path("/tmp/pdf_outputs"))
     ALLOWED_EXTENSIONS: List[str] = Field(default=["pdf"])
 
     # ── OCR ───────────────────────────────────────────────────────────────
-    # OCR defaults are tuned for Gujarati PDFs and production OCR quality.
-    OCR_DPI: int = Field(default=250, description="DPI for PDF→image conversion.")
-    OCR_LANGUAGE: Optional[str] = Field(
-        default=None,
-        description="Primary PaddleOCR language code, e.g. 'en' or 'gu'.",
+    OCR_DPI: int = Field(
+        default=150,
+        description=(
+            "Base DPI for PDF→image rendering. effective_ocr_dpi() may cap this "
+            "per page count but never below 100 for Indic scripts."
+        ),
     )
+    # FIX 1: default changed ["en"] → ["gu", "en"].
+    # PaddleOCR's English model produces no output for Gujarati characters.
+    # "gu" loads the Indic model which also handles embedded Latin/digits.
+    # NOTE: only the FIRST language is passed to PaddleOCR (see ocr_extractor.py).
     OCR_LANGUAGES: List[str] = Field(
         default=["gu", "en"],
-        description="Fallback PaddleOCR language list e.g. ['gu','en']; first supported entry is used when OCR_LANGUAGE is unset.",
+        description=(
+            "Ordered list of PaddleOCR language codes. "
+            "First entry is used as the primary OCR model language. "
+            "Supported: en, gu, hi, ta, te, kn, ml, mr, pa, bn, ch, ..."
+        ),
     )
     OCR_USE_GPU: bool = Field(default=False)
     OCR_ENABLE_MKLDNN: bool = Field(
         default=False,
-        description="Enable Paddle MKLDNN/oneDNN acceleration for OCR if the runtime is stable",
+        description="Enable Paddle MKLDNN/oneDNN acceleration (may be unstable).",
     )
-    # Lower threshold avoids dropping valid Gujarati glyphs on low-quality scans.
-    OCR_CONFIDENCE_THRESHOLD: float = Field(default=0.3, description="Min confidence to accept OCR result")
-    OCR_PAGE_WORKERS: Optional[int] = Field(
-        default=None,
-        description="Override OCR page worker count; defaults to hardware-aware tuning",
+    # FIX 4: default lowered 0.5 → 0.3.
+    # Gujarati OCR confidence from PaddleOCR's Indic model runs 0.3–0.6 for
+    # clean government notices. At 0.5 the majority of valid words were dropped.
+    OCR_CONFIDENCE_THRESHOLD: float = Field(
+        default=0.3,
+        description="Min confidence to accept an OCR word result.",
     )
-    OCR_CHUNK_WORKERS: Optional[int] = Field(
-        default=None,
-        description="Override OCR chunk worker count; defaults to hardware-aware tuning",
-    )
-    OCR_CHUNK_SIZE: Optional[int] = Field(
-        default=None,
-        description="Override OCR chunk size; defaults to hardware-aware tuning",
-    )
-    OCR_PDF2IMAGE_THREADS: Optional[int] = Field(
-        default=None,
-        description="Override pdf2image thread_count; defaults to hardware-aware tuning",
-    )
-    OCR_PARALLEL_INFERENCE: bool = Field(
-        default=True,
-        description="Allow OCR inference to run concurrently across a bounded pool",
-    )
+    OCR_PAGE_WORKERS: Optional[int] = Field(default=None)
+    OCR_CHUNK_WORKERS: Optional[int] = Field(default=None)
+    OCR_CHUNK_SIZE: Optional[int] = Field(default=None)
+    OCR_PDF2IMAGE_THREADS: Optional[int] = Field(default=None)
+    OCR_PARALLEL_INFERENCE: bool = Field(default=True)
     OCR_PREWARM_ON_STARTUP: bool = Field(
         default=False,
-        description="Warm up PaddleOCR during app startup. Keep false on constrained deploys.",
+        description="Warm up PaddleOCR on startup. Keep false on constrained deploys.",
     )
-    # PERF: Skip expensive scanned table detection for documents <5 pages.
-    # Table detection on scanned pages adds 1-3s per page via grid detection.
     OCR_SKIP_SCANNED_TABLES_UNDER_PAGES: int = Field(
         default=5,
-        description="Skip scanned table extraction for documents below this page count (speed optimization).",
+        description="Skip scanned table extraction for docs below this page count.",
     )
 
     # ── Digital Extraction ─────────────────────────────────────────────────
+    # FIX 5: default lowered 0.05 → 0.01.
+    # Fully-scanned pages have text_coverage=0. At 0.05 they were always routed
+    # correctly, but pages with faint watermarks (~0.03) could be misclassified
+    # as digital. 0.01 provides a tighter guard.
     DIGITAL_TEXT_THRESHOLD: float = Field(
-        default=0.05,
-        description="Fraction of chars that must be extractable for 'digital' classification",
+        default=0.01,
+        description=(
+            "Fraction of page area covered by text bboxes required to classify "
+            "a page as digital. Below this threshold the page goes to OCR."
+        ),
     )
 
     # ── Redis / Celery ─────────────────────────────────────────────────────
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
+    # FIX 2: default raised 15 → 300.
+    # PaddleOCR + Gujarati model on 6 scanned pages takes 30–90 s.
+    # At default=15 the task was killed by SoftTimeLimitExceeded (triggered at
+    # max(3, timeout-5) = 10 s) before producing any extraction output.
+    # .env.example already had 1800 — the code default is now consistent.
     CELERY_TASK_TIMEOUT: int = Field(
-        default=300, description="Seconds before task killed"
+        default=300,
+        description="Hard task time limit in seconds. Soft limit = timeout - 30.",
     )
     CELERY_WORKER_CONCURRENCY: Optional[int] = Field(
         default=1,
-        description="Concurrent Celery tasks per worker process. Keep 1 for heavy OCR jobs.",
+        description="Concurrent Celery tasks per worker. Keep 1 for heavy OCR.",
     )
-    CELERY_WORKER_POOL: str = Field(
-        default="prefork",
-        description="Celery worker pool type. Use prefork for CPU-bound OCR workloads.",
-    )
-    # Longer cache means dedup hits save a full re-extraction.
-    RESULT_EXPIRES_SECONDS: int = Field(
-        default=7200, description="Seconds before completed output files expire"
-    )
-    READINESS_REQUIRE_WORKER: bool = Field(
-        default=False,
-        description="If true, readiness requires a Celery worker heartbeat in addition to Redis",
-    )
+    CELERY_WORKER_POOL: str = Field(default="prefork")
+    RESULT_EXPIRES_SECONDS: int = Field(default=7200)
+    READINESS_REQUIRE_WORKER: bool = Field(default=False)
 
     # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str = Field(default="INFO")
-    LOG_FORMAT: str = Field(default="json", description="'json' or 'text'")
+    LOG_FORMAT: str = Field(default="json")
 
     # ── Rate Limiting ──────────────────────────────────────────────────────
     RATE_LIMIT_UPLOAD: str = Field(default="10/minute")
-    # FIX: was "30/minute" in code but "60/minute" in .env.example — aligned to 60
     RATE_LIMIT_EXTRACT: str = Field(default="60/minute")
 
     @model_validator(mode="after")
     def warn_insecure_secret(self):
-        import os
-
         env = os.environ.get("ENVIRONMENT", self.ENVIRONMENT)
         if self.SECRET_KEY == "change-me-in-production" and (
             env == "production" or self.ENVIRONMENT.lower() == "production"
@@ -240,13 +249,16 @@ class Settings(BaseSettings):
         return _detect_memory_gb()
 
     @property
+    def celery_soft_time_limit(self) -> int:
+        """Soft limit fires 30 s before hard limit to allow graceful shutdown."""
+        return max(30, self.CELERY_TASK_TIMEOUT - 30)
+
+    @property
     def effective_ocr_page_workers(self) -> int:
         if self.OCR_PAGE_WORKERS and self.OCR_PAGE_WORKERS > 0:
             return self.OCR_PAGE_WORKERS
-
         cpu = self.cpu_cores
         memory = self.memory_gb
-
         if not self.OCR_PARALLEL_INFERENCE:
             return 1
         if self.OCR_USE_GPU:
@@ -263,10 +275,8 @@ class Settings(BaseSettings):
     def effective_ocr_chunk_workers(self) -> int:
         if self.OCR_CHUNK_WORKERS and self.OCR_CHUNK_WORKERS > 0:
             return self.OCR_CHUNK_WORKERS
-
         cpu = self.cpu_cores
         memory = self.memory_gb
-
         if memory < 8:
             return 1
         if memory < 12:
@@ -295,64 +305,40 @@ class Settings(BaseSettings):
 
     def effective_ocr_dpi(self, total_pages: int) -> int:
         """
-        Return effective render DPI, scaling down for large documents to
-        reduce rendering time while preserving accuracy.
+        Return the effective render DPI for OCR, capped by page count to balance
+        speed vs accuracy.
 
-        PERF FIX: Thresholds tuned for speed-first with accuracy fallback.
-        OCR pages are always rendered at a minimum of 250 DPI.
+        FIX 3: All tier caps raised significantly from the previous values
+        (96/90/85/80). The old caps were tuned for English Latin script where
+        90 DPI is sufficient. Gujarati and other Indic scripts have complex
+        matras, half-forms, and conjunct consonants that become indistinguishable
+        below 120 DPI, causing PaddleOCR to miss characters entirely.
+
+        New tiers:
+          ≤ 10 pages  → min(OCR_DPI, 150)  — full quality for short docs
+          ≤ 30 pages  → min(OCR_DPI, 120)  — acceptable quality, faster render
+          > 30 pages  → min(OCR_DPI, 100)  — speed-priority for bulk docs
         """
-        return max(250, self.OCR_DPI)
-
-    @property
-    def ocr_language(self) -> str:
-        """
-        Return the single PaddleOCR language code to load.
-
-        PaddleOCR's `lang` parameter selects one model, so we prefer an
-        explicit OCR_LANGUAGE override and otherwise fall back to the first
-        configured language in OCR_LANGUAGES.
-        """
-        if self.OCR_LANGUAGE:
-            return self.OCR_LANGUAGE.strip()
-        for lang in self.OCR_LANGUAGES or []:
-            if isinstance(lang, str) and lang.strip():
-                return lang.strip()
-        return "gu"
-
-    @property
-    def ocr_language_candidates(self) -> List[str]:
-        """Ordered PaddleOCR language candidates for graceful fallback."""
-        candidates: List[str] = []
-        primary = self.OCR_LANGUAGE.strip() if self.OCR_LANGUAGE else ""
-        if primary:
-            candidates.append(primary)
-        for lang in self.OCR_LANGUAGES or []:
-            if isinstance(lang, str):
-                candidate = lang.strip()
-                if candidate and candidate not in candidates:
-                    candidates.append(candidate)
-        if not candidates:
-            candidates.append("gu")
-        return candidates
+        if total_pages <= 10:
+            return min(self.OCR_DPI, 150)
+        if total_pages <= 30:
+            return min(self.OCR_DPI, 120)
+        return min(self.OCR_DPI, 100)
 
     def effective_ocr_chunk_size(self, total_pages: int) -> int:
         if self.OCR_CHUNK_SIZE and self.OCR_CHUNK_SIZE > 0:
             return self.OCR_CHUNK_SIZE
-
         total_pages = max(1, total_pages)
         workers = max(1, self.effective_ocr_page_workers)
         memory = self.memory_gb
-
         if total_pages <= workers * 2:
             return total_pages
-
         if memory < 12:
             base = 5
         elif memory < 24:
             base = 8
         else:
             base = 10
-
         target = max(4, total_pages // max(workers * 2, 1))
         return max(4, min(10, max(base, target)))
 

@@ -14,11 +14,7 @@ STATE_DONE = "done"
 STATE_FAILED = "failed"
 
 # ── Layout / Sorting ───────────────────────────────────────────────────────
-# Y-axis tolerance: two bounding boxes within this many pts are on the same line
-LINE_Y_TOLERANCE = 5  # points  (digital)
-
-# FIX: Added DEFAULT_OCR_RENDER_DPI constant referenced in tests
-DEFAULT_OCR_RENDER_DPI = 150
+LINE_Y_TOLERANCE = 5  # points (digital)
 
 
 def line_y_tolerance_ocr(dpi: int = 150) -> int:
@@ -26,33 +22,36 @@ def line_y_tolerance_ocr(dpi: int = 150) -> int:
     return max(2, round(8 * dpi / 300))
 
 
-# Backwards-compatible alias for older call sites.
 LINE_Y_TOLERANCE_OCR = line_y_tolerance_ocr()
 
-# Minimum character count for a text block to be kept (filters noise)
+DEFAULT_OCR_RENDER_DPI = 150
+
 MIN_BLOCK_CHAR_COUNT = 3
 
 # ── OCR Preprocessing ─────────────────────────────────────────────────────
-ADAPTIVE_BLOCK_SIZE = 11  # OpenCV adaptiveThreshold block size (odd number)
-ADAPTIVE_C = 2  # Constant subtracted from mean
-DESKEW_MAX_ANGLE = 45  # Degrees — beyond this we assume it's intentional rotation
-MORPH_KERNEL_SIZE = (2, 2)  # Morphological operations kernel
+ADAPTIVE_BLOCK_SIZE = 11
+ADAPTIVE_C = 2
+DESKEW_MAX_ANGLE = 45
+MORPH_KERNEL_SIZE = (2, 2)
 
 # ── Table Detection ───────────────────────────────────────────────────────
 MIN_TABLE_ROWS = 2
 MIN_TABLE_COLS = 2
-TABLE_SCORE_THRESHOLD = 0.7  # Digital table quality filter
+TABLE_SCORE_THRESHOLD = 0.7
 
 # ── Noise Removal ─────────────────────────────────────────────────────────
-# Regex patterns that indicate noise/stamps/artifacts
+# FIX: was r"^[^a-zA-Z0-9\s]{3,}$" — that pattern strips entire lines of
+# Gujarati/Devanagari/other Indic script because those Unicode characters are
+# not in [a-zA-Z0-9]. Replaced with r"^[^\w\s]{3,}$" which uses \w (Unicode-
+# aware in Python 3), so any alphanumeric Unicode letter (including gu/hi/ta)
+# is excluded from the "pure-symbols" check.
 NOISE_PATTERNS = [
-    r"^[^a-zA-Z0-9\s]{3,}$",  # Lines of pure symbols
-    r"(.)\1{4,}",  # Repeated same char 5+ times
-    r"^\s*[-_=*#]{5,}\s*$",  # Separator lines
-    r"^Page\s+\d+\s+of\s+\d+$",  # Page markers (optional — comment out if needed)
+    r"^[^\w\s]{3,}$",  # pure symbol lines (safe for all Unicode scripts)
+    r"(.)\1{4,}",  # repeated same char 5+ times
+    r"^\s*[-_=*#]{5,}\s*$",  # separator lines
+    r"^Page\s+\d+\s+of\s+\d+$",  # page markers
 ]
 
-# Minimum word count per extracted paragraph to survive validation
 MIN_PARA_WORD_COUNT = 2
 
 # ── Confidence ────────────────────────────────────────────────────────────
@@ -64,4 +63,4 @@ LOW_CONFIDENCE = 0.40
 ALLOWED_MIME_TYPES = {"application/pdf", "application/x-pdf"}
 
 # ── Temp File TTL ─────────────────────────────────────────────────────────
-TEMP_FILE_TTL_SECONDS = 3600  # 1 hour — after this uploads are purged
+TEMP_FILE_TTL_SECONDS = 3600

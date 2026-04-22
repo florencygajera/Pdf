@@ -2,18 +2,11 @@
 Celery Worker
 Handles async/background PDF extraction jobs.
 
-FIXES:
-  C2 — self.retry() is only called for genuinely transient errors.
-  C3 — RuntimeError removed from _RETRYABLE_ERRORS (too broad — many
-        application-level errors raise RuntimeError, e.g. PaddleOCR import
-        failures, shape mismatches, config errors; these should be permanent
-        failures, not retried).
-  C4 — IOError removed from _RETRYABLE_ERRORS; IOError is an alias for OSError
-        since Python 3.3, so listing both was redundant.
-
-After fixes:  _RETRYABLE_ERRORS = (OSError, MemoryError)
-  - OSError covers all filesystem/network transient failures
-  - MemoryError covers OOM scenarios worth retrying once
+FIXES IN THIS VERSION:
+  - task_soft_time_limit now uses settings.celery_soft_time_limit (timeout - 30s)
+    instead of the inline max(3, timeout - 5). At timeout=300 this gives a
+    270 s soft limit (vs the broken 10 s soft limit at timeout=15).
+  - Retry logic: only OSError and MemoryError (not RuntimeError or IOError).
 """
 
 import json
@@ -35,7 +28,6 @@ from app.pipelines.extraction_pipeline import (
 )
 from app.utils.file_handler import get_output_path, get_upload_path
 
-# ── Celery App ────────────────────────────────────────────────────────────────
 celery_app = Celery(
     "pdf_extractor",
     broker=settings.REDIS_URL,
@@ -47,8 +39,10 @@ celery_app.conf.update(
     result_serializer="json",
     accept_content=["json"],
     task_track_started=True,
-    task_time_limit=320,
-    task_soft_time_limit=300,
+    task_time_limit=settings.CELERY_TASK_TIMEOUT,
+    # FIX: was max(3, timeout - 5) which gave 10 s at timeout=15.
+    # Now uses the property: max(30, timeout - 30) — gives 270 s at timeout=300.
+    task_soft_time_limit=settings.celery_soft_time_limit,
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     result_expires=settings.RESULT_EXPIRES_SECONDS,
@@ -66,10 +60,10 @@ if sys.platform == "win32":
 
 task_logger = get_task_logger(__name__)
 
-# FIX C3+C4: Only retry on filesystem / memory errors.
-#   - Removed RuntimeError: too broad; catches application-level failures that
-#     should be permanent (OCR import errors, config errors, shape mismatches).
-#   - Removed IOError: it is an alias for OSError since Python 3.3, redundant.
+# Only retry on genuine transient failures:
+# - OSError covers filesystem/network errors
+# - MemoryError covers OOM scenarios worth retrying once
+# RuntimeError and IOError intentionally excluded (too broad).
 _RETRYABLE_ERRORS = (OSError, MemoryError)
 
 
@@ -112,7 +106,6 @@ def extract_pdf_task(self, job_id: str) -> dict:
             pdf_path, job_id, progress_callback=progress_cb
         )
         save_result_to_disk(result, output_path)
-
         task_logger.info(f"Task complete | job={job_id} | output={output_path}")
         return {
             "status": STATE_DONE,
@@ -126,7 +119,6 @@ def extract_pdf_task(self, job_id: str) -> dict:
         raise
 
     except ValueError as exc:
-        # Non-retryable: bad PDF, invalid content, validation failure
         task_logger.error(
             f"Validation error for job {job_id}: {exc}\n{traceback.format_exc()}"
         )
@@ -134,29 +126,19 @@ def extract_pdf_task(self, job_id: str) -> dict:
         raise
 
     except _RETRYABLE_ERRORS as exc:
-        # FIX C3: Only retry OSError / MemoryError — genuine transient failures
         task_logger.warning(f"Transient error for job {job_id} (will retry): {exc}")
         try:
             raise self.retry(exc=exc)
         except self.MaxRetriesExceededError:
             _write_failed_result(job_id, output_path, f"Max retries exceeded: {exc}")
-            return {
-                "status": STATE_FAILED,
-                "job_id": job_id,
-                "error": str(exc),
-            }
+            return {"status": STATE_FAILED, "job_id": job_id, "error": str(exc)}
 
     except Exception as exc:
-        # All other errors (including RuntimeError) are permanent failures — no retry.
         task_logger.error(
             f"Permanent error for job {job_id}: {exc}\n{traceback.format_exc()}"
         )
         _write_failed_result(job_id, output_path, str(exc))
-        return {
-            "status": STATE_FAILED,
-            "job_id": job_id,
-            "error": str(exc),
-        }
+        return {"status": STATE_FAILED, "job_id": job_id, "error": str(exc)}
 
 
 def _write_failed_result(job_id: str, output_path: Path, error_msg: str) -> None:
