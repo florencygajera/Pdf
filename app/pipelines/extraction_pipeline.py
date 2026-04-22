@@ -9,7 +9,14 @@ Performance-focused version:
   - FIX: reads stitched pages from "page_results" key (validator fix)
   - preserves stable output ordering and existing API contracts
 
-Designed to stay safe under Windows Celery thread pools.
+FIXES IN THIS VERSION:
+  FIX 1 — effective_ocr_dpi() now called with doc_classification.total_pages
+           (was called with len(scanned_page_nums) — a count that could be 1
+           even for a 50-page mixed PDF, causing DPI to never be scaled down).
+  FIX 2 — _resolve_scanned_ocr_language() reads settings.OCR_ENGINE and
+           settings.OCR_LANGUAGE correctly; added "gu" as explicit Gujarati
+           trigger so .env OCR_LANGUAGE=gu routes to Tesseract without needing
+           the full word "gujarati".
 """
 
 from __future__ import annotations
@@ -53,19 +60,31 @@ def _resolve_scanned_ocr_language() -> str:
     """
     Resolve the OCR language used for scanned pages.
 
-    The pipeline passes this into the OCR layer so the OCR service can route
-    strictly:
-      - Gujarati -> Tesseract only
-      - English  -> PaddleOCR only
+    FIX 2: "gu" is now treated as a Gujarati trigger (alongside "guj"/"gujarati").
+    This matches the .env convention OCR_LANGUAGE=gu used in docker-compose.yml.
+
+    Routing:
+      - Gujarati → Tesseract only (via gujarati_ocr.py)
+      - English  → PaddleOCR only (via ocr_extractor.py)
     """
     engine = (settings.OCR_ENGINE or "hybrid").strip().lower()
-    configured = (settings.OCR_LANGUAGE or "").strip().lower()
+    configured = (getattr(settings, "OCR_LANGUAGE", None) or "").strip().lower()
+
     if engine == "tesseract":
         return "gujarati"
     if engine == "paddle":
         return "english"
+
+    # FIX 2: treat "gu" as Gujarati (was only checking "guj" and "gujarati")
     if configured in {"gu", "guj", "gujarati"}:
         return "gujarati"
+
+    # Also check OCR_LANGUAGES[0] as fallback
+    if settings.OCR_LANGUAGES:
+        first = settings.OCR_LANGUAGES[0].strip().lower()
+        if first in {"gu", "guj", "gujarati"}:
+            return "gujarati"
+
     return "english"
 
 
@@ -187,7 +206,14 @@ def _process_scanned_pages(
     progress_callback: Optional[Callable] = None,
     pdf_bytes: Optional[bytes] = None,
 ) -> List[Dict[str, Any]]:
-    """Process scanned pages through a shared OCR executor."""
+    """
+    Process scanned pages through a shared OCR executor.
+
+    FIX 1: DPI is now computed using doc_classification.total_pages (the full
+    document page count) rather than len(scanned_page_nums). This ensures that
+    a mixed 50-page PDF where only 5 pages are scanned still gets the capped DPI
+    (100 for >30 pages) instead of the short-doc DPI (150 for ≤10 pages).
+    """
     scanned_page_nums = [
         p.page_number
         for p in doc_classification.pages
@@ -203,7 +229,9 @@ def _process_scanned_pages(
         len(scanned_page_nums),
     )
 
-    dpi = settings.effective_ocr_dpi(len(scanned_page_nums))
+    # FIX 1: use total_pages not len(scanned_page_nums) for DPI scaling
+    dpi = settings.effective_ocr_dpi(doc_classification.total_pages)
+
     if _prefer_gujarati_tesseract_ocr():
         logger.info(
             "Using Gujarati Tesseract OCR | pages=%s | dpi=%s",

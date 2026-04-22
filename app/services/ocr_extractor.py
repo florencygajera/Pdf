@@ -12,6 +12,11 @@ FIXES IN THIS VERSION:
   FIX D — _ocr_result_looks_good() confidence gate lowered 0.4 → 0.25.
   FIX E — shutdown_ocr_executor() is available for clean FastAPI shutdown.
   FIX F — _get_multiprocessing_context() exported for tests.
+  FIX G — _resolve_ocr_language() now reads settings.ocr_language as its
+           final fallback instead of hardcoding "english". This ensures that
+           OCR_LANGUAGE=gu in .env correctly routes ALL scanned pages to
+           Tesseract, not just those where the pipeline explicitly passes
+           language="gujarati".
 """
 
 from __future__ import annotations
@@ -79,6 +84,11 @@ def _resolve_ocr_language(language: Optional[str] = None) -> str:
     """
     Resolve the OCR language routed by the pipeline.
 
+    FIX G: Previously ended with `return "english"` as the hardcoded fallback,
+    ignoring OCR_LANGUAGE/OCR_LANGUAGES settings entirely when no explicit
+    language was passed. Now reads settings.ocr_language as the final fallback,
+    so OCR_LANGUAGE=gu in .env correctly routes all pages to Tesseract.
+
     Strict routing:
       - Gujarati => Tesseract-only via app.services.gujarati_ocr
       - English  => PaddleOCR-only
@@ -92,6 +102,12 @@ def _resolve_ocr_language(language: Optional[str] = None) -> str:
         return "gujarati"
     if engine == "paddle":
         return "english"
+
+    # FIX G: check settings instead of hardcoding "english"
+    configured = _normalize_ocr_language(getattr(settings, "ocr_language", None))
+    if configured in {"gujarati", "english"}:
+        return configured
+
     return "english"
 
 
@@ -485,23 +501,13 @@ def _ocr_result_looks_good(page_result: Dict[str, Any]) -> bool:
 
     FIX B: Confidence threshold lowered from 0.4 → 0.25 and minimum text
     length lowered from 15 → 8 characters.
-
-    Reasoning:
-    - PaddleOCR's Gujarati/Indic model assigns lower confidence scores than
-      the English model for structurally valid characters.
-    - Government notice PDFs in Gujarati contain short fields like registration
-      numbers, village names, and amounts that are 5–10 characters long.
-    - At the old thresholds (0.4 / 15 chars) virtually all valid Gujarati fast-
-      path results were rejected, resulting in empty text output.
     """
     text = (page_result.get("text") or "").strip()
     if not text:
         return False
     confidence = float(page_result.get("confidence") or 0.0)
-    # FIX B: was 0.4 — Indic model scores valid words at 0.25–0.6
     if confidence < 0.25:
         return False
-    # FIX B: was 15 — Gujarati words like "GANGAD" or "161600" are 6 chars
     return len(text) >= 8 or len(text.split()) >= 2
 
 
@@ -524,13 +530,6 @@ def ocr_single_page_image(
     Strict routing:
       - Gujarati -> Tesseract only
       - English  -> PaddleOCR only
-
-    PaddleOCR path:
-      1. Fast path — run PaddleOCR on the raw rendered image. Accept if
-         the result looks good (confidence ≥ 0.25, text ≥ 8 chars).
-      2. Slow path — apply full image preprocessing (deskew, denoise,
-         adaptive threshold, morphological cleanup) then re-run OCR.
-      3. Return whichever path gave the higher combined score.
     """
     warnings: List[str] = []
     render_dpi = max(300, dpi or settings.OCR_DPI)
