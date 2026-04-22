@@ -31,6 +31,7 @@ import cv2
 import fitz
 import numpy as np
 from PIL import Image
+import pytesseract
 
 from app.config.settings import settings
 from app.utils.image_preprocessing import adaptive_threshold, pil_to_cv2, remove_noise
@@ -41,6 +42,13 @@ logger = get_logger(__name__)
 _TESSERACT_AVAILABLE: Optional[bool] = None
 _TESSERACT_CHECK_LOCK = Lock()
 
+_TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+_TESSDATA_PREFIX = r"C:\Program Files\Tesseract-OCR\tessdata"
+_GUJ_TRAINEDDATA_CANDIDATES = (
+    Path(_TESSDATA_PREFIX) / "guj.traineddata",
+    Path(_TESSDATA_PREFIX) / "eng.traineddata",
+)
+
 _PRIMARY_PSM = 6
 _RETRY_PSM = 11
 _TARGET_CONFIDENCE = 0.6
@@ -50,13 +58,42 @@ _EMPTY_CONFIDENCE_CUTOFF = 0.2
 _OCR_LANG = "guj+eng"
 
 
-def _check_tesseract_available() -> bool:
-    """Check whether pytesseract and the Gujarati language pack are available."""
-    try:
-        import pytesseract
+def _configure_tesseract_runtime() -> None:
+    """Force the Windows Tesseract install path so Celery/Python share the same runtime."""
+    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
+    os.environ["TESSDATA_PREFIX"] = _TESSDATA_PREFIX
+    logger.debug("[DEBUG] Tesseract CMD: %s", pytesseract.pytesseract.tesseract_cmd)
+    logger.debug("[DEBUG] TESSDATA_PREFIX: %s", os.environ.get("TESSDATA_PREFIX"))
 
-        langs = pytesseract.get_languages(config="")
-        return "guj" in langs
+
+_configure_tesseract_runtime()
+
+
+def _check_tesseract_available() -> bool:
+    """
+    Check whether pytesseract and the Tesseract executable are available.
+
+    Do not block OCR if guj is missing from the language list; the OCR path
+    should still try the configured language and fall back at runtime.
+    """
+    try:
+        version = pytesseract.get_tesseract_version()
+        langs = []
+        try:
+            langs = pytesseract.get_languages(config="")
+        except Exception as lang_exc:
+            logger.debug("Could not enumerate Tesseract languages: %s", lang_exc)
+
+        logger.debug("[DEBUG] Tesseract version: %s", version)
+        logger.debug("[DEBUG] Languages: %s", langs)
+
+        for traineddata_path in _GUJ_TRAINEDDATA_CANDIDATES:
+            if not traineddata_path.exists():
+                logger.warning("%s not found", traineddata_path)
+            else:
+                logger.debug("%s found", traineddata_path)
+
+        return True
     except Exception as exc:
         logger.warning("Tesseract unavailable: %s", exc)
         return False
@@ -111,8 +148,6 @@ def _run_tesseract(
     - extracted text
     - mean confidence from OCR data
     """
-    import pytesseract
-
     config = f"--oem 3 --psm {psm}"
     text = pytesseract.image_to_string(image, lang=lang, config=config).strip()
 
@@ -169,17 +204,19 @@ def _ocr_page_with_fallbacks(
     started = time.perf_counter()
     warnings: List[str] = []
 
-    if not tesseract_available():
+    logger.debug(
+        "[DEBUG] OCR execution start | page=%s | tesseract_cmd=%s | lang=%s | dpi=%s",
+        page_number,
+        pytesseract.pytesseract.tesseract_cmd,
+        _OCR_LANG,
+        dpi,
+    )
+
+    available = tesseract_available()
+    if not available:
         warnings.append(
-            "Tesseract/guj not installed. Install tesseract-ocr tesseract-ocr-guj."
+            "Tesseract runtime check failed; continuing with OCR fallback attempts."
         )
-        return {
-            "page_number": page_number,
-            "text": "",
-            "confidence": 0.0,
-            "warnings": warnings,
-            "tables": [],
-        }
 
     try:
         preprocessed = _preprocess_for_gujarati(image)
@@ -260,6 +297,35 @@ def _ocr_page_with_fallbacks(
             best_score = retry_score
             best_conf = retry_conf
             best_psm = _RETRY_PSM
+
+    if not best_text.strip():
+        try:
+            eng_text, eng_conf = _run_tesseract(preprocessed, lang="eng", psm=_PRIMARY_PSM)
+        except Exception as exc:
+            logger.warning(
+                "English fallback failed | page=%s | psm=%s | error=%s",
+                page_number,
+                _PRIMARY_PSM,
+                exc,
+            )
+            warnings.append(f"English fallback error (psm={_PRIMARY_PSM}): {exc}")
+            eng_text, eng_conf = "", 0.0
+
+        eng_score = _score_result(eng_text, eng_conf)
+        logger.info(
+            "[OCR] Page %s -> Engine: Tesseract | lang=%s | psm=%s | confidence=%.3f | score=%.3f | chars=%s",
+            page_number,
+            "eng",
+            _PRIMARY_PSM,
+            eng_conf,
+            eng_score,
+            len(eng_text),
+        )
+        if eng_score > best_score:
+            best_text = eng_text
+            best_score = eng_score
+            best_conf = eng_conf
+            best_psm = _PRIMARY_PSM
 
     if best_score < _EMPTY_CONFIDENCE_CUTOFF:
         best_text = ""
