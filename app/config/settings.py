@@ -112,6 +112,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    OCR_ENGINE: str = Field(
+        default="hybrid",
+        description="OCR engine mode: hybrid, paddle, or tesseract.",
+    )
+    TESSERACT_LANG: str = Field(
+        default="guj+eng",
+        description="Tesseract language pack used for Gujarati OCR.",
+    )
+    PADDLE_LANG: str = Field(
+        default="en",
+        description="PaddleOCR language code used for non-Gujarati OCR.",
+    )
+
     # FIX: Added OCR_LANGUAGE single override field.
     # When set, this takes priority over OCR_LANGUAGES[0] in the ocr_language property.
     # Allows per-deployment override without changing the full language list.

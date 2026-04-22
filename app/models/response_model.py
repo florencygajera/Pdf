@@ -57,6 +57,11 @@ class ExtractionResult(BaseModel):
     job_id: str
     status: str = Field(..., description="'done', 'processing', 'failed'")
     text: str = Field(default="", description="Full merged clean text")
+    full_text: str = Field(default="", description="Alias for full merged clean text")
+    confidence: float = Field(
+        default=0.0, ge=0.0, le=1.0, description="Overall extraction confidence"
+    )
+    language: str = Field(default="unknown", description="Detected document language")
     tables: List[TableData] = []
     pages: List[PageResult] = []
     metadata: ExtractionMetadata

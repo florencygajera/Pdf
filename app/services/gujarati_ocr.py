@@ -4,8 +4,8 @@ Gujarati OCR engine built on Tesseract.
 This module is optimized for scanned Gujarati PDFs:
 - parallel per-page processing
 - grayscale-only rendering path
-- CLAHE + median blur + Gujarati-friendly thresholding
-- two-pass OCR only: (guj+eng, PSM 6) then (guj, PSM 6)
+- grayscale + denoise + threshold preprocessing
+- two-pass OCR only: (guj+eng, PSM 6) then retry empty pages with (guj+eng, PSM 11)
 - early stop when confidence is high enough
 
 Each page returns the existing pipeline schema:
@@ -30,7 +30,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import cv2
 import fitz
 import numpy as np
+from PIL import Image
 
+from app.config.settings import settings
+from app.utils.image_preprocessing import adaptive_threshold, pil_to_cv2, remove_noise
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -38,15 +41,13 @@ logger = get_logger(__name__)
 _TESSERACT_AVAILABLE: Optional[bool] = None
 _TESSERACT_CHECK_LOCK = Lock()
 
-_PSM_BLOCK = 6
+_PRIMARY_PSM = 6
+_RETRY_PSM = 11
 _TARGET_CONFIDENCE = 0.6
 _LOW_CONFIDENCE_WARNING = 0.35
 _EMPTY_CONFIDENCE_CUTOFF = 0.2
 
-_OCR_VARIANTS: Tuple[Tuple[str, int], ...] = (
-    ("guj+eng", _PSM_BLOCK),
-    ("guj", _PSM_BLOCK),
-)
+_OCR_LANG = "guj+eng"
 
 
 def _check_tesseract_available() -> bool:
@@ -83,52 +84,20 @@ def _as_grayscale_array(image: Union[np.ndarray, "Image.Image"]) -> np.ndarray:
             return cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
         raise ValueError("Unsupported ndarray shape for Gujarati OCR preprocessing.")
 
-    arr = np.asarray(image)
-    if arr.ndim == 2:
-        return arr
-    if arr.ndim == 3 and arr.shape[2] == 3:
-        return cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    if arr.ndim == 3 and arr.shape[2] == 4:
-        return cv2.cvtColor(arr, cv2.COLOR_RGBA2GRAY)
-    raise ValueError("Unsupported image shape for Gujarati OCR preprocessing.")
+    bgr = pil_to_cv2(image)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
 
 def _preprocess_for_gujarati(image: Union[np.ndarray, "Image.Image"]) -> np.ndarray:
     """
     Gujarati-safe preprocessing:
     - grayscale only
-    - CLAHE for low contrast
-    - median blur, not Gaussian
-    - adaptive threshold tuned for shirorekha
-    - very light dilation only
+    - denoise
+    - adaptive threshold tuned for Gujarati scans
     """
     gray = _as_grayscale_array(image)
-
-    h, w = gray.shape[:2]
-    if h > 0 and h < 1400:
-        scale = 1400 / h
-        gray = cv2.resize(
-            gray,
-            (max(1, int(w * scale)), 1400),
-            interpolation=cv2.INTER_CUBIC,
-        )
-
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    gray = cv2.medianBlur(gray, 3)
-
-    binary = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        17,
-        5,
-    )
-
-    # Keep matras/shirorekha intact: avoid erosion, use only a tiny dilation.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
-    binary = cv2.dilate(binary, kernel, iterations=1)
+    gray = remove_noise(gray)
+    binary = adaptive_threshold(gray)
     return binary
 
 
@@ -225,44 +194,72 @@ def _ocr_page_with_fallbacks(
 
     best_text = ""
     best_score = 0.0
-    best_lang = ""
-    best_psm = _PSM_BLOCK
+    best_psm = _PRIMARY_PSM
     best_conf = 0.0
 
-    for lang, psm in _OCR_VARIANTS:
+    try:
+        primary_text, primary_conf = _run_tesseract(
+            preprocessed, lang=_OCR_LANG, psm=_PRIMARY_PSM
+        )
+    except Exception as exc:
+        logger.warning(
+            "Tesseract failed | page=%s | lang=%s | psm=%s | error=%s",
+            page_number,
+            _OCR_LANG,
+            _PRIMARY_PSM,
+            exc,
+        )
+        warnings.append(f"Tesseract error (lang={_OCR_LANG} psm={_PRIMARY_PSM}): {exc}")
+        primary_text, primary_conf = "", 0.0
+
+    primary_score = _score_result(primary_text, primary_conf)
+    logger.info(
+        "[OCR] Page %s -> Engine: Tesseract | lang=%s | psm=%s | confidence=%.3f | score=%.3f | chars=%s",
+        page_number,
+        _OCR_LANG,
+        _PRIMARY_PSM,
+        primary_conf,
+        primary_score,
+        len(primary_text),
+    )
+
+    best_text = primary_text
+    best_score = primary_score
+    best_conf = primary_conf
+
+    if not primary_text.strip():
         try:
-            text, confidence = _run_tesseract(preprocessed, lang=lang, psm=psm)
+            retry_text, retry_conf = _run_tesseract(
+                preprocessed, lang=_OCR_LANG, psm=_RETRY_PSM
+            )
         except Exception as exc:
             logger.warning(
-                "Tesseract failed | page=%s | lang=%s | psm=%s | error=%s",
+                "Tesseract retry failed | page=%s | lang=%s | psm=%s | error=%s",
                 page_number,
-                lang,
-                psm,
+                _OCR_LANG,
+                _RETRY_PSM,
                 exc,
             )
-            warnings.append(f"Tesseract error (lang={lang} psm={psm}): {exc}")
-            continue
+            warnings.append(
+                f"Tesseract error (lang={_OCR_LANG} psm={_RETRY_PSM}): {exc}"
+            )
+            retry_text, retry_conf = "", 0.0
 
-        score = _score_result(text, confidence)
+        retry_score = _score_result(retry_text, retry_conf)
         logger.info(
-            "Gujarati OCR pass | page=%s | lang=%s | psm=%s | confidence=%.3f | score=%.3f | chars=%s",
+            "[OCR] Page %s -> Engine: Tesseract | lang=%s | psm=%s | confidence=%.3f | score=%.3f | chars=%s",
             page_number,
-            lang,
-            psm,
-            confidence,
-            score,
-            len(text),
+            _OCR_LANG,
+            _RETRY_PSM,
+            retry_conf,
+            retry_score,
+            len(retry_text),
         )
-
-        if score > best_score:
-            best_text = text
-            best_score = score
-            best_lang = lang
-            best_psm = psm
-            best_conf = confidence
-
-        if score >= _TARGET_CONFIDENCE:
-            break
+        if retry_score > best_score:
+            best_text = retry_text
+            best_score = retry_score
+            best_conf = retry_conf
+            best_psm = _RETRY_PSM
 
     if best_score < _EMPTY_CONFIDENCE_CUTOFF:
         best_text = ""
@@ -277,7 +274,7 @@ def _ocr_page_with_fallbacks(
     logger.info(
         "Gujarati OCR page done | page=%s | lang=%s | psm=%s | confidence=%.3f | score=%.3f | duration_seconds=%.2f",
         page_number,
-        best_lang or "n/a",
+        _OCR_LANG,
         best_psm,
         best_conf,
         best_score,
@@ -302,23 +299,26 @@ def ocr_gujarati_page(
     return _ocr_page_with_fallbacks(image=image, page_number=page_number, dpi=dpi)
 
 
-def _render_page_to_gray(
+def _render_page_to_pil(
     page: "fitz.Page",
     dpi: int,
-) -> np.ndarray:
-    scale = max(1.5, dpi / 72.0)
+) -> Image.Image:
+    scale = max(1.0, dpi / 72.0)
     matrix = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=matrix, alpha=False, colorspace=fitz.csGRAY)
-    gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-    return gray.copy()
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    mode = "RGB" if pix.n < 4 else "RGBA"
+    image = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+    if mode == "RGBA":
+        image = image.convert("RGB")
+    return image
 
 
 def _process_rendered_page(
-    gray: np.ndarray,
+    image: Image.Image,
     page_number: int,
     dpi: int,
 ) -> Dict[str, Any]:
-    return ocr_gujarati_page(gray, page_number=page_number, dpi=dpi)
+    return ocr_gujarati_page(image, page_number=page_number, dpi=dpi)
 
 
 def _parallel_workers() -> int:
@@ -340,7 +340,7 @@ def extract_gujarati_pdf(
     import fitz
 
     started = time.perf_counter()
-    dpi = max(250, dpi)
+    dpi = max(300, dpi, settings.OCR_DPI)
 
     try:
         doc = (
@@ -356,7 +356,7 @@ def extract_gujarati_pdf(
         targets = page_numbers or list(range(1, total + 1))
         targets = [p for p in targets if 1 <= p <= total]
         rendered_pages = [
-            (page_num, _render_page_to_gray(doc[page_num - 1], dpi=dpi))
+            (page_num, _render_page_to_pil(doc[page_num - 1], dpi=dpi))
             for page_num in targets
         ]
     finally:
@@ -377,8 +377,8 @@ def extract_gujarati_pdf(
     results: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_process_rendered_page, gray, page_num, dpi): page_num
-            for page_num, gray in rendered_pages
+            executor.submit(_process_rendered_page, image, page_num, dpi): page_num
+            for page_num, image in rendered_pages
         }
         for future in as_completed(futures):
             page_num = futures[future]

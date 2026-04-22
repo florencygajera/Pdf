@@ -3,24 +3,15 @@ OCR Extraction Engine.
 
 FIXES IN THIS VERSION:
 
-  FIX A — lang= parameter now uses settings.ocr_language property (single string).
-           Previous code did settings.OCR_LANGUAGES[0] which was bypassing the
-           new OCR_LANGUAGE single-override field. The property resolves priority:
-           OCR_LANGUAGE override > OCR_LANGUAGES[0] > "en" fallback.
-           Also previously someone tried ",".join(["gu","en"]) → "gu,en" which is
-           not a valid PaddleOCR language code. Now only one language is passed.
-
-  FIX B — _ocr_result_looks_good() confidence gate lowered 0.4 → 0.25.
-           PaddleOCR's Gujarati model scores valid words at 0.25–0.6.
-           At 0.4 the fast-path rejected most Gujarati results and fell
-           through to slow full-preprocessing.
-
-  FIX C — Added shutdown_ocr_executor() for clean FastAPI lifespan shutdown.
-
-  FIX D — Thread-safe _ocr_runtime_warning_emitted using threading.Lock to
-           prevent duplicate warning log spam from concurrent page threads.
-
-  FIX E — _get_multiprocessing_context() exported for tests.
+  FIX A — strict routing: Gujarati OCR goes to app.services.gujarati_ocr
+           only, English OCR goes to PaddleOCR only.
+  FIX B — PaddleOCR is pinned to settings.PADDLE_LANG so it never receives
+           lang="gu".
+  FIX C — rendered pages are generated at a minimum of 300 DPI and kept as
+           PIL images before OCR.
+  FIX D — _ocr_result_looks_good() confidence gate lowered 0.4 → 0.25.
+  FIX E — shutdown_ocr_executor() is available for clean FastAPI shutdown.
+  FIX F — _get_multiprocessing_context() exported for tests.
 """
 
 from __future__ import annotations
@@ -46,6 +37,7 @@ from pdf2image.exceptions import PDFPageCountError, PDFSyntaxError
 
 from app.config.constants import line_y_tolerance_ocr
 from app.config.settings import settings
+from app.services.gujarati_ocr import extract_gujarati_pdf, ocr_gujarati_page
 from app.utils.image_preprocessing import (
     estimate_page_complexity,
     preprocess_page_image,
@@ -74,6 +66,35 @@ def _get_multiprocessing_context():
     return mp.get_context("spawn")
 
 
+def _normalize_ocr_language(language: Optional[str]) -> str:
+    value = (language or "").strip().lower()
+    if value in {"gu", "guj", "gujarati"}:
+        return "gujarati"
+    if value in {"en", "eng", "english"}:
+        return "english"
+    return value
+
+
+def _resolve_ocr_language(language: Optional[str] = None) -> str:
+    """
+    Resolve the OCR language routed by the pipeline.
+
+    Strict routing:
+      - Gujarati => Tesseract-only via app.services.gujarati_ocr
+      - English  => PaddleOCR-only
+    """
+    normalized = _normalize_ocr_language(language)
+    if normalized in {"gujarati", "english"}:
+        return normalized
+
+    engine = (settings.OCR_ENGINE or "hybrid").strip().lower()
+    if engine == "tesseract":
+        return "gujarati"
+    if engine == "paddle":
+        return "english"
+    return "english"
+
+
 class _PaddleOCRPool:
     """
     Small bounded pool of PaddleOCR instances.
@@ -95,10 +116,7 @@ class _PaddleOCRPool:
             self._init_error = exc
             raise
 
-        # FIX A: use settings.ocr_language property to resolve OCR_LANGUAGE override
-        # vs OCR_LANGUAGES list. Passing a comma-joined string like "gu,en" is not
-        # a valid PaddleOCR language code and silently falls back to English.
-        primary_lang = settings.ocr_language
+        primary_lang = (settings.PADDLE_LANG or "en").strip() or "en"
 
         instance = PaddleOCR(
             use_angle_cls=True,
@@ -266,6 +284,7 @@ def _render_pages_with_fitz(
     dpi: int,
 ) -> List[Image.Image]:
     """Render PDF pages with PyMuPDF — faster than pdf2image for most PDFs."""
+    dpi = max(300, dpi)
     if pdf_bytes is not None:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     elif pdf_path is not None:
@@ -301,6 +320,7 @@ def _render_pages_for_ocr(
     dpi: int,
 ) -> List[Image.Image]:
     """Render pages with PyMuPDF first, falling back to pdf2image if needed."""
+    dpi = max(300, dpi)
     try:
         return _render_pages_with_fitz(
             pdf_path=pdf_path,
@@ -496,11 +516,16 @@ def ocr_single_page_image(
     page_number: int,
     include_rendered_image: bool = True,
     dpi: Optional[int] = None,
+    language: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run OCR on a single PIL image.
 
-    Pipeline:
+    Strict routing:
+      - Gujarati -> Tesseract only
+      - English  -> PaddleOCR only
+
+    PaddleOCR path:
       1. Fast path — run PaddleOCR on the raw rendered image. Accept if
          the result looks good (confidence ≥ 0.25, text ≥ 8 chars).
       2. Slow path — apply full image preprocessing (deskew, denoise,
@@ -508,7 +533,17 @@ def ocr_single_page_image(
       3. Return whichever path gave the higher combined score.
     """
     warnings: List[str] = []
-    render_dpi = dpi or settings.OCR_DPI
+    render_dpi = max(300, dpi or settings.OCR_DPI)
+    resolved_language = _resolve_ocr_language(language)
+
+    if resolved_language == "gujarati":
+        logger.info("[OCR] Page %s -> Engine: Tesseract", page_number)
+        result = ocr_gujarati_page(image, page_number=page_number, dpi=render_dpi)
+        if include_rendered_image and "rendered_image" not in result:
+            result["rendered_image"] = _page_array_from_image(image)
+        return result
+
+    logger.info("[OCR] Page %s -> Engine: Paddle", page_number)
     raw_image = _page_array_from_image(image)
     rendered_image = raw_image if include_rendered_image else None
     profile = estimate_page_complexity(raw_image)
@@ -611,6 +646,7 @@ def _process_images_in_threads(
     start_page: int,
     page_numbers: Optional[List[int]],
     dpi: int,
+    language: Optional[str] = None,
     parallel: bool = True,
 ) -> List[Dict[str, Any]]:
     """Process page images through OCR using a thread pool."""
@@ -622,7 +658,7 @@ def _process_images_in_threads(
     def _process(item):
         idx, pil_image = item
         page_num = page_numbers[idx] if page_numbers else start_page + idx
-        return ocr_single_page_image(pil_image, page_num, dpi=dpi)
+        return ocr_single_page_image(pil_image, page_num, dpi=dpi, language=language)
 
     if not parallel or max_workers == 1:
         for item in enumerate(images):
@@ -665,9 +701,23 @@ def extract_ocr_pdf(
     pdf_path: Path,
     page_numbers: Optional[List[int]] = None,
     dpi: int = None,
+    language: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Full OCR extraction pipeline using the PDF on disk."""
-    dpi = dpi or settings.OCR_DPI
+    dpi = max(300, dpi or settings.OCR_DPI)
+    resolved_language = _resolve_ocr_language(language)
+    if resolved_language == "gujarati":
+        logger.info(
+            "[OCR] Routing scanned pages to Tesseract | pages=%s | dpi=%s",
+            page_numbers if page_numbers else "all",
+            dpi,
+        )
+        return extract_gujarati_pdf(
+            pdf_path,
+            page_numbers=page_numbers,
+            dpi=dpi,
+        )
+
     try:
         with fitz.open(str(pdf_path)) as doc:
             total_pages = len(doc)
@@ -723,6 +773,7 @@ def extract_ocr_pdf(
                 start_page=normalized_pages[0] if normalized_pages else 1,
                 page_numbers=normalized_pages,
                 dpi=dpi,
+                language=resolved_language,
                 parallel=False,
             )
     else:
@@ -734,6 +785,7 @@ def extract_ocr_pdf(
             start_page=normalized_pages[0] if normalized_pages else 1,
             page_numbers=normalized_pages,
             dpi=dpi,
+            language=resolved_language,
             parallel=False,
         )
 
@@ -748,9 +800,24 @@ def extract_ocr_pdf_from_bytes(
     pdf_bytes: bytes,
     page_numbers: Optional[List[int]] = None,
     dpi: int = None,
+    language: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Bytes-based OCR pipeline to avoid repeated disk reads."""
-    dpi = dpi or settings.OCR_DPI
+    dpi = max(300, dpi or settings.OCR_DPI)
+    resolved_language = _resolve_ocr_language(language)
+    if resolved_language == "gujarati":
+        logger.info(
+            "[OCR] Routing scanned pages to Tesseract | pages=%s | dpi=%s",
+            page_numbers if page_numbers else "all",
+            dpi,
+        )
+        return extract_gujarati_pdf(
+            Path("memory.pdf"),
+            page_numbers=page_numbers,
+            dpi=dpi,
+            pdf_bytes=pdf_bytes,
+        )
+
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
@@ -774,6 +841,7 @@ def extract_ocr_pdf_from_bytes(
         start_page=normalized_pages[0] if normalized_pages else 1,
         page_numbers=normalized_pages,
         dpi=dpi,
+        language=resolved_language,
         parallel=len(all_images) > 1,
     )
 
@@ -790,7 +858,7 @@ def extract_ocr_pdf_local(
     Local OCR path for process-pool chunk workers.
     Runs rendering + OCR sequentially to avoid nested process pools.
     """
-    dpi = dpi or settings.OCR_DPI
+    dpi = max(300, dpi or settings.OCR_DPI)
     all_images = _render_pages_for_ocr(
         pdf_path=pdf_path, page_numbers=page_numbers, dpi=dpi
     )
@@ -800,7 +868,11 @@ def extract_ocr_pdf_local(
     for idx, pil_image in enumerate(all_images):
         page_num = page_numbers[idx] if page_numbers else start_page + idx
         page_info = ocr_single_page_image(
-            pil_image, page_num, include_rendered_image=False, dpi=dpi
+            pil_image,
+            page_num,
+            include_rendered_image=False,
+            dpi=dpi,
+            language="english",
         )
 
         if page_info.get("text") or page_info.get("raw_results"):

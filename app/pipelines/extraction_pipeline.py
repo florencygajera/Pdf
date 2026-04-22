@@ -36,6 +36,7 @@ from app.models.response_model import (
     TableData,
 )
 from app.services.digital_extractor import extract_digital_pdf
+from app.services.gujarati_ocr import extract_gujarati_pdf, tesseract_available
 from app.services.noise_cleaner import clean_pages, clean_text_block
 from app.services.ocr_extractor import extract_ocr_pdf, extract_ocr_pdf_from_bytes
 from app.services.pdf_detector import DocumentClassification, detect_pdf_type_from_bytes
@@ -46,6 +47,39 @@ from app.services.validator import validate_extraction_result
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _resolve_scanned_ocr_language() -> str:
+    """
+    Resolve the OCR language used for scanned pages.
+
+    The pipeline passes this into the OCR layer so the OCR service can route
+    strictly:
+      - Gujarati -> Tesseract only
+      - English  -> PaddleOCR only
+    """
+    engine = (settings.OCR_ENGINE or "hybrid").strip().lower()
+    configured = (settings.OCR_LANGUAGE or "").strip().lower()
+    if engine == "tesseract":
+        return "gujarati"
+    if engine == "paddle":
+        return "english"
+    if configured in {"gu", "guj", "gujarati"}:
+        return "gujarati"
+    return "english"
+
+
+def _display_language(language: str) -> str:
+    normalized = (language or "").strip().lower()
+    if normalized in {"gu", "guj", "gujarati"}:
+        return "gujarati"
+    if normalized in {"en", "eng", "english"}:
+        return "english"
+    return normalized or "unknown"
+
+
+def _prefer_gujarati_tesseract_ocr() -> bool:
+    return _resolve_scanned_ocr_language() == "gujarati" and tesseract_available()
 
 
 def _build_page_result(
@@ -169,18 +203,34 @@ def _process_scanned_pages(
         len(scanned_page_nums),
     )
 
-    if pdf_bytes:
-        results = extract_ocr_pdf_from_bytes(
-            pdf_bytes,
-            page_numbers=scanned_page_nums,
-            dpi=settings.effective_ocr_dpi(len(scanned_page_nums)),
+    dpi = settings.effective_ocr_dpi(len(scanned_page_nums))
+    if _prefer_gujarati_tesseract_ocr():
+        logger.info(
+            "Using Gujarati Tesseract OCR | pages=%s | dpi=%s",
+            len(scanned_page_nums),
+            dpi,
         )
-    else:
-        results = extract_ocr_pdf(
+        results = extract_gujarati_pdf(
             pdf_path,
             page_numbers=scanned_page_nums,
-            dpi=settings.effective_ocr_dpi(len(scanned_page_nums)),
+            dpi=dpi,
+            pdf_bytes=pdf_bytes,
         )
+    else:
+        if pdf_bytes:
+            results = extract_ocr_pdf_from_bytes(
+                pdf_bytes,
+                page_numbers=scanned_page_nums,
+                dpi=dpi,
+                language=_resolve_scanned_ocr_language(),
+            )
+        else:
+            results = extract_ocr_pdf(
+                pdf_path,
+                page_numbers=scanned_page_nums,
+                dpi=dpi,
+                language=_resolve_scanned_ocr_language(),
+            )
 
     _run_with_progress_lock(progress_callback, progress_lock, 1, 1, "ocr")
     return sorted(results, key=lambda p: p.get("page_number", 0))
@@ -334,7 +384,14 @@ def run_extraction_pipeline(
         confidence_score=validation_report["overall_confidence"],
         processing_time_seconds=processing_time,
         languages_detected=validation_report.get("languages", []),
-        ocr_engine="PaddleOCR" if doc_classification.scanned_page_count > 0 else None,
+        ocr_engine=(
+            "Tesseract"
+            if doc_classification.scanned_page_count > 0
+            and _resolve_scanned_ocr_language() == "gujarati"
+            else "Paddle"
+            if doc_classification.scanned_page_count > 0
+            else None
+        ),
         warnings=warnings[:50],
         warnings_truncated=warnings_truncated,
         total_warning_count=total_warning_count,
@@ -344,6 +401,14 @@ def run_extraction_pipeline(
         job_id=job_id,
         status=STATE_DONE,
         text=full_text,
+        full_text=full_text,
+        confidence=metadata.confidence_score,
+        language=(
+            "gujarati"
+            if doc_classification.scanned_page_count > 0
+            and _resolve_scanned_ocr_language() == "gujarati"
+            else _display_language(validation_report.get("languages", ["unknown"])[0])
+        ),
         tables=table_models,
         pages=page_models,
         metadata=metadata,

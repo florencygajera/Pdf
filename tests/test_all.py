@@ -1076,6 +1076,63 @@ class TestGujaratiOCR:
         s = Settings(ENVIRONMENT="test", API_KEY="test-api-key", OCR_DPI=150)
         assert s.effective_ocr_dpi(50) == 100
 
+    def test_scanned_pages_route_to_gujarati_tesseract(self, monkeypatch, tmp_path):
+        """
+        When Gujarati OCR is configured and Tesseract Gujarati is available,
+        scanned pages should be sent through the Gujarati OCR engine instead of
+        the generic PaddleOCR path.
+        """
+        from types import SimpleNamespace
+
+        from app.pipelines import extraction_pipeline
+
+        called = {"gujarati": False, "paddle": False}
+
+        monkeypatch.setattr(
+            extraction_pipeline.settings, "OCR_LANGUAGE", "gu", raising=False
+        )
+        monkeypatch.setattr(extraction_pipeline, "tesseract_available", lambda: True)
+
+        def fake_gujarati(pdf_path, page_numbers=None, dpi=None, pdf_bytes=None):
+            called["gujarati"] = True
+            assert page_numbers == [1]
+            return [
+                {
+                    "page_number": 1,
+                    "text": "ગુજરાત",
+                    "confidence": 0.9,
+                    "warnings": [],
+                    "tables": [],
+                }
+            ]
+
+        def fake_paddle(*args, **kwargs):
+            called["paddle"] = True
+            return []
+
+        monkeypatch.setattr(
+            extraction_pipeline, "extract_gujarati_pdf", fake_gujarati
+        )
+        monkeypatch.setattr(extraction_pipeline, "extract_ocr_pdf", fake_paddle)
+        monkeypatch.setattr(extraction_pipeline, "extract_ocr_pdf_from_bytes", fake_paddle)
+
+        pdf_path = tmp_path / "gujarati.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4")
+
+        result = extraction_pipeline._process_scanned_pages(
+            pdf_path,
+            SimpleNamespace(
+                total_pages=1,
+                pages=[SimpleNamespace(page_number=1, pdf_type="scanned")],
+                scanned_page_count=1,
+            ),
+            pdf_bytes=b"%PDF-1.4",
+        )
+
+        assert called["gujarati"] is True
+        assert called["paddle"] is False
+        assert result[0]["text"] == "ગુજરાત"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. Security Config Tests

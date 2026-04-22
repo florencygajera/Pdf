@@ -8,7 +8,7 @@ FIX: When API_KEY is not configured, return 401 (not 500).
 
 from fastapi import HTTPException, Request, status
 
-from app.config.settings import settings
+import app.config.settings as settings_module
 
 
 def require_api_key(request: Request) -> None:
@@ -20,7 +20,7 @@ def require_api_key(request: Request) -> None:
     In environments where API_KEY is intentionally empty (e.g. local dev),
     you can set API_KEY to an empty string to disable auth enforcement.
     """
-    expected = getattr(settings, "API_KEY", None)
+    expected = getattr(settings_module.settings, "API_KEY", None)
 
     # FIX: empty string means auth is disabled (dev convenience)
 
